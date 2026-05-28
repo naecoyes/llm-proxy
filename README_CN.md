@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="ChatGPT Image May 27, 2026, 11_09_44 AM.png" width="200" />
+  <img src="images/ChatGPT Image May 27, 2026, 11_09_44 AM.png" width="200" />
 </p>
 
 <h1 align="center">LLM Proxy</h1>
@@ -28,19 +28,19 @@
 
 ### 仪表盘
 
-![Dashboard](dashboard.png)
+![Dashboard](images/dashboard.png)
 
 ### 模型管理
 
-![Models](models.png)
+![Models](images/models.png)
 
 ### 配置管理
 
-![Config](cofing.png)
+![Config](images/cofing.png)
 
 ### 请求日志
 
-![Logs](logs.png)
+![Logs](images/logs.png)
 
 ## 快速开始
 
