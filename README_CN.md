@@ -86,14 +86,122 @@ llm_proxy/
 └── logs/               # 日志目录
 ```
 
-## API 接口
+## API 调用
 
-| 接口 | 说明 |
-|------|------|
-| `POST /v1/chat/completions` | Chat Completions 兼容接口 |
-| `GET /v1/models` | 获取可用模型列表 |
-| `GET /admin/dashboard` | 管理面板 |
-| `GET /admin/logs` | 请求日志 |
+### Chat Completions
+
+代理完全兼容 OpenAI Chat Completions API 格式。
+
+**基础请求（非流式）：**
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "my-model",
+    "messages": [
+      {"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "你好！"}
+    ]
+  }'
+```
+
+**流式请求：**
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "my-model",
+    "stream": true,
+    "messages": [
+      {"role": "user", "content": "讲个笑话。"}
+    ]
+  }'
+```
+
+**Python（OpenAI SDK）：**
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="any-string"  # 代理会处理真实的 API Key
+)
+
+response = client.chat.completions.create(
+    model="my-model",
+    messages=[{"role": "user", "content": "你好！"}]
+)
+print(response.choices[0].message.content)
+```
+
+**自动选择模型：**
+
+省略 `model` 字段，代理会自动选择可用模型：
+
+```python
+response = client.chat.completions.create(
+    messages=[{"role": "user", "content": "你好！"}]
+)
+```
+
+### 获取模型列表
+
+```bash
+curl http://localhost:8000/v1/models
+```
+
+返回：
+
+```json
+{
+  "object": "list",
+  "data": [
+    {"id": "my-model", "object": "model", "created": 0, "owned_by": "proxy"}
+  ]
+}
+```
+
+### 代理状态
+
+```bash
+curl http://localhost:8000/proxy/status
+```
+
+### 健康检查
+
+```bash
+curl http://localhost:8000/proxy/health
+```
+
+### 用量统计
+
+```bash
+curl http://localhost:8000/proxy/usage
+```
+
+### 请求日志
+
+```bash
+curl http://localhost:8000/proxy/logs
+```
+
+## API 接口参考
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/v1/chat/completions` | POST | Chat Completions 兼容接口 |
+| `/v1/models` | GET | 获取可用模型列表 |
+| `/proxy/status` | GET | 代理状态概览 |
+| `/proxy/health` | GET | 模型健康检查结果 |
+| `/proxy/usage` | GET | 用量统计 |
+| `/proxy/logs` | GET | 请求日志 |
+| `/proxy/config` | GET/PUT | 读取或更新配置 |
+| `/proxy/models/{name}/enable` | POST | 启用模型 |
+| `/proxy/models/{name}/disable` | POST | 禁用模型 |
+| `/proxy/models/{name}/test` | POST | 测试模型连接 |
 
 ## License
 
