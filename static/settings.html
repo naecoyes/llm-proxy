@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Proxy Hub - 设置</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #0a0a0f;
+            --bg-secondary: #12121a;
+            --bg-card: #1a1a25;
+            --bg-hover: #22222e;
+            --border-color: #2a2a3a;
+            --text-primary: #e8e8ef;
+            --text-secondary: #8888a0;
+            --accent-blue: #6366f1;
+            --accent-purple: #a855f7;
+            --accent-green: #22c55e;
+            --accent-yellow: #eab308;
+            --accent-red: #ef4444;
+            --accent-cyan: #06b6d4;
+            --gradient-1: linear-gradient(135deg, #6366f1 0%, #a855f7 100%);
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Inter', sans-serif; background: var(--bg-primary); color: var(--text-primary); min-height: 100vh; }
+        
+        .container { max-width: 1200px; margin: 0 auto; padding: 32px; }
+        
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 32px;
+        }
+        .header-left { display: flex; align-items: center; gap: 16px; }
+        .back-btn {
+            padding: 8px 16px;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 13px;
+            transition: all 0.2s;
+        }
+        .back-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+        .page-title {
+            font-size: 28px;
+            font-weight: 700;
+            background: var(--gradient-1);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 20px;
+        }
+        .card-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        .card-desc {
+            font-size: 13px;
+            color: var(--text-secondary);
+            margin-bottom: 20px;
+        }
+        
+        .form-group { margin-bottom: 20px; }
+        .form-label {
+            display: block;
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+        }
+        .form-input, .form-select, .form-textarea {
+            width: 100%;
+            padding: 10px 14px;
+            background: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 14px;
+            font-family: 'Inter', sans-serif;
+            transition: all 0.2s;
+        }
+        .form-input:focus, .form-select:focus, .form-textarea:focus {
+            outline: none;
+            border-color: var(--accent-blue);
+            box-shadow: 0 0 0 3px rgba(99,102,241,0.1);
+        }
+        .form-textarea { min-height: 400px; resize: vertical; font-family: 'Monaco', 'Menlo', monospace; font-size: 13px; }
+        
+        .form-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 20px;
+        }
+        
+        .btn {
+            padding: 10px 20px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+        .btn-primary { background: var(--accent-blue); color: white; }
+        .btn-primary:hover { background: #4f46e5; }
+        .btn-danger { background: rgba(239,68,68,0.15); color: var(--accent-red); }
+        .btn-danger:hover { background: rgba(239,68,68,0.25); }
+        .btn-success { background: rgba(34,197,94,0.15); color: var(--accent-green); }
+        .btn-success:hover { background: rgba(34,197,94,0.25); }
+        .btn-ghost {
+            background: transparent;
+            color: var(--text-secondary);
+            border: 1px solid var(--border-color);
+        }
+        .btn-ghost:hover { background: var(--bg-hover); color: var(--text-primary); }
+        
+        .btn-group { display: flex; gap: 10px; margin-top: 20px; }
+        
+        /* IP List */
+        .ip-list { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
+        .ip-tag {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 14px;
+            background: var(--bg-hover);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            font-size: 13px;
+        }
+        .ip-tag .remove {
+            cursor: pointer;
+            color: var(--accent-red);
+            font-weight: bold;
+            width: 16px;
+            height: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 50%;
+            transition: all 0.2s;
+        }
+        .ip-tag .remove:hover { background: rgba(239,68,68,0.2); }
+        
+        .add-ip-form { display: flex; gap: 10px; }
+        .add-ip-form .form-input { flex: 1; }
+        
+        /* Models Table */
+        .models-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .models-table th, .models-table td {
+            padding: 12px 16px;
+            text-align: left;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .models-table th {
+            font-size: 12px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .models-table tr:hover { background: var(--bg-hover); }
+        
+        .model-name { font-weight: 500; }
+        .model-id { font-size: 11px; color: var(--text-secondary); margin-top: 2px; }
+        
+        .tag {
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 500;
+        }
+        .tag-free { background: rgba(34,197,94,0.15); color: var(--accent-green); }
+        .tag-peak { background: rgba(234,179,8,0.15); color: var(--accent-yellow); }
+        .tag-paid { background: rgba(99,102,241,0.15); color: var(--accent-blue); }
+        .tag-enabled { background: rgba(34,197,94,0.15); color: var(--accent-green); }
+        .tag-disabled { background: rgba(239,68,68,0.15); color: var(--accent-red); }
+        
+        .toggle {
+            position: relative;
+            width: 44px;
+            height: 24px;
+            background: var(--border-color);
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .toggle.active { background: var(--accent-green); }
+        .toggle::after {
+            content: '';
+            position: absolute;
+            top: 3px;
+            left: 3px;
+            width: 18px;
+            height: 18px;
+            background: white;
+            border-radius: 50%;
+            transition: transform 0.3s;
+        }
+        .toggle.active::after { transform: translateX(20px); }
+        
+        /* Toast */
+        .toast {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            padding: 12px 20px;
+            border-radius: 10px;
+            font-size: 13px;
+            font-weight: 500;
+            transform: translateY(100px);
+            opacity: 0;
+            transition: all 0.3s;
+            z-index: 1000;
+        }
+        .toast.show { transform: translateY(0); opacity: 1; }
+        .toast.success { background: var(--accent-green); color: white; }
+        .toast.error { background: var(--accent-red); color: white; }
+        
+        @media (max-width: 768px) {
+            .form-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="header-left">
+                <a href="/" class="back-btn">← 返回仪表盘</a>
+                <div class="page-title">设置</div>
+            </div>
+        </div>
+        
+        <!-- IP 白名单 -->
+        <div class="card">
+            <div class="card-title">🔒 IP 白名单</div>
+            <div class="card-desc">控制哪些 IP 可以访问 API 和管理面板。留空则允许所有访问。</div>
+            
+            <div class="ip-list" id="ipList"></div>
+            
+            <div class="add-ip-form">
+                <input type="text" class="form-input" id="newIp" placeholder="输入 IP 地址 (例如: 192.168.1.100)" />
+                <button class="btn btn-primary" onclick="addIp()">添加 IP</button>
+            </div>
+        </div>
+        
+        <!-- 模型管理 -->
+        <div class="card">
+            <div class="card-title">🤖 模型管理</div>
+            <div class="card-desc">管理所有 LLM 模型的启用状态</div>
+            
+            <table class="models-table">
+                <thead>
+                    <tr>
+                        <th>模型名称</th>
+                        <th>Provider</th>
+                        <th>优先级</th>
+                        <th>类型</th>
+                        <th>状态</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="modelsTableBody"></tbody>
+            </table>
+        </div>
+        
+        <!-- 用量控制 -->
+        <div class="card">
+            <div class="card-title">📊 用量控制</div>
+            <div class="card-desc">设置 Token 限制和费用预算</div>
+            
+            <div class="form-grid">
+                <div class="form-group">
+                    <label class="form-label">每日预算 (美元)</label>
+                    <input type="number" class="form-input" id="dailyBudget" value="50" step="0.1" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">每月预算 (美元)</label>
+                    <input type="number" class="form-input" id="monthlyBudget" value="500" step="1" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">每日 Token 限制</label>
+                    <input type="number" class="form-input" id="maxTokensPerDay" value="5000000" step="100000" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">单次请求 Token 限制</label>
+                    <input type="number" class="form-input" id="maxTokensPerRequest" value="100000" step="1000" />
+                </div>
+            </div>
+            <button class="btn btn-primary" onclick="saveUsageConfig()">保存用量配置</button>
+        </div>
+        
+        <!-- 时间策略 -->
+        <div class="card">
+            <div class="card-title">⏰ 时间策略</div>
+            <div class="card-desc">配置高峰期和优先时段策略</div>
+            
+            <div class="form-grid">
+                <div class="form-group">
+                    <label class="form-label">高峰期策略模型</label>
+                    <select class="form-select" id="peakStrategy">
+                        <option value="minimax">minimax</option>
+                        <option value="nvidia-deepseek">nvidia-deepseek</option>
+                        <option value="mimo">mimo</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">高峰期并行限制</label>
+                    <input type="number" class="form-input" id="peakParallelLimit" value="1" min="1" max="10" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">MIMO 优先时段 (小时，逗号分隔)</label>
+                    <input type="text" class="form-input" id="mimoPriorityHours" value="0,1,2,3,4,5,6,7" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">跳过周末高峰期</label>
+                    <select class="form-select" id="peakSkipWeekends">
+                        <option value="true">是</option>
+                        <option value="false">否</option>
+                    </select>
+                </div>
+            </div>
+            <button class="btn btn-primary" onclick="saveScheduleConfig()">保存时间策略</button>
+        </div>
+        
+        <!-- 故障转移 -->
+        <div class="card">
+            <div class="card-title">🔄 故障转移</div>
+            <div class="card-desc">配置模型故障转移策略</div>
+            
+            <div class="form-grid">
+                <div class="form-group">
+                    <label class="form-label">最大重试次数</label>
+                    <input type="number" class="form-input" id="maxRetries" value="5" min="1" max="10" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">连续失败后标记不健康</label>
+                    <input type="number" class="form-input" id="maxConsecutiveFailures" value="3" min="1" max="10" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">恢复探测间隔 (秒)</label>
+                    <input type="number" class="form-input" id="recoveryTime" value="3600" min="60" step="60" />
+                </div>
+                <div class="form-group">
+                    <label class="form-label">失败后尝试免费模型</label>
+                    <select class="form-select" id="fallbackToFree">
+                        <option value="true">是</option>
+                        <option value="false">否</option>
+                    </select>
+                </div>
+            </div>
+            <button class="btn btn-primary" onclick="saveFailoverConfig()">保存故障转移配置</button>
+        </div>
+        
+        <!-- 高级配置 -->
+        <div class="card">
+            <div class="card-title">📝 高级配置 (YAML)</div>
+            <div class="card-desc">直接编辑配置文件，保存后自动生效</div>
+            
+            <textarea class="form-textarea" id="configEditor"></textarea>
+            
+            <div class="btn-group">
+                <button class="btn btn-ghost" onclick="loadConfig()">重新加载</button>
+                <button class="btn btn-primary" onclick="saveConfig()">保存配置</button>
+            </div>
+        </div>
+    </div>
+    
+    <div class="toast" id="toast"></div>
+    
+    <script>
+        let config = {};
+        
+        async function loadConfig() {
+            try {
+                const response = await fetch('/proxy/config');
+                config = await response.json();
+                document.getElementById('configEditor').value = JSON.stringify(config, null, 2);
+                updateIpList();
+                updateModelsTable();
+                updateFormValues();
+                showToast('配置已加载');
+            } catch (error) {
+                showToast('加载配置失败', true);
+            }
+        }
+        
+        async function saveConfig() {
+            try {
+                const configText = document.getElementById('configEditor').value;
+                const newConfig = JSON.parse(configText);
+                const response = await fetch('/proxy/config', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(newConfig)
+                });
+                if (response.ok) {
+                    config = newConfig;
+                    showToast('配置已保存');
+                } else {
+                    showToast('保存失败', true);
+                }
+            } catch (error) {
+                showToast('配置格式错误', true);
+            }
+        }
+        
+        function updateIpList() {
+            const ipList = document.getElementById('ipList');
+            const allowedIps = config.server?.allowed_ips || [];
+            
+            ipList.innerHTML = allowedIps.map(ip => `
+                <div class="ip-tag">
+                    <span>${ip}</span>
+                    <span class="remove" onclick="removeIp('${ip}')">&times;</span>
+                </div>
+            `).join('');
+        }
+        
+        async function addIp() {
+            const input = document.getElementById('newIp');
+            const ip = input.value.trim();
+            
+            if (!ip) {
+                showToast('请输入 IP 地址', true);
+                return;
+            }
+            
+            try {
+                const response = await fetch('/proxy/ip-whitelist/add', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ip })
+                });
+                
+                if (response.ok) {
+                    input.value = '';
+                    await loadConfig();
+                    showToast(`IP ${ip} 已添加`);
+                } else {
+                    showToast('添加失败', true);
+                }
+            } catch (error) {
+                showToast('添加失败', true);
+            }
+        }
+        
+        async function removeIp(ip) {
+            try {
+                const response = await fetch('/proxy/ip-whitelist/remove', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ip })
+                });
+                
+                if (response.ok) {
+                    await loadConfig();
+                    showToast(`IP ${ip} 已移除`);
+                } else {
+                    showToast('移除失败', true);
+                }
+            } catch (error) {
+                showToast('移除失败', true);
+            }
+        }
+        
+        function updateModelsTable() {
+            const tbody = document.getElementById('modelsTableBody');
+            const models = config.models?.available || {};
+            
+            tbody.innerHTML = Object.entries(models).map(([name, model]) => `
+                <tr>
+                    <td>
+                        <div class="model-name">${name}</div>
+                        <div class="model-id">${model.model}</div>
+                    </td>
+                    <td>${model.provider || '-'}</td>
+                    <td>${model.priority}</td>
+                    <td>${model.free ? '<span class="tag tag-free">免费</span>' : model.peak_only ? '<span class="tag tag-peak">高峰期</span>' : '<span class="tag tag-paid">付费</span>'}</td>
+                    <td>${model.enabled !== false ? '<span class="tag tag-enabled">启用</span>' : '<span class="tag tag-disabled">禁用</span>'}</td>
+                    <td>
+                        <div class="toggle ${model.enabled !== false ? 'active' : ''}" onclick="toggleModel('${name}', ${model.enabled === false})"></div>
+                    </td>
+                </tr>
+            `).join('');
+        }
+        
+        async function toggleModel(name, enable) {
+            try {
+                const response = await fetch(`/proxy/models/${name}/${enable ? 'enable' : 'disable'}`, { method: 'POST' });
+                if (response.ok) {
+                    await loadConfig();
+                    showToast(`模型 ${name} 已${enable ? '启用' : '禁用'}`);
+                } else {
+                    showToast('操作失败', true);
+                }
+            } catch (error) {
+                showToast('操作失败', true);
+            }
+        }
+        
+        function updateFormValues() {
+            const usage = config.usage || {};
+            document.getElementById('dailyBudget').value = usage.daily_budget || 50;
+            document.getElementById('monthlyBudget').value = usage.monthly_budget || 500;
+            document.getElementById('maxTokensPerDay').value = usage.max_tokens_per_day || 5000000;
+            document.getElementById('maxTokensPerRequest').value = usage.max_tokens_per_request || 100000;
+            
+            const schedule = config.schedule || {};
+            document.getElementById('peakStrategy').value = schedule.peak_strategy || 'minimax';
+            document.getElementById('peakParallelLimit').value = schedule.peak_parallel_limit || 1;
+            document.getElementById('mimoPriorityHours').value = (schedule.mimo_priority_hours || [0,1,2,3,4,5,6,7]).join(',');
+            document.getElementById('peakSkipWeekends').value = schedule.peak_skip_weekends !== false ? 'true' : 'false';
+            
+            const failover = config.failover || {};
+            document.getElementById('maxRetries').value = failover.max_retries || 5;
+            document.getElementById('maxConsecutiveFailures').value = failover.max_consecutive_failures || 3;
+            document.getElementById('recoveryTime').value = failover.recovery_time || 3600;
+            document.getElementById('fallbackToFree').value = failover.fallback_to_free !== false ? 'true' : 'false';
+        }
+        
+        async function saveUsageConfig() {
+            if (!config.usage) config.usage = {};
+            config.usage.daily_budget = parseFloat(document.getElementById('dailyBudget').value);
+            config.usage.monthly_budget = parseFloat(document.getElementById('monthlyBudget').value);
+            config.usage.max_tokens_per_day = parseInt(document.getElementById('maxTokensPerDay').value);
+            config.usage.max_tokens_per_request = parseInt(document.getElementById('maxTokensPerRequest').value);
+            await saveConfigToServer();
+        }
+        
+        async function saveScheduleConfig() {
+            if (!config.schedule) config.schedule = {};
+            config.schedule.peak_strategy = document.getElementById('peakStrategy').value;
+            config.schedule.peak_parallel_limit = parseInt(document.getElementById('peakParallelLimit').value);
+            config.schedule.mimo_priority_hours = document.getElementById('mimoPriorityHours').value.split(',').map(Number);
+            config.schedule.peak_skip_weekends = document.getElementById('peakSkipWeekends').value === 'true';
+            await saveConfigToServer();
+        }
+        
+        async function saveFailoverConfig() {
+            if (!config.failover) config.failover = {};
+            config.failover.max_retries = parseInt(document.getElementById('maxRetries').value);
+            config.failover.max_consecutive_failures = parseInt(document.getElementById('maxConsecutiveFailures').value);
+            config.failover.recovery_time = parseInt(document.getElementById('recoveryTime').value);
+            config.failover.fallback_to_free = document.getElementById('fallbackToFree').value === 'true';
+            await saveConfigToServer();
+        }
+        
+        async function saveConfigToServer() {
+            try {
+                const response = await fetch('/proxy/config', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(config)
+                });
+                
+                if (response.ok) {
+                    document.getElementById('configEditor').value = JSON.stringify(config, null, 2);
+                    showToast('配置已保存');
+                } else {
+                    showToast('保存失败', true);
+                }
+            } catch (error) {
+                showToast('保存失败', true);
+            }
+        }
+        
+        function showToast(message, isError = false) {
+            const toast = document.getElementById('toast');
+            toast.textContent = message;
+            toast.className = `toast show ${isError ? 'error' : 'success'}`;
+            setTimeout(() => toast.className = 'toast', 3000);
+        }
+        
+        document.getElementById('newIp').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') addIp();
+        });
+        
+        loadConfig();
+    </script>
+</body>
+</html>
