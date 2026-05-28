@@ -5,60 +5,60 @@
 <h1 align="center">LLM Proxy</h1>
 
 <p align="center">
-  一个轻量级、高性能的 LLM API 代理服务器
+  A lightweight, high-performance LLM API proxy server
 </p>
 
 <p align="center">
-  <a href="README_EN.md">English</a> | 中文
+  English | <a href="README_CN.md">中文</a>
 </p>
 
 ---
 
-## 功能特性
+## Features
 
-- **多模型管理** - 支持配置多个 LLM 提供商和模型，统一入口调用
-- **智能负载均衡** - 自动分发请求到可用模型
-- **故障转移** - 检测失败自动切换备用模型，保障服务可用性
-- **请求日志** - 完整记录所有 API 请求和响应
-- **IP 白名单** - 精细化访问控制
-- **热重载配置** - 修改配置无需重启服务
-- **Web 管理面板** - 直观的可视化管理界面
+- **Multi-Model Management** - Configure multiple LLM providers and models with a unified endpoint
+- **Smart Load Balancing** - Automatically distribute requests across available models
+- **Failover** - Detect failures and switch to backup models to ensure availability
+- **Request Logging** - Complete logging of all API requests and responses
+- **IP Whitelist** - Fine-grained access control
+- **Hot Reload** - Update configuration without restarting the server
+- **Web Dashboard** - Intuitive visual management interface
 
-## 界面预览
+## Screenshots
 
-### 仪表盘
+### Dashboard
 
 ![Dashboard](dashboard.png)
 
-### 模型管理
+### Model Management
 
 ![Models](models.png)
 
-### 配置管理
+### Configuration
 
 ![Config](cofing.png)
 
-### 请求日志
+### Request Logs
 
 ![Logs](logs.png)
 
-## 快速开始
+## Quick Start
 
-### 安装依赖
+### Install Dependencies
 
 ```bash
 pip install fastapi uvicorn httpx pyyaml
 ```
 
-### 启动服务
+### Start Server
 
 ```bash
 uvicorn llm_proxy.server:app --host 0.0.0.0 --port 8000
 ```
 
-### 配置模型
+### Configure Models
 
-编辑 `proxy_config.yaml`：
+Edit `proxy_config.yaml`:
 
 ```yaml
 models:
@@ -70,30 +70,30 @@ models:
       model: model-name
 ```
 
-## 项目结构
+## Project Structure
 
 ```
 llm_proxy/
-├── server.py           # 主服务器
-├── model_manager.py    # 模型管理与负载均衡
-├── config_watcher.py   # 配置文件热重载
-├── health_checker.py   # 模型健康检查
-├── request_logger.py   # 请求日志记录
-├── usage_controller.py # 用量控制
-├── time_controller.py  # 时间控制
-├── proxy_config.yaml   # 配置文件
-├── static/             # 前端静态资源
-└── logs/               # 日志目录
+├── server.py           # Main server
+├── model_manager.py    # Model management & load balancing
+├── config_watcher.py   # Config file hot reload
+├── health_checker.py   # Model health checks
+├── request_logger.py   # Request logging
+├── usage_controller.py # Usage control
+├── time_controller.py  # Time control
+├── proxy_config.yaml   # Configuration file
+├── static/             # Frontend static assets
+└── logs/               # Log directory
 ```
 
-## API 接口
+## API Endpoints
 
-| 接口 | 说明 |
-|------|------|
-| `POST /v1/chat/completions` | Chat Completions 兼容接口 |
-| `GET /v1/models` | 获取可用模型列表 |
-| `GET /admin/dashboard` | 管理面板 |
-| `GET /admin/logs` | 请求日志 |
+| Endpoint | Description |
+|----------|-------------|
+| `POST /v1/chat/completions` | Chat Completions compatible API |
+| `GET /v1/models` | List available models |
+| `GET /admin/dashboard` | Admin dashboard |
+| `GET /admin/logs` | Request logs |
 
 ## License
 
