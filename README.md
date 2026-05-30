@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="images/ChatGPT Image May 27, 2026, 11_09_44 AM.png" width="200" />
+  <img src="images/ChatGPT Image May 27, 2026, 11_09_44 AM.png" width="180" />
 </p>
 
 <h1 align="center">LLM Proxy</h1>
@@ -9,14 +9,19 @@
 </p>
 
 <p align="center">
-  English | <a href="README_CN.md">中文</a>
+  <a href="README_CN.md">中文</a> | English
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.10+-blue.svg" />
+  <img src="https://img.shields.io/badge/License-MIT-green.svg" />
 </p>
 
 ---
 
 ## Features
 
-- **Multi-Model Management** - Configure multiple LLM providers and models with a unified endpoint
+- **Multi-Model Management** - Configure multiple LLM providers with a unified OpenAI-compatible endpoint
 - **Smart Load Balancing** - Automatically distribute requests across available models
 - **Failover** - Detect failures and switch to backup models to ensure availability
 - **Request Logging** - Complete logging of all API requests and responses
@@ -26,39 +31,25 @@
 
 ## Screenshots
 
-### Dashboard
+| Dashboard | Model Management |
+|-----------|------------------|
+| ![Dashboard](images/dashboard.png) | ![Models](images/models.png) |
 
-![Dashboard](images/dashboard.png)
-
-### Model Management
-
-![Models](images/models.png)
-
-### Configuration
-
-![Config](images/cofing.png)
-
-### Request Logs
-
-![Logs](images/logs.png)
+| Configuration | Request Logs |
+|---------------|--------------|
+| ![Config](images/cofing.png) | ![Logs](images/logs.png) |
 
 ## Quick Start
 
-### Install Dependencies
+### 1. Install Dependencies
 
 ```bash
 pip install fastapi uvicorn httpx pyyaml
 ```
 
-### Start Server
+### 2. Configure Models
 
-```bash
-uvicorn llm_proxy.server:app --host 0.0.0.0 --port 8000
-```
-
-### Configure Models
-
-Edit `proxy_config.yaml`:
+Create or edit `proxy_config.yaml`:
 
 ```yaml
 models:
@@ -70,29 +61,21 @@ models:
       model: model-name
 ```
 
-## Project Structure
+### 3. Start Server
 
+```bash
+uvicorn llm_proxy.server:app --host 0.0.0.0 --port 8000
 ```
-llm_proxy/
-├── server.py           # Main server
-├── model_manager.py    # Model management & load balancing
-├── config_watcher.py   # Config file hot reload
-├── health_checker.py   # Model health checks
-├── request_logger.py   # Request logging
-├── usage_controller.py # Usage control
-├── time_controller.py  # Time control
-├── proxy_config.yaml   # Configuration file
-├── static/             # Frontend static assets
-└── logs/               # Log directory
-```
+
+Server will be available at `http://localhost:8000`, with the dashboard at `http://localhost:8000/`.
 
 ## API Usage
 
+The proxy is fully compatible with the **OpenAI Chat Completions API** format.
+
 ### Chat Completions
 
-The proxy is fully compatible with the OpenAI Chat Completions API format.
-
-**Basic Request (non-streaming):**
+**cURL (non-streaming):**
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -106,7 +89,7 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
-**Streaming Request:**
+**cURL (streaming):**
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
@@ -147,48 +130,26 @@ response = client.chat.completions.create(
 )
 ```
 
-### List Models
+### Management API
 
 ```bash
+# List available models
 curl http://localhost:8000/v1/models
-```
 
-Response:
-
-```json
-{
-  "object": "list",
-  "data": [
-    {"id": "my-model", "object": "model", "created": 0, "owned_by": "proxy"}
-  ]
-}
-```
-
-### Proxy Status
-
-```bash
+# Proxy status
 curl http://localhost:8000/proxy/status
-```
 
-### Health Check
-
-```bash
+# Health check
 curl http://localhost:8000/proxy/health
-```
 
-### Usage Statistics
-
-```bash
+# Usage statistics
 curl http://localhost:8000/proxy/usage
-```
 
-### Request Logs
-
-```bash
+# Request logs
 curl http://localhost:8000/proxy/logs
 ```
 
-## API Endpoints Reference
+## API Reference
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -202,6 +163,23 @@ curl http://localhost:8000/proxy/logs
 | `/proxy/models/{name}/enable` | POST | Enable a model |
 | `/proxy/models/{name}/disable` | POST | Disable a model |
 | `/proxy/models/{name}/test` | POST | Test a model connection |
+
+## Project Structure
+
+```
+llm_proxy/
+├── server.py           # Main server
+├── model_manager.py    # Model management & load balancing
+├── config_watcher.py   # Config file hot reload
+├── health_checker.py   # Model health checks
+├── request_logger.py   # Request logging
+├── usage_controller.py # Usage control
+├── time_controller.py  # Time control
+├── proxy_config.yaml   # Configuration file
+├── static/             # Frontend static assets
+├── images/             # README screenshots
+└── logs/               # Log directory
+```
 
 ## License
 
