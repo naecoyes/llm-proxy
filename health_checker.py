@@ -1,8 +1,11 @@
 """健康管理器 - 管理模型健康状态"""
 
+import json
 import logging
 import time
 from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -57,10 +60,13 @@ class HealthChecker:
         "litellm.RateLimitError",
     ]
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, stats_dir: str = "stats"):
         self.config = config
+        self.stats_dir = Path(stats_dir)
+        self.stats_dir.mkdir(parents=True, exist_ok=True)
         self.health_state: Dict[str, ModelHealth] = {}
         self._update_config(config)
+        self._load_health_state()
 
     def _update_config(self, config: dict):
         """更新配置"""
@@ -81,6 +87,62 @@ class HealthChecker:
         self.config = config
         self._update_config(config)
         logger.info("健康管理器配置已更新")
+
+    def _get_health_file(self) -> Path:
+        """获取健康状态文件路径"""
+        return self.stats_dir / "health_state.json"
+
+    def _load_health_state(self):
+        """从磁盘加载健康状态"""
+        health_file = self._get_health_file()
+        if not health_file.exists():
+            return
+        
+        try:
+            with open(health_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            for model_name, state in data.items():
+                self.health_state[model_name] = ModelHealth(
+                    healthy=state.get("healthy", True),
+                    reason=state.get("reason", ""),
+                    failed_at=state.get("failed_at", 0.0),
+                    next_probe_at=state.get("next_probe_at", 0.0),
+                    probe_in_flight=state.get("probe_in_flight", False),
+                    consecutive_failures=state.get("consecutive_failures", 0),
+                    total_failures=state.get("total_failures", 0),
+                    total_successes=state.get("total_successes", 0),
+                    last_success_at=state.get("last_success_at", 0.0),
+                    last_failure_at=state.get("last_failure_at", 0.0),
+                )
+            
+            logger.info(f"已加载健康状态: {len(self.health_state)} 个模型")
+        except Exception as e:
+            logger.warning(f"加载健康状态失败: {e}")
+
+    def _save_health_state(self):
+        """保存健康状态到磁盘"""
+        health_file = self._get_health_file()
+        try:
+            data = {}
+            for model_name, state in self.health_state.items():
+                data[model_name] = {
+                    "healthy": state.healthy,
+                    "reason": state.reason,
+                    "failed_at": state.failed_at,
+                    "next_probe_at": state.next_probe_at,
+                    "probe_in_flight": state.probe_in_flight,
+                    "consecutive_failures": state.consecutive_failures,
+                    "total_failures": state.total_failures,
+                    "total_successes": state.total_successes,
+                    "last_success_at": state.last_success_at,
+                    "last_failure_at": state.last_failure_at,
+                }
+            
+            with open(health_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.warning(f"保存健康状态失败: {e}")
 
     def initialize_model(self, model_name: str):
         """初始化模型健康状态"""
@@ -114,6 +176,7 @@ class HealthChecker:
             state.last_failure_at = time.time()
 
         self.health_state[model_name] = state
+        self._save_health_state()
 
         logger.warning(
             f"⚠️ 模型 {model_name} 标记为不健康: {reason} | "
@@ -139,6 +202,7 @@ class HealthChecker:
         state.last_success_at = time.time()
 
         self.health_state[model_name] = state
+        self._save_health_state()
 
         if was_unhealthy:
             logger.info(f"🟢 模型 {model_name} 已恢复正常")

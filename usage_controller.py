@@ -112,14 +112,25 @@ class UsageController:
             try:
                 with open(stats_file, "r") as f:
                     data = json.load(f)
+                
+                # 检查日期是否是今天
+                file_date = data.get("date", "")
+                today = datetime.now().strftime("%Y-%m-%d")
+                if file_date != today:
+                    logger.info(f"统计文件日期 ({file_date}) 不是今天 ({today})，跳过加载")
+                    return
+                
                 for model_name, stats in data.get("models", {}).items():
                     self.model_stats[model_name] = UsageStats(**stats)
                 self.daily_stats["total"] = UsageStats(**data.get("total", {}))
 
-                # 加载每小时数据
+                # 加载每小时数据（只加载当前小时之前的）
+                current_hour = datetime.now().hour
                 for slot, slot_data in data.get("hourly", {}).items():
-                    for model_name, stats in slot_data.items():
-                        self.hourly_stats[slot][model_name] = UsageStats(**stats)
+                    slot_hour = int(slot)
+                    if slot_hour < current_hour:
+                        for model_name, stats in slot_data.items():
+                            self.hourly_stats[slot][model_name] = UsageStats(**stats)
 
                 logger.info(f"已加载今日统计: {stats_file}")
             except Exception as e:
@@ -383,7 +394,7 @@ class UsageController:
             return self._get_hourly_trend(model)
 
     def _get_hourly_trend(self, model: str = None) -> dict:
-        """获取4小时粒度趋势数据
+        """获取4小时粒度趋势数据（按 provider 聚合）
 
         Args:
             model: 模型名称，None 表示全部
@@ -406,26 +417,36 @@ class UsageController:
         else:
             models_to_show = sorted(all_models)
 
-        # 构建数据集
+        # 按 provider 分组聚合
+        provider_data = {}  # provider -> {tokens: [], input: [], output: [], requests: []}
+        
         for model_name in models_to_show:
-            tokens_data = []
-            input_data = []
-            output_data = []
-            requests_data = []
-
-            for slot in labels:
+            # 获取 provider（从模型名推断）
+            provider = self._get_provider_from_model(model_name)
+            
+            if provider not in provider_data:
+                provider_data[provider] = {
+                    "tokens": [0] * len(labels),
+                    "input_tokens": [0] * len(labels),
+                    "output_tokens": [0] * len(labels),
+                    "requests": [0] * len(labels),
+                }
+            
+            for i, slot in enumerate(labels):
                 slot_stats = self.hourly_stats.get(slot, {}).get(model_name, UsageStats())
-                tokens_data.append(slot_stats.tokens)
-                input_data.append(slot_stats.input_tokens)
-                output_data.append(slot_stats.output_tokens)
-                requests_data.append(slot_stats.requests)
+                provider_data[provider]["tokens"][i] += slot_stats.tokens
+                provider_data[provider]["input_tokens"][i] += slot_stats.input_tokens
+                provider_data[provider]["output_tokens"][i] += slot_stats.output_tokens
+                provider_data[provider]["requests"][i] += slot_stats.requests
 
+        # 构建数据集
+        for provider, data in sorted(provider_data.items()):
             datasets.append({
-                "model": model_name,
-                "tokens": tokens_data,
-                "input_tokens": input_data,
-                "output_tokens": output_data,
-                "requests": requests_data,
+                "model": provider,
+                "tokens": data["tokens"],
+                "input_tokens": data["input_tokens"],
+                "output_tokens": data["output_tokens"],
+                "requests": data["requests"],
             })
 
         return {
@@ -433,6 +454,20 @@ class UsageController:
             "labels": labels,
             "datasets": datasets,
         }
+
+    def _get_provider_from_model(self, model_name: str) -> str:
+        """从模型名推断 provider"""
+        model_lower = model_name.lower()
+        if "mimo" in model_lower or "xiaomi" in model_lower:
+            return "xiaomi"
+        elif "nvidia" in model_lower:
+            return "nvidia"
+        elif "openrouter" in model_lower or "or-" in model_lower:
+            return "openrouter"
+        elif "minimax" in model_lower:
+            return "minimax"
+        else:
+            return "other"
 
     def _get_daily_trend(self, model: str = None) -> dict:
         """获取天粒度趋势数据
@@ -460,27 +495,36 @@ class UsageController:
         else:
             models_to_show = sorted(all_models)
 
+        # 按 provider 分组聚合
+        provider_data = {}  # provider -> {tokens: [], input: [], output: [], requests: []}
+        
+        for model_name in models_to_show:
+            provider = self._get_provider_from_model(model_name)
+            
+            if provider not in provider_data:
+                provider_data[provider] = {
+                    "tokens": [0] * len(dates),
+                    "input_tokens": [0] * len(dates),
+                    "output_tokens": [0] * len(dates),
+                    "requests": [0] * len(dates),
+                }
+            
+            for i, date in enumerate(dates):
+                model_stats = historical[date].get("models", {}).get(model_name, {})
+                provider_data[provider]["tokens"][i] += model_stats.get("tokens", 0)
+                provider_data[provider]["input_tokens"][i] += model_stats.get("input_tokens", 0)
+                provider_data[provider]["output_tokens"][i] += model_stats.get("output_tokens", 0)
+                provider_data[provider]["requests"][i] += model_stats.get("requests", 0)
+
         # 构建数据集
         datasets = []
-        for model_name in models_to_show:
-            tokens_data = []
-            input_data = []
-            output_data = []
-            requests_data = []
-
-            for date in dates:
-                model_stats = historical[date].get("models", {}).get(model_name, {})
-                tokens_data.append(model_stats.get("tokens", 0))
-                input_data.append(model_stats.get("input_tokens", 0))
-                output_data.append(model_stats.get("output_tokens", 0))
-                requests_data.append(model_stats.get("requests", 0))
-
+        for provider, data in sorted(provider_data.items()):
             datasets.append({
-                "model": model_name,
-                "tokens": tokens_data,
-                "input_tokens": input_data,
-                "output_tokens": output_data,
-                "requests": requests_data,
+                "model": provider,
+                "tokens": data["tokens"],
+                "input_tokens": data["input_tokens"],
+                "output_tokens": data["output_tokens"],
+                "requests": data["requests"],
             })
 
         return {

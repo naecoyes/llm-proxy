@@ -839,20 +839,25 @@
             const select = document.getElementById('trendModelFilter');
             const currentValue = select.value;
 
-            // 获取所有模型名称
-            const models = statusData?.models ? Object.keys(statusData.models) : [];
+            // 获取所有 provider 名称
+            const providers = new Set();
+            if (statusData?.models) {
+                Object.values(statusData.models).forEach(m => {
+                    if (m.provider) providers.add(m.provider);
+                });
+            }
 
             // 清空并重新填充选项
-            select.innerHTML = '<option value="">All Models</option>';
-            models.forEach(model => {
+            select.innerHTML = '<option value="">All Providers</option>';
+            Array.from(providers).sort().forEach(provider => {
                 const option = document.createElement('option');
-                option.value = model;
-                option.textContent = model;
+                option.value = provider;
+                option.textContent = provider;
                 select.appendChild(option);
             });
 
             // 恢复之前的选择
-            if (currentValue && models.includes(currentValue)) {
+            if (currentValue && providers.has(currentValue)) {
                 select.value = currentValue;
             }
         }
@@ -873,65 +878,31 @@
 
             const { labels, datasets } = trendData;
 
-            // 颜色配置 - 每个模型一个颜色
-            const modelColors = [
-                'rgb(99, 102, 241)',    // indigo
-                'rgb(16, 185, 129)',    // emerald
-                'rgb(245, 158, 11)',    // amber
-                'rgb(239, 68, 68)',     // red
-                'rgb(168, 85, 247)',    // purple
-                'rgb(59, 130, 246)',    // blue
-                'rgb(236, 72, 153)',    // pink
-                'rgb(20, 184, 166)',    // teal
-                'rgb(34, 197, 94)',     // green
-                'rgb(249, 115, 22)',    // orange
-            ];
+            // Provider 颜色配置
+            const providerColors = {
+                'xiaomi': 'rgb(99, 102, 241)',     // indigo
+                'openrouter': 'rgb(16, 185, 129)', // emerald
+                'nvidia': 'rgb(245, 158, 11)',     // amber
+                'minimax': 'rgb(239, 68, 68)',     // red
+                'other': 'rgb(168, 85, 247)',      // purple
+            };
 
-            // 构建数据集: input实线, output虚线
+            // 构建数据集: 每个 provider 一条线
             const allDatasets = [];
             datasets.forEach((ds, i) => {
-                const color = modelColors[i % modelColors.length];
+                const provider = ds.model;
+                const color = providerColors[provider] || `hsl(${i * 60}, 70%, 50%)`;
 
-                // Input tokens - 实线, 左Y轴
                 allDatasets.push({
-                    label: ds.model + ' input',
-                    data: ds.input_tokens,
+                    label: provider,
+                    data: ds.tokens,
                     borderColor: color,
                     backgroundColor: 'transparent',
                     borderWidth: 2,
                     fill: false,
                     tension: 0.3,
-                    pointRadius: 3,
-                    yAxisID: 'y',
-                });
-
-                // Output tokens - 虚线, 左Y轴
-                allDatasets.push({
-                    label: ds.model + ' output',
-                    data: ds.output_tokens,
-                    borderColor: color,
-                    backgroundColor: 'transparent',
-                    borderWidth: 2,
-                    borderDash: [6, 4],
-                    fill: false,
-                    tension: 0.3,
-                    pointRadius: 3,
-                    yAxisID: 'y',
-                });
-
-                // Requests - 点线, 右Y轴
-                allDatasets.push({
-                    label: ds.model + ' requests',
-                    data: ds.requests,
-                    borderColor: color,
-                    backgroundColor: 'transparent',
-                    borderWidth: 1.5,
-                    borderDash: [2, 3],
-                    fill: false,
-                    tension: 0.3,
-                    pointRadius: 2,
-                    pointStyle: 'rect',
-                    yAxisID: 'y1',
+                    pointRadius: 4,
+                    pointHoverRadius: 6,
                 });
             });
 
@@ -942,14 +913,8 @@
                 plugins: {
                     legend: {
                         display: true,
-                        position: 'bottom',
-                        labels: {
-                            color: 'oklch(0.5 0 0)',
-                            font: { size: 11 },
-                            boxWidth: 20,
-                            padding: 10,
-                            usePointStyle: true,
-                        }
+                        position: 'top',
+                        labels: { color: 'oklch(0.5 0 0)', font: { size: 11 } }
                     },
                     tooltip: {
                         backgroundColor: 'oklch(0.2 0 0)',
@@ -963,30 +928,26 @@
                             label: function(context) {
                                 let label = context.dataset.label || '';
                                 let value = context.parsed.y;
-                                if (value >= 1e6) return label + ': ' + (value/1e6).toFixed(2) + 'M';
-                                if (value >= 1e3) return label + ': ' + (value/1e3).toFixed(1) + 'K';
-                                return label + ': ' + value;
+                                if (value >= 1e6) return label + ': ' + (value/1e6).toFixed(1) + 'M tokens';
+                                if (value >= 1e3) return label + ': ' + (value/1e3).toFixed(1) + 'K tokens';
+                                return label + ': ' + value + ' tokens';
                             }
                         }
                     }
                 },
                 scales: {
-                    x: { grid: { display: false }, ticks: { color: 'oklch(0.5 0 0)', font: { size: 11 } } },
+                    x: {
+                        grid: { display: false },
+                        ticks: { color: 'oklch(0.5 0 0)', font: { size: 11 } }
+                    },
                     y: {
-                        type: 'linear',
-                        display: true,
-                        position: 'left',
                         title: { display: true, text: 'Tokens', color: 'oklch(0.5 0 0)', font: { size: 11 } },
                         grid: { color: 'oklch(0.2 0 0)' },
-                        ticks: { color: 'oklch(0.5 0 0)', font: { size: 11 }, callback: v => v >= 1e6 ? (v/1e6).toFixed(1)+'M' : v >= 1e3 ? (v/1e3).toFixed(0)+'K' : v }
-                    },
-                    y1: {
-                        type: 'linear',
-                        display: true,
-                        position: 'right',
-                        title: { display: true, text: 'Requests', color: 'oklch(0.5 0 0)', font: { size: 11 } },
-                        grid: { drawOnChartArea: false },
-                        ticks: { color: 'oklch(0.5 0 0)', font: { size: 11 } }
+                        ticks: {
+                            color: 'oklch(0.5 0 0)',
+                            font: { size: 11 },
+                            callback: v => v >= 1e6 ? (v/1e6).toFixed(1)+'M' : v >= 1e3 ? (v/1e3).toFixed(0)+'K' : v
+                        }
                     }
                 }
             };
@@ -1040,11 +1001,32 @@
             const providers = {};
             for (const [name, m] of Object.entries(models)) {
                 const p = m.provider || 'unknown';
-                if (!providers[p]) providers[p] = { total: 0, healthy: 0, unhealthy: 0 };
+                if (!providers[p]) providers[p] = { total: 0, healthy: 0, unhealthy: 0, tokens: 0, requests: 0 };
                 providers[p].total++;
                 if (!m.enabled) {}
                 else if (m.health?.healthy === false) providers[p].unhealthy++;
                 else providers[p].healthy++;
+            }
+            
+            // 添加 token 使用量数据
+            const perModel = statusData?.usage?.per_model || {};
+            for (const [modelName, usage] of Object.entries(perModel)) {
+                const m = models[modelName];
+                if (m) {
+                    const p = m.provider || 'unknown';
+                    if (providers[p]) {
+                        providers[p].tokens += usage.tokens || 0;
+                        providers[p].requests += usage.requests || 0;
+                    }
+                }
+            }
+            
+            // 格式化 token 数量
+            function formatTokens(n) {
+                if (n >= 1e9) return (n/1e9).toFixed(1) + 'B';
+                if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
+                if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
+                return n.toString();
             }
             
             let html = '';
@@ -1062,6 +1044,10 @@
                         <div class="provider-stats">
                             <div class="provider-stat"><div class="dot green"></div>${s.healthy} healthy</div>
                             <div class="provider-stat"><div class="dot red"></div>${s.unhealthy} unhealthy</div>
+                        </div>
+                        <div class="provider-usage" style="margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); font-size: 11px; color: var(--muted-foreground);">
+                            <div>${formatTokens(s.tokens)} tokens</div>
+                            <div>${s.requests} requests</div>
                         </div>
                     </div>
                 `;

@@ -44,11 +44,13 @@ class ModelManager:
         self._round_robin_counter = 0  # 轮询计数器
         self._active_models: set = set()  # 当前正在使用的模型
         self._active_models_lock = __import__('threading').Lock()
+        self._slot_model_map: Dict[int, str] = {}  # slot -> model_name 固定分配
+        self._slot_model_lock = __import__('threading').Lock()
 
         # 初始化子控制器
         self.time_controller = TimeController(config)
         self.usage_controller = UsageController(config, stats_dir)
-        self.health_checker = HealthChecker(config)
+        self.health_checker = HealthChecker(config, stats_dir)
 
         # 加载配置
         self._load_providers(config)
@@ -314,6 +316,7 @@ class ModelManager:
         """根据固定序号选择模型（auto1, auto2, auto3...）
 
         每个序号固定映射到一个模型，失败时自动切换到下一个可用模型。
+        同一个 slot 每次请求都返回同一个模型（除非模型不健康）。
 
         Args:
             slot: 序号（从1开始）
@@ -321,6 +324,15 @@ class ModelManager:
         Returns:
             (模型名称, 模型配置)
         """
+        with self._slot_model_lock:
+            # 检查该 slot 是否已有分配且模型健康
+            if slot in self._slot_model_map:
+                assigned = self._slot_model_map[slot]
+                if assigned in self.models and self.health_checker.is_healthy(assigned):
+                    logger.debug(f"固定分配模型: auto{slot} -> {assigned} (复用)")
+                    return assigned, self.models[assigned]
+
+        # 需要重新分配
         available = self._get_available_models()
         if not available:
             raise NoAvailableModelError("没有可用的模型")
@@ -335,18 +347,31 @@ class ModelManager:
             if self.models.get(name, ModelConfig(name="", model="", api_key="", api_base="")).priority == highest_priority
         ]
 
+        # 排除已分配给其他 slot 的模型
+        with self._slot_model_lock:
+            assigned_models = set(self._slot_model_map.values())
+            available_for_slot = [m for m in same_priority if m not in assigned_models or m == self._slot_model_map.get(slot)]
+
+        # 如果没有可用模型，使用原始列表
+        if not available_for_slot:
+            available_for_slot = same_priority
+
         # 根据序号选择固定模型
-        idx = (slot - 1) % len(same_priority)
-        selected = same_priority[idx]
+        idx = (slot - 1) % len(available_for_slot)
+        selected = available_for_slot[idx]
 
         # 如果选中的模型不健康，尝试下一个
         if not self.health_checker.is_healthy(selected):
-            for i in range(1, len(same_priority)):
-                next_idx = (idx + i) % len(same_priority)
-                candidate = same_priority[next_idx]
+            for i in range(1, len(available_for_slot)):
+                next_idx = (idx + i) % len(available_for_slot)
+                candidate = available_for_slot[next_idx]
                 if self.health_checker.is_healthy(candidate):
                     selected = candidate
                     break
+
+        # 记录分配
+        with self._slot_model_lock:
+            self._slot_model_map[slot] = selected
 
         logger.debug(f"固定分配模型: auto{slot} -> {selected}")
         return selected, self.models[selected]

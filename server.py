@@ -237,7 +237,7 @@ class LLMProxyServer:
         return results
 
     async def test_model(self, model_name: str) -> dict:
-        """测试单个模型连接"""
+        """测试单个模型连接（支持禁用模型）"""
         if model_name not in self.model_manager.models:
             return {
                 "status": "error",
@@ -245,12 +245,6 @@ class LLMProxyServer:
             }
         
         model_config = self.model_manager.models[model_name]
-        
-        if not model_config.enabled:
-            return {
-                "status": "disabled",
-                "message": "Model is disabled"
-            }
         
         try:
             start_time = time.time()
@@ -1012,7 +1006,6 @@ def create_app(config_path: str) -> FastAPI:
             "api_key": config.api_key,
             "provider": config.provider,
             "priority": config.priority,
-            "weight": config.weight,
             "enabled": config.enabled and model_name not in server.model_manager.disabled_models,
             "peak_only": config.peak_only,
             "free": config.free,
