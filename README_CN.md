@@ -22,12 +22,14 @@
 ## 功能特性
 
 - **多模型管理** - 支持配置多个 LLM 提供商，统一 OpenAI 兼容接口
+- **Anthropic API 支持** - 原生支持 Anthropic Claude 模型，自动完成 OpenAI ↔ Anthropic 格式转换（含流式）
 - **智能负载均衡** - 自动分发请求到可用模型
 - **故障转移** - 检测失败自动切换备用模型，保障服务可用性
+- **自动禁用** - 健康检查连续失败超阈值后自动禁用模型
 - **请求日志** - 完整记录所有 API 请求和响应
 - **IP 白名单** - 精细化访问控制
 - **热重载配置** - 修改配置无需重启服务
-- **Web 管理面板** - 直观的可视化管理界面
+- **Web 管理面板** - 直观的可视化管理界面，支持在线编辑模型
 
 ## 界面预览
 
@@ -54,11 +56,21 @@ pip install fastapi uvicorn httpx pyyaml
 ```yaml
 models:
   available:
+    # OpenAI 兼容模型
     my-model:
       api_base: https://api.example.com/v1
       api_key: your-api-key
       enabled: true
       model: model-name
+
+    # Anthropic Claude 模型
+    my-claude:
+      api_base: https://api.anthropic.com
+      api_key: your-anthropic-key
+      enabled: true
+      model: claude-sonnet-4-20250514
+      provider: anthropic
+      api_format: anthropic
 ```
 
 ### 3. 启动服务
@@ -162,6 +174,8 @@ curl http://localhost:8000/proxy/logs
 | `/proxy/config` | GET/PUT | 读取或更新配置 |
 | `/proxy/models/{name}/enable` | POST | 启用模型 |
 | `/proxy/models/{name}/disable` | POST | 禁用模型 |
+| `/proxy/models/{name}` | PUT | 更新模型配置 |
+| `/proxy/models/{name}` | DELETE | 删除模型 |
 | `/proxy/models/{name}/test` | POST | 测试模型连接 |
 
 ## 项目结构

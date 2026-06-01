@@ -26,6 +26,7 @@ class ModelConfig:
     peak_only: bool = False
     free: bool = False
     label: str = ""
+    api_format: str = "openai"  # openai 或 anthropic
 
 
 class NoAvailableModelError(Exception):
@@ -50,7 +51,7 @@ class ModelManager:
         # 初始化子控制器
         self.time_controller = TimeController(config)
         self.usage_controller = UsageController(config, stats_dir)
-        self.health_checker = HealthChecker(config, stats_dir)
+        self.health_checker = HealthChecker(config, stats_dir, self)
 
         # 加载配置
         self._load_providers(config)
@@ -64,6 +65,13 @@ class ModelManager:
     def _load_models(self, config: dict):
         """加载模型配置"""
         models_config = config.get("models", {}).get("available", {})
+        
+        # 清除不在配置中的模型
+        models_to_remove = [name for name in self.models if name not in models_config]
+        for name in models_to_remove:
+            del self.models[name]
+            logger.info(f"移除模型: {name}")
+        
         self.disabled_models.clear()
 
         for name, model_conf in models_config.items():
@@ -80,6 +88,7 @@ class ModelManager:
                 peak_only=model_conf.get("peak_only", False),
                 free=model_conf.get("free", False),
                 label=model_conf.get("label", ""),
+                api_format=model_conf.get("api_format", "openai"),
             )
 
             self.models[name] = model

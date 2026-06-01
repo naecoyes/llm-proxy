@@ -60,11 +60,12 @@ class HealthChecker:
         "litellm.RateLimitError",
     ]
 
-    def __init__(self, config: dict, stats_dir: str = "stats"):
+    def __init__(self, config: dict, stats_dir: str = "stats", model_manager=None):
         self.config = config
         self.stats_dir = Path(stats_dir)
         self.stats_dir.mkdir(parents=True, exist_ok=True)
         self.health_state: Dict[str, ModelHealth] = {}
+        self.model_manager = model_manager
         self._update_config(config)
         self._load_health_state()
 
@@ -183,6 +184,14 @@ class HealthChecker:
             f"连续失败: {state.consecutive_failures} | "
             f"下次探测: {self._format_time(state.next_probe_at)}"
         )
+
+        # 连续失败超过阈值，自动禁用模型
+        if state.consecutive_failures >= self.max_consecutive_failures:
+            if self.model_manager:
+                logger.warning(
+                    f"🚫 模型 {model_name} 连续失败 {state.consecutive_failures} 次，自动禁用"
+                )
+                self.model_manager.disable_model(model_name)
 
     def mark_healthy(self, model_name: str):
         """标记模型恢复健康

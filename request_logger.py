@@ -66,6 +66,7 @@ class RequestLogger:
         provider: str,
         messages: list,
         stream: bool = False,
+        model_id: str = "",
     ):
         """记录请求开始"""
         self._rotate_if_needed()
@@ -76,6 +77,7 @@ class RequestLogger:
             "client_ip": client_ip,
             "requested_model": requested_model,
             "actual_model": actual_model,
+            "model_id": model_id,
             "provider": provider,
             "stream": stream,
             "message_count": len(messages),

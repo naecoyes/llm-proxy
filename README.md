@@ -22,12 +22,14 @@
 ## Features
 
 - **Multi-Model Management** - Configure multiple LLM providers with a unified OpenAI-compatible endpoint
+- **Anthropic API Support** - Native support for Anthropic Claude models with automatic OpenAI ↔ Anthropic format conversion (including streaming)
 - **Smart Load Balancing** - Automatically distribute requests across available models
 - **Failover** - Detect failures and switch to backup models to ensure availability
+- **Auto-Disable** - Automatically disable models after consecutive health check failures
 - **Request Logging** - Complete logging of all API requests and responses
 - **IP Whitelist** - Fine-grained access control
 - **Hot Reload** - Update configuration without restarting the server
-- **Web Dashboard** - Intuitive visual management interface
+- **Web Dashboard** - Intuitive visual management interface with model editing support
 
 ## Screenshots
 
@@ -54,11 +56,21 @@ Create or edit `proxy_config.yaml`:
 ```yaml
 models:
   available:
+    # OpenAI-compatible model
     my-model:
       api_base: https://api.example.com/v1
       api_key: your-api-key
       enabled: true
       model: model-name
+
+    # Anthropic Claude model
+    my-claude:
+      api_base: https://api.anthropic.com
+      api_key: your-anthropic-key
+      enabled: true
+      model: claude-sonnet-4-20250514
+      provider: anthropic
+      api_format: anthropic
 ```
 
 ### 3. Start Server
@@ -162,6 +174,8 @@ curl http://localhost:8000/proxy/logs
 | `/proxy/config` | GET/PUT | Read or update configuration |
 | `/proxy/models/{name}/enable` | POST | Enable a model |
 | `/proxy/models/{name}/disable` | POST | Disable a model |
+| `/proxy/models/{name}` | PUT | Update a model's configuration |
+| `/proxy/models/{name}` | DELETE | Delete a model |
 | `/proxy/models/{name}/test` | POST | Test a model connection |
 
 ## Project Structure

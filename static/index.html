@@ -781,7 +781,7 @@
             'nvidia': '<svg viewBox="0 0 24 24" fill="#76b900"><path d="M10.212 8.976V7.62c.127-.01.256-.017.388-.021 3.596-.117 5.957 3.184 5.957 3.184s-2.548 3.647-5.282 3.647a3.227 3.227 0 01-1.063-.175v-4.109c1.4.174 1.681.812 2.523 2.258l1.873-1.627a4.905 4.905 0 00-3.67-1.846 6.594 6.594 0 00-.729.044m0-4.476v2.025c.13-.01.259-.019.388-.024 5.002-.174 8.261 4.226 8.261 4.226s-3.743 4.69-7.643 4.69c-.338 0-.675-.031-1.007-.092v1.25c.278.038.558.057.838.057 3.629 0 6.253-1.91 8.794-4.169.421.347 2.146 1.193 2.501 1.564-2.416 2.083-8.048 3.763-11.24 3.763-.308 0-.603-.02-.894-.048V19.5H24v-15H10.21zm0 9.756v1.068c-3.356-.616-4.287-4.21-4.287-4.21a7.173 7.173 0 014.287-2.138v1.172h-.005a3.182 3.182 0 00-2.502 1.178s.615 2.276 2.507 2.931m-5.961-3.3c1.436-1.935 3.604-3.148 5.961-3.336V6.523C5.81 6.887 2 10.723 2 10.723s2.158 6.427 8.21 7.015v-1.166C5.77 16 4.25 10.958 4.25 10.958h-.002z"/></svg>',
             'xiaomi': '<svg viewBox="0 0 32 32"><rect x="2" y="2" width="28" height="28" rx="6" fill="#ff6700"/><text x="16" y="22" text-anchor="middle" font-family="Arial,sans-serif" font-size="16" font-weight="bold" fill="white">Mi</text></svg>',
             'openrouter': '<svg viewBox="0 0 24 24" fill="#8b5cf6"><path d="M16.804 1.957l7.22 4.105v.087L16.73 10.21l.017-2.117-.821-.03c-1.059-.028-1.611.002-2.268.11-1.064.175-2.038.577-3.147 1.352L8.345 11.03c-.284.195-.495.336-.68.455l-.515.322-.397.234.385.23.53.338c.476.314 1.17.796 2.701 1.866 1.11.775 2.083 1.177 3.147 1.352l.3.045c.694.091 1.375.094 2.825.033l.022-2.159 7.22 4.105v.087L16.589 22l.014-1.862-.635.022c-1.386.042-2.137.002-3.138-.162-1.694-.28-3.26-.926-4.881-2.059l-2.158-1.5a21.997 21.997 0 00-.755-.498l-.467-.28a55.927 55.927 0 00-.76-.43C2.908 14.73.563 14.116 0 14.116V9.888l.14.004c.564-.007 2.91-.622 3.809-1.124l1.016-.58.438-.274c.428-.28 1.072-.726 2.686-1.853 1.621-1.133 3.186-1.78 4.881-2.059 1.152-.19 1.974-.213 3.814-.138l.02-1.907z"/></svg>',
-            'minimax': '<svg viewBox="0 0 32 32"><circle cx="16" cy="16" r="14" fill="url(#minimaxGrad)"/><defs><linearGradient id="minimaxGrad" x1="0" y1="0" x2="32" y2="32"><stop offset="0%" stop-color="#E2167E"/><stop offset="100%" stop-color="#FE603C"/></linearGradient></defs><text x="16" y="21" text-anchor="middle" font-family="Arial,sans-serif" font-size="12" font-weight="bold" fill="white">M</text></svg>'
+            'minimax': '<img src="/static/logos/minimax.jpeg" style="width:100%;height:100%;object-fit:contain;" alt="MiniMax">'
         };
         
         let statusData = null;
@@ -1092,6 +1092,7 @@
                         <td style="text-align: right;">
                             <div class="actions" style="justify-content: flex-end;">
                                 <button class="btn btn-ghost btn-xs" onclick="testModel('${name}', this)">Test</button>
+                                <button class="btn btn-ghost btn-xs" onclick="editModel('${name}')">Edit</button>
                                 <button class="btn btn-ghost btn-xs" onclick="toggleModel('${name}', ${!en}, this)">${en ? 'Disable' : 'Enable'}</button>
                                 <button class="btn btn-ghost btn-xs" onclick="deleteModel('${name}', this)" style="color: var(--destructive);">Delete</button>
                             </div>
@@ -1163,11 +1164,16 @@
                 const output = resp.usage?.completion_tokens || '-';
                 const total = resp.usage?.total_tokens || '-';
                 const clientDisplay = r.requested_model && r.requested_model.startsWith('auto') ? r.requested_model : r.client_ip;
+                const modelId = r.model_id || r.actual_model;
+                const provider = r.provider || '';
+                const modelShort = modelId.includes('/') ? modelId.split('/').pop() : modelId;
+                // 显示 actual_model + provider/model（如 openrouter-1/openrouter/owl-alpha）
+                const modelDisplay = r.actual_model ? `${r.actual_model}/${modelShort}` : (provider ? `${provider}/${modelShort}` : modelShort);
                 html += `
                     <tr>
                         <td class="text-sm">${new Date(r.timestamp).toLocaleTimeString()}</td>
                         <td class="text-sm">${clientDisplay}</td>
-                        <td class="text-sm">${r.actual_model}</td>
+                        <td class="text-sm">${modelDisplay}</td>
                         <td><span class="badge ${cls}"><span class="dot"></span>${status}</span></td>
                         <td class="text-sm">${resp.duration_seconds ? resp.duration_seconds.toFixed(2) + 's' : '-'}</td>
                         <td class="text-sm">${input}</td>
@@ -1300,6 +1306,37 @@
             const res = await fetch('/proxy/models/' + name, { method: 'DELETE' });
             if (res.ok) { toast('Model deleted', 'success'); refreshData(); } 
             else { toast('Failed', 'error'); if (btn) { btn.disabled = false; btn.textContent = 'Delete'; } }
+        }
+        
+        async function editModel(name) {
+            const res = await fetch('/proxy/models/' + name);
+            if (!res.ok) { toast('Failed to load model', 'error'); return; }
+            const data = await res.json();
+            
+            const newKey = prompt('API Key:', data.api_key || '');
+            if (newKey === null) return;
+            
+            const newBase = prompt('API Base:', data.api_base || '');
+            if (newBase === null) return;
+            
+            const newPriority = prompt('Priority:', data.priority || 10);
+            if (newPriority === null) return;
+            
+            const body = {};
+            if (newKey !== data.api_key) body.api_key = newKey;
+            if (newBase !== data.api_base) body.api_base = newBase;
+            if (parseInt(newPriority) !== data.priority) body.priority = parseInt(newPriority);
+            
+            if (Object.keys(body).length === 0) { toast('No changes', 'error'); return; }
+            
+            const updateRes = await fetch('/proxy/models/' + name, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            
+            if (updateRes.ok) { toast('Model updated', 'success'); refreshData(); }
+            else { toast('Failed to update', 'error'); }
         }
         
         async function toggleModel(name, enable, btn) {

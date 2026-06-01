@@ -249,89 +249,117 @@ class LLMProxyServer:
         try:
             start_time = time.time()
             
-            model_id = model_config.model
-            if "/" in model_id:
-                parts = model_id.split("/", 1)
-                if parts[0] in ["nvidia", "openai", "openrouter", "minimax", "anthropic"]:
-                    model_id = parts[1]
+            # 判断是否使用 Anthropic 格式
+            use_anthropic = getattr(model_config, 'api_format', 'openai') == 'anthropic'
             
-            test_body = {
-                "model": model_id,
-                "messages": [{"role": "user", "content": "Hello, respond with one word."}],
-                "max_tokens": 10
-            }
-            
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {model_config.api_key}"
-            }
-            
-            url = f"{model_config.api_base}/chat/completions"
-            
-            response = await self.http_client.post(
-                url, json=test_body, headers=headers, timeout=30
-            )
-            
-            duration = time.time() - start_time
-            
-            if response.status_code == 200:
-                data = response.json()
-                content = ""
-                if "choices" in data and len(data["choices"]) > 0:
-                    content = data["choices"][0].get("message", {}).get("content", "")
-                
-                self.model_manager.handle_success(model_name)
-                
-                return {
-                    "status": "success",
-                    "latency": round(duration, 3),
+            if use_anthropic:
+                # Anthropic 格式测试
+                url = f"{model_config.api_base}/v1/messages"
+                headers = {
+                    "Content-Type": "application/json",
+                    "x-api-key": model_config.api_key,
+                    "anthropic-version": "2023-06-01",
+                }
+                test_body = {
                     "model": model_config.model,
-                    "provider": model_config.provider,
-                    "response_preview": content[:100],
-                    "message": "Connection successful"
+                    "messages": [{"role": "user", "content": "Hello, respond with one word."}],
+                    "max_tokens": 10
                 }
+                
+                response = await self.http_client.post(url, json=test_body, headers=headers, timeout=30)
+                duration = time.time() - start_time
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    content = ""
+                    if "content" in data and len(data["content"]) > 0:
+                        content = data["content"][0].get("text", "")
+                    
+                    usage = data.get("usage", {})
+                    self.model_manager.handle_success(model_name)
+                    
+                    return {
+                        "status": "success",
+                        "latency": round(duration, 3),
+                        "model": model_config.model,
+                        "provider": model_config.provider,
+                        "response_preview": content[:100],
+                        "usage": {
+                            "input_tokens": usage.get("input_tokens", 0),
+                            "output_tokens": usage.get("output_tokens", 0),
+                        },
+                        "message": "Connection successful"
+                    }
+                else:
+                    error_text = response.text[:500]
+                    self.model_manager.health_checker.mark_unhealthy(model_name, f"HTTP {response.status_code}")
+                    return {
+                        "status": "error",
+                        "latency": round(duration, 3),
+                        "message": f"HTTP {response.status_code}",
+                        "error": error_text
+                    }
             else:
-                error_text = response.text[:500]
-                reason = f"HTTP {response.status_code}"
-                try:
-                    error_json = response.json()
-                    if "error" in error_json:
-                        err = error_json["error"]
-                        if isinstance(err, dict):
-                            reason = f"HTTP {response.status_code}: {err.get('message', err.get('type', ''))[:200]}"
-                        else:
-                            reason = f"HTTP {response.status_code}: {str(err)[:200]}"
-                except Exception:
-                    reason = f"HTTP {response.status_code}: {error_text[:200]}"
+                # OpenAI 格式测试
+                model_id = model_config.model
+                if "/" in model_id:
+                    parts = model_id.split("/", 1)
+                    if parts[0] in ["nvidia", "openai", "openrouter", "minimax", "anthropic", "xiaomi"]:
+                        model_id = parts[1]
                 
-                self.model_manager.health_checker.mark_unhealthy(model_name, reason)
-                
-                return {
-                    "status": "error",
-                    "latency": round(duration, 3),
-                    "message": reason,
-                    "error": error_text
+                test_body = {
+                    "model": model_id,
+                    "messages": [{"role": "user", "content": "Hello, respond with one word."}],
+                    "max_tokens": 10
                 }
+                
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {model_config.api_key}"
+                }
+                
+                url = f"{model_config.api_base}/chat/completions"
+                
+                response = await self.http_client.post(url, json=test_body, headers=headers, timeout=30)
+                duration = time.time() - start_time
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    content = ""
+                    if "choices" in data and len(data["choices"]) > 0:
+                        content = data["choices"][0].get("message", {}).get("content", "")
+                    
+                    self.model_manager.handle_success(model_name)
+                    
+                    return {
+                        "status": "success",
+                        "latency": round(duration, 3),
+                        "model": model_config.model,
+                        "provider": model_config.provider,
+                        "response_preview": content[:100],
+                        "message": "Connection successful"
+                    }
+                else:
+                    error_text = response.text[:500]
+                    self.model_manager.health_checker.mark_unhealthy(model_name, f"HTTP {response.status_code}")
+                    return {
+                        "status": "error",
+                        "latency": round(duration, 3),
+                        "message": f"HTTP {response.status_code}",
+                        "error": error_text
+                    }
                 
         except httpx.TimeoutException:
-            self.model_manager.health_checker.mark_unhealthy(model_name, "Timeout (30s)")
+            self.model_manager.health_checker.mark_unhealthy(model_name, "Timeout")
             return {
                 "status": "timeout",
                 "message": "Request timeout (30s)"
             }
-        except httpx.ConnectError as e:
-            reason = f"Connection failed: {str(e)[:200]}"
-            self.model_manager.health_checker.mark_unhealthy(model_name, reason)
-            return {
-                "status": "error",
-                "message": reason
-            }
         except Exception as e:
-            reason = f"{type(e).__name__}: {str(e)[:200]}"
-            self.model_manager.health_checker.mark_unhealthy(model_name, reason)
+            self.model_manager.health_checker.mark_unhealthy(model_name, str(e)[:100])
             return {
                 "status": "error",
-                "message": reason
+                "message": str(e)[:300]
             }
 
     async def forward_request(
@@ -341,52 +369,209 @@ class LLMProxyServer:
         request_body: dict,
         stream: bool = False
     ):
-        """转发请求到后端 LLM API"""
-        url = f"{model_config.api_base}/chat/completions"
+        """转发请求到后端 LLM API，内部自动适配 OpenAI/Anthropic 格式"""
+        
+        # 判断是否使用 Anthropic 格式
+        use_anthropic = getattr(model_config, 'api_format', 'openai') == 'anthropic'
+        
+        if use_anthropic:
+            return await self._forward_anthropic(model_name, model_config, request_body, stream)
+        else:
+            return await self._forward_openai(model_name, model_config, request_body, stream)
 
+    async def _forward_openai(self, model_name: str, model_config, request_body: dict, stream: bool):
+        """转发到 OpenAI 兼容 API"""
+        url = f"{model_config.api_base}/chat/completions"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {model_config.api_key}",
         }
-
-        # 修改请求体中的模型名称
         body = request_body.copy()
-        model_name = model_config.model
-        if "/" in model_name:
-            parts = model_name.split("/", 1)
-            if parts[0] in ["nvidia", "openai", "openrouter", "minimax", "anthropic"]:
-                model_name = parts[1]
-        body["model"] = model_name
+        model_id = model_config.model
+        if "/" in model_id:
+            parts = model_id.split("/", 1)
+            if parts[0] in ["nvidia", "openai", "openrouter", "minimax", "anthropic", "xiaomi"]:
+                model_id = parts[1]
+        body["model"] = model_id
 
         if stream:
             async def stream_generator() -> AsyncGenerator[bytes, None]:
-                async with self.http_client.stream(
-                    "POST", url, json=body, headers=headers
-                ) as response:
+                async with self.http_client.stream("POST", url, json=body, headers=headers) as response:
                     if response.status_code != 200:
                         error_body = await response.aread()
-                        raise HTTPException(
-                            status_code=response.status_code,
-                            detail=error_body.decode()
-                        )
-
+                        raise HTTPException(status_code=response.status_code, detail=error_body.decode())
                     async for chunk in response.aiter_bytes():
                         yield chunk
-
-            return StreamingResponse(
-                stream_generator(),
-                media_type="text/event-stream"
-            )
+            return StreamingResponse(stream_generator(), media_type="text/event-stream")
         else:
             response = await self.http_client.post(url, json=body, headers=headers)
-
             if response.status_code != 200:
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail=response.text
-                )
-
+                raise HTTPException(status_code=response.status_code, detail=response.text)
             return response.json()
+
+    async def _forward_anthropic(self, model_name: str, model_config, request_body: dict, stream: bool):
+        """转发到 Anthropic API，自动转换 OpenAI 格式"""
+        url = f"{model_config.api_base}/v1/messages"
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": model_config.api_key,
+            "anthropic-version": "2023-06-01",
+        }
+
+        # OpenAI -> Anthropic 格式转换
+        body = request_body.copy()
+        model_id = model_config.model
+        
+        # 构建 Anthropic 请求
+        anthropic_body = {
+            "model": model_id,
+            "max_tokens": body.get("max_tokens", 4096),
+            "messages": body.get("messages", []),
+        }
+        
+        # 添加 system prompt（如果有）
+        if "system" in body:
+            anthropic_body["system"] = body["system"]
+        else:
+            # 从 messages 中提取 system message
+            messages = body.get("messages", [])
+            if messages and messages[0].get("role") == "system":
+                anthropic_body["system"] = messages[0].get("content", "")
+                anthropic_body["messages"] = messages[1:]
+        
+        # 添加可选参数
+        if "temperature" in body:
+            anthropic_body["temperature"] = body["temperature"]
+        if "top_p" in body:
+            anthropic_body["top_p"] = body["top_p"]
+
+        if stream:
+            anthropic_body["stream"] = True
+            async def stream_generator() -> AsyncGenerator[bytes, None]:
+                async with self.http_client.stream("POST", url, json=anthropic_body, headers=headers) as response:
+                    if response.status_code != 200:
+                        error_body = await response.aread()
+                        raise HTTPException(status_code=response.status_code, detail=error_body.decode())
+                    
+                    # 转换 Anthropic SSE 到 OpenAI SSE
+                    async for line in response.aiter_lines():
+                        if not line.strip():
+                            continue
+                        if line.startswith("data: "):
+                            data_str = line[6:]
+                            if data_str == "[DONE]":
+                                yield "data: [DONE]\n\n"
+                                continue
+                            try:
+                                event = json.loads(data_str)
+                                openai_chunk = self._anthropic_stream_to_openai(event, model_id)
+                                if openai_chunk:
+                                    yield f"data: {json.dumps(openai_chunk)}\n\n"
+                            except json.JSONDecodeError:
+                                pass
+            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+        else:
+            response = await self.http_client.post(url, json=anthropic_body, headers=headers)
+            if response.status_code != 200:
+                raise HTTPException(status_code=response.status_code, detail=response.text)
+            
+            # Anthropic -> OpenAI 格式转换
+            anthropic_resp = response.json()
+            return self._anthropic_to_openai(anthropic_resp, model_id)
+
+    def _anthropic_to_openai(self, anthropic_resp: dict, model_id: str) -> dict:
+        """将 Anthropic 响应转换为 OpenAI 格式"""
+        content = ""
+        for block in anthropic_resp.get("content", []):
+            if block.get("type") == "text":
+                content += block.get("text", "")
+        
+        usage = anthropic_resp.get("usage", {})
+        
+        return {
+            "id": anthropic_resp.get("id", ""),
+            "object": "chat.completion",
+            "created": int(datetime.now().timestamp()),
+            "model": model_id,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                },
+                "finish_reason": anthropic_resp.get("stop_reason", "stop"),
+            }],
+            "usage": {
+                "prompt_tokens": usage.get("input_tokens", 0),
+                "completion_tokens": usage.get("output_tokens", 0),
+                "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+            },
+        }
+
+    def _anthropic_stream_to_openai(self, event: dict, model_id: str) -> dict:
+        """将 Anthropic 流式事件转换为 OpenAI 格式"""
+        event_type = event.get("type", "")
+        
+        if event_type == "message_start":
+            # message_start 包含 input_tokens
+            message = event.get("message", {})
+            usage = message.get("usage", {})
+            if usage:
+                return {
+                    "id": f"chatcmpl-{int(datetime.now().timestamp())}",
+                    "object": "chat.completion.chunk",
+                    "created": int(datetime.now().timestamp()),
+                    "model": model_id,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": ""},
+                        "finish_reason": None,
+                    }],
+                    "usage": {
+                        "prompt_tokens": usage.get("input_tokens", 0),
+                        "completion_tokens": 0,
+                        "total_tokens": usage.get("input_tokens", 0),
+                    },
+                }
+            return None
+        
+        elif event_type == "content_block_delta":
+            delta = event.get("delta", {})
+            if delta.get("type") == "text_delta":
+                return {
+                    "id": f"chatcmpl-{int(datetime.now().timestamp())}",
+                    "object": "chat.completion.chunk",
+                    "created": int(datetime.now().timestamp()),
+                    "model": model_id,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": delta.get("text", "")},
+                        "finish_reason": None,
+                    }],
+                }
+        
+        elif event_type == "message_delta":
+            # message_delta 包含 output_tokens
+            delta = event.get("delta", {})
+            usage = event.get("usage", {})
+            return {
+                "id": f"chatcmpl-{int(datetime.now().timestamp())}",
+                "object": "chat.completion.chunk",
+                "created": int(datetime.now().timestamp()),
+                "model": model_id,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": delta.get("stop_reason", "stop"),
+                }],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("output_tokens", 0),
+                },
+            }
+        
+        return None
 
 
 def create_app(config_path: str) -> FastAPI:
@@ -513,6 +698,7 @@ def create_app(config_path: str) -> FastAPI:
                     provider=model_config.provider,
                     messages=messages,
                     stream=stream,
+                    model_id=model_config.model,
                 )
 
                 if stream:
@@ -950,6 +1136,53 @@ def create_app(config_path: str) -> FastAPI:
             server.model_manager.save_config(str(server.config_path))
             
             return {"message": f"Model {name} added", "model": name}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.put("/proxy/models/{model_name}")
+    async def update_model(model_name: str, request: Request):
+        """更新模型配置"""
+        if model_name not in server.model_manager.models:
+            raise HTTPException(status_code=404, detail=f"Model not found: {model_name}")
+        
+        try:
+            body = await request.json()
+            model_config = server.model_manager.models[model_name]
+            
+            # 更新允许的字段
+            if "api_key" in body:
+                model_config.api_key = body["api_key"]
+            if "api_base" in body:
+                model_config.api_base = body["api_base"]
+            if "model" in body:
+                model_config.model = body["model"]
+            if "provider" in body:
+                model_config.provider = body["provider"]
+            if "priority" in body:
+                model_config.priority = int(body["priority"])
+            if "enabled" in body:
+                enabled = body["enabled"]
+                if enabled:
+                    server.model_manager.enable_model(model_name)
+                else:
+                    server.model_manager.disable_model(model_name)
+            
+            # 更新配置文件
+            if "models" in server.config and "available" in server.config["models"]:
+                if model_name in server.config["models"]["available"]:
+                    server.config["models"]["available"][model_name].update({
+                        "api_key": model_config.api_key,
+                        "api_base": model_config.api_base,
+                        "model": model_config.model,
+                        "provider": model_config.provider,
+                        "priority": model_config.priority,
+                    })
+            
+            server.model_manager.save_config(str(server.config_path))
+            
+            return {"message": f"Model {model_name} updated"}
         except HTTPException:
             raise
         except Exception as e:
