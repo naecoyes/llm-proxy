@@ -2,7 +2,7 @@
   <img src="images/ChatGPT Image May 27, 2026, 11_09_44 AM.png" width="180" />
 </p>
 
-<h1 align="center">LLM Proxy</h1>
+<h1 align="center">LLM Proxy Hub</h1>
 
 <p align="center">
   A lightweight, high-performance LLM API proxy server
@@ -24,6 +24,8 @@
 - **Multi-Model Management** - Configure multiple LLM providers with a unified OpenAI-compatible endpoint
 - **Anthropic API Support** - Native support for Anthropic Claude models with automatic OpenAI ↔ Anthropic format conversion (including streaming)
 - **Smart Load Balancing** - Automatically distribute requests across available models
+- **Off-Peak Scheduling** - Dynamic priority boost for specified models during off-peak hours (configurable timezone)
+- **Rate Limit Awareness** - Skip models that have triggered rate limits, auto fallback to available ones
 - **Failover** - Detect failures and switch to backup models to ensure availability
 - **Auto-Disable** - Automatically disable models after consecutive health check failures
 - **Request Logging** - Complete logging of all API requests and responses
@@ -46,7 +48,7 @@
 ### 1. Install Dependencies
 
 ```bash
-pip install fastapi uvicorn httpx pyyaml
+pip install -r requirements.txt
 ```
 
 ### 2. Configure Models
@@ -54,32 +56,72 @@ pip install fastapi uvicorn httpx pyyaml
 Create or edit `proxy_config.yaml`:
 
 ```yaml
+server:
+  host: "127.0.0.1"
+  port: 8888
+
 models:
   available:
     # OpenAI-compatible model
-    my-model:
-      api_base: https://api.example.com/v1
+    my-openai:
+      api_base: https://api.openai.com/v1
       api_key: your-api-key
+      model: gpt-4
+      provider: openai
+      priority: 100
       enabled: true
-      model: model-name
 
     # Anthropic Claude model
     my-claude:
       api_base: https://api.anthropic.com
       api_key: your-anthropic-key
-      enabled: true
       model: claude-sonnet-4-20250514
       provider: anthropic
       api_format: anthropic
+      priority: 90
+      enabled: true
+
+# Time-based scheduling (optional)
+schedule:
+  timezone: "Asia/Shanghai"
+  peak_hours: [18, 19, 20, 21, 22, 23]
+  peak_strategy: openrouter
+  off_peak_hours:
+    enabled: true
+    hours: [[20, 4]]        # UTC+4 8PM - 4AM
+    timezone: "Asia/Dubai"
+    models: ["my-openai"]
+    priority_boost: true
+    boost_priority: 1       # Higher priority during off-peak
+    default_priority: 100
 ```
 
 ### 3. Start Server
 
 ```bash
-uvicorn llm_proxy.server:app --host 0.0.0.0 --port 8000
+# Using shell scripts
+chmod +x start.sh stop.sh
+./start.sh    # Start
+./stop.sh     # Stop
+
+# Or directly
+python start_proxy.py --config proxy_config.yaml --port 8888
 ```
 
-Server will be available at `http://localhost:8000`, with the dashboard at `http://localhost:8000/`.
+Server will be available at `http://127.0.0.1:8888`, with the dashboard at the same address.
+
+### 4. Command Line Options
+
+```
+python start_proxy.py [options]
+
+Options:
+  --config, -c    Config file path (default: proxy_config.yaml)
+  --host          Listen address (default: from config)
+  --port, -p      Listen port (default: from config)
+  --log-level     Log level (debug/info/warning/error)
+  --reload        Enable auto-reload (dev mode)
+```
 
 ## API Usage
 
@@ -90,27 +132,13 @@ The proxy is fully compatible with the **OpenAI Chat Completions API** format.
 **cURL (non-streaming):**
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:8888/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "my-model",
+    "model": "my-openai",
     "messages": [
       {"role": "system", "content": "You are a helpful assistant."},
       {"role": "user", "content": "Hello!"}
-    ]
-  }'
-```
-
-**cURL (streaming):**
-
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "my-model",
-    "stream": true,
-    "messages": [
-      {"role": "user", "content": "Tell me a joke."}
     ]
   }'
 ```
@@ -121,44 +149,34 @@ curl http://localhost:8000/v1/chat/completions \
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:8000/v1",
+    base_url="http://localhost:8888/v1",
     api_key="any-string"  # Proxy handles the real API key
 )
 
 response = client.chat.completions.create(
-    model="my-model",
+    model="auto",  # Auto model selection
     messages=[{"role": "user", "content": "Hello!"}]
 )
 print(response.choices[0].message.content)
-```
-
-**Auto Model Selection:**
-
-Omit the `model` field to let the proxy automatically select an available model:
-
-```python
-response = client.chat.completions.create(
-    messages=[{"role": "user", "content": "Hello!"}]
-)
 ```
 
 ### Management API
 
 ```bash
 # List available models
-curl http://localhost:8000/v1/models
+curl http://localhost:8888/v1/models
 
 # Proxy status
-curl http://localhost:8000/proxy/status
+curl http://localhost:8888/proxy/status
 
 # Health check
-curl http://localhost:8000/proxy/health
+curl http://localhost:8888/proxy/health
 
 # Usage statistics
-curl http://localhost:8000/proxy/usage
+curl http://localhost:8888/proxy/usage
 
 # Request logs
-curl http://localhost:8000/proxy/logs
+curl http://localhost:8888/proxy/logs
 ```
 
 ## API Reference
@@ -182,17 +200,22 @@ curl http://localhost:8000/proxy/logs
 
 ```
 llm_proxy/
-├── server.py           # Main server
+├── server.py           # FastAPI server
 ├── model_manager.py    # Model management & load balancing
 ├── config_watcher.py   # Config file hot reload
 ├── health_checker.py   # Model health checks
 ├── request_logger.py   # Request logging
 ├── usage_controller.py # Usage control
-├── time_controller.py  # Time control
+├── time_controller.py  # Time-based scheduling & off-peak
+├── start_proxy.py      # Startup script with CLI args
+├── start.sh            # Shell start script
+├── stop.sh             # Shell stop script
+├── requirements.txt    # Python dependencies
 ├── proxy_config.yaml   # Configuration file
 ├── static/             # Frontend static assets
 ├── images/             # README screenshots
-└── logs/               # Log directory
+├── logs/               # Log directory
+└── stats/              # Statistics data
 ```
 
 ## License

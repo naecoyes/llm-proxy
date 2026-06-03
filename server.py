@@ -17,9 +17,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from .config_watcher import ConfigWatcher
-from .model_manager import ModelManager, NoAvailableModelError
-from .request_logger import request_logger
+from config_watcher import ConfigWatcher
+from model_manager import ModelManager, NoAvailableModelError
+from request_logger import request_logger
 
 logger = logging.getLogger(__name__)
 
@@ -683,6 +683,11 @@ def create_app(config_path: str) -> FastAPI:
             except NoAvailableModelError as e:
                 raise HTTPException(status_code=503, detail=str(e))
 
+            # 检查模型是否被禁用（禁用后自动切换）
+            if model_name in server.model_manager.disabled_models:
+                logger.info(f"[{request_id}] 模型 {model_name} 已禁用，重新选择")
+                continue
+
             try:
                 start_time = time.time()
 
@@ -713,8 +718,23 @@ def create_app(config_path: str) -> FastAPI:
                         input_tokens = 0
                         output_tokens = 0
                         final_usage = {}
+                        model_switched = False
                         try:
                             async for chunk in response.body_iterator:
+                                # 检查模型是否被禁用，如果是则中断流
+                                if model_name in server.model_manager.disabled_models and not model_switched:
+                                    logger.warning(f"[{request_id}] 流式中检测到模型 {model_name} 被禁用，中断切换")
+                                    model_switched = True
+                                    # 发送错误事件，客户端可据此重试
+                                    error_event = json.dumps({
+                                        "error": {
+                                            "message": f"Model {model_name} was disabled, please retry",
+                                            "type": "model_disabled",
+                                            "code": "model_switched"
+                                        }
+                                    })
+                                    yield f"data: {error_event}\n\n"
+                                    break
                                 yield chunk
                                 try:
                                     chunk_str = chunk.decode() if isinstance(chunk, bytes) else chunk
@@ -760,6 +780,12 @@ def create_app(config_path: str) -> FastAPI:
                         media_type="text/event-stream"
                     )
                 else:
+                    # 非流式请求前检查模型是否被禁用
+                    if model_name in server.model_manager.disabled_models:
+                        logger.warning(f"[{request_id}] 模型 {model_name} 在发送前被禁用，重新选择")
+                        server.model_manager.mark_model_inactive(model_name)
+                        continue
+                    
                     response_data = await server.forward_request(
                         model_name, model_config, body, stream=False
                     )

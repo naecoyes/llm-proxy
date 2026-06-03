@@ -6,9 +6,9 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from .health_checker import HealthChecker
-from .time_controller import TimeController
-from .usage_controller import UsageController
+from health_checker import HealthChecker
+from time_controller import TimeController
+from usage_controller import UsageController
 
 logger = logging.getLogger(__name__)
 
@@ -213,12 +213,23 @@ class ModelManager:
             if self.usage_controller.check_budget(name)
         ]
 
+    def _filter_by_rate_limit(self, model_names: List[str]) -> List[str]:
+        """过滤掉触发速率限制的模型"""
+        return [
+            name for name in model_names
+            if not self.usage_controller.check_rate_limit(name)
+        ]
+
     def _sort_by_priority(self, model_names: List[str]) -> List[str]:
-        """按优先级排序"""
-        return sorted(
-            model_names,
-            key=lambda name: self.models.get(name, ModelConfig(name="", model="", api_key="", api_base="")).priority
-        )
+        """按优先级排序（考虑 off-peak 时段动态优先级）"""
+        def get_priority(name: str) -> int:
+            model = self.models.get(name)
+            if not model:
+                return 999
+            # 使用 time_controller 获取动态优先级
+            return self.time_controller.get_model_priority(name, model.priority)
+        
+        return sorted(model_names, key=get_priority)
 
     def select_model(self, requested_model: str = None) -> Tuple[str, ModelConfig]:
         """选择最优模型
@@ -305,18 +316,33 @@ class ModelManager:
         # 5. 按优先级排序
         prioritized = self._sort_by_priority(affordable)
 
-        # 6. 获取最高优先级
-        highest_priority = self.models.get(prioritized[0], ModelConfig(name="", model="", api_key="", api_base="")).priority
+        # 6. 获取最高优先级（使用动态优先级）
+        def get_dynamic_priority(name: str) -> int:
+            model = self.models.get(name)
+            if not model:
+                return 999
+            return self.time_controller.get_model_priority(name, model.priority)
+        
+        highest_priority = get_dynamic_priority(prioritized[0])
 
         # 7. 筛选同优先级的模型
         same_priority = [
             name for name in prioritized
-            if self.models.get(name, ModelConfig(name="", model="", api_key="", api_base="")).priority == highest_priority
+            if get_dynamic_priority(name) == highest_priority
         ]
 
-        # 8. 轮询选择（避免所有请求都用同一个 key）
+        # 8. 轮询分发（优先未触发速率限制的模型）
+        rate_ok = self._filter_by_rate_limit(same_priority)
+        if not rate_ok:
+            # 所有模型都触发速率限制，使用全部（排队等待）
+            rate_ok = same_priority
+            logger.warning(f"所有模型触发速率限制，排队等待: {rate_ok}")
+        elif len(rate_ok) < len(same_priority):
+            skipped = [n for n in same_priority if n not in rate_ok]
+            logger.debug(f"跳过速率限制模型: {skipped}")
+
         self._round_robin_counter += 1
-        selected = same_priority[self._round_robin_counter % len(same_priority)]
+        selected = rate_ok[self._round_robin_counter % len(rate_ok)]
 
         logger.debug(f"选择模型: {selected} | 策略: {self.time_controller.get_current_strategy()} | 轮询: {self._round_robin_counter}")
         return selected, self.models[selected]
@@ -349,11 +375,17 @@ class ModelManager:
         # 按优先级排序
         prioritized = self._sort_by_priority(available)
 
-        # 获取最高优先级的模型组
-        highest_priority = self.models.get(prioritized[0], ModelConfig(name="", model="", api_key="", api_base="")).priority
+        # 获取最高优先级的模型组（使用动态优先级）
+        def get_dynamic_priority(name: str) -> int:
+            model = self.models.get(name)
+            if not model:
+                return 999
+            return self.time_controller.get_model_priority(name, model.priority)
+        
+        highest_priority = get_dynamic_priority(prioritized[0])
         same_priority = [
             name for name in prioritized
-            if self.models.get(name, ModelConfig(name="", model="", api_key="", api_base="")).priority == highest_priority
+            if get_dynamic_priority(name) == highest_priority
         ]
 
         # 排除已分配给其他 slot 的模型

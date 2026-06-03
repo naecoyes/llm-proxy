@@ -2,9 +2,18 @@
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# 时区映射
+TIMEZONE_MAP = {
+    "Asia/Shanghai": timezone(timedelta(hours=8)),
+    "Asia/Dubai": timezone(timedelta(hours=4)),
+    "America/Los_Angeles": timezone(timedelta(hours=-7)),  # PDT (Pacific Daylight Time)
+    "America/New_York": timezone(timedelta(hours=-4)),  # EDT
+    "UTC": timezone.utc,
+}
 
 
 class TimeController:
@@ -20,8 +29,8 @@ class TimeController:
         timezone_str = schedule.get("timezone", "Asia/Shanghai")
 
         # 设置时区
-        if timezone_str == "Asia/Shanghai":
-            self.timezone = timezone(timedelta(hours=8))
+        if timezone_str in TIMEZONE_MAP:
+            self.timezone = TIMEZONE_MAP[timezone_str]
         else:
             self.timezone = timezone.utc
 
@@ -33,6 +42,22 @@ class TimeController:
 
         # mimo 优先时段
         self.mimo_priority_hours = schedule.get("mimo_priority_hours", [0, 1, 2, 3, 4, 5, 6, 7])
+
+        # off-peak 配置（用于非高峰时段优先级提升）
+        off_peak_config = schedule.get("off_peak_hours", {})
+        self.off_peak_enabled = off_peak_config.get("enabled", False)
+        self.off_peak_hours = off_peak_config.get("hours", [[9, 17]])
+        self.off_peak_models = off_peak_config.get("models", [])
+        self.off_peak_priority_boost = off_peak_config.get("priority_boost", False)
+        self.off_peak_default_priority = off_peak_config.get("default_priority", 10)
+        self.off_peak_boost_priority = off_peak_config.get("boost_priority", 1)
+        
+        # off-peak 时区（默认使用主时区）
+        off_peak_tz_str = off_peak_config.get("timezone", timezone_str)
+        if off_peak_tz_str in TIMEZONE_MAP:
+            self.off_peak_timezone = TIMEZONE_MAP[off_peak_tz_str]
+        else:
+            self.off_peak_timezone = self.timezone
 
     def update_config(self, config: dict):
         """热更新配置"""
@@ -64,6 +89,60 @@ class TimeController:
         now = now or self.get_current_time()
         return now.hour in self.mimo_priority_hours
 
+    def is_off_peak_hour(self, now: Optional[datetime] = None) -> bool:
+        """检查当前是否 off-peak 时段（迪拜时区 UTC+4 8PM-4AM）"""
+        if not self.off_peak_enabled:
+            return False
+        
+        # 使用 off-peak 时区获取时间
+        if now is None:
+            now = datetime.now(self.off_peak_timezone)
+        
+        current_hour = now.hour
+        
+        # 检查是否在 off-peak 时段内（支持跨越午夜）
+        for start_hour, end_hour in self.off_peak_hours:
+            if start_hour > end_hour:
+                # 跨越午夜的情况：例如 20:00-04:00
+                if current_hour >= start_hour or current_hour < end_hour:
+                    return True
+            else:
+                # 正常情况：例如 09:00-17:00
+                if start_hour <= current_hour < end_hour:
+                    return True
+        
+        return False
+
+    def get_off_peak_models(self) -> List[str]:
+        """获取 off-peak 时段需要提升优先级的模型列表"""
+        if not self.off_peak_enabled or not self.off_peak_priority_boost:
+            return []
+        return self.off_peak_models
+
+    def get_model_priority(self, model_name: str, base_priority: int) -> int:
+        """获取模型的当前优先级（考虑 off-peak 时段提升）
+
+        Args:
+            model_name: 模型名称
+            base_priority: 模型的基础优先级
+
+        Returns:
+            当前应使用的优先级值
+        """
+        if not self.off_peak_enabled or not self.off_peak_priority_boost:
+            return base_priority
+        
+        # 检查模型是否在 off-peak 提升列表中
+        if model_name not in self.off_peak_models:
+            return base_priority
+        
+        # 检查当前是否 off-peak 时段
+        if self.is_off_peak_hour():
+            return self.off_peak_boost_priority
+        
+        # 非 off-peak 时段，使用默认优先级
+        return self.off_peak_default_priority
+
     def is_weekend(self, now: Optional[datetime] = None) -> bool:
         """检查当前是否周末"""
         now = now or self.get_current_time()
@@ -75,6 +154,7 @@ class TimeController:
         Returns:
             "peak" - 高峰期，使用 peak_strategy 配置的模型
             "mimo_priority" - mimo 优先时段
+            "off_peak" - off-peak 时段（迪拜时区 UTC+4 8PM-4AM），提升 mimo 优先级
             "normal" - 正常时段
         """
         now = self.get_current_time()
@@ -83,11 +163,15 @@ class TimeController:
         if self.is_peak_hour(now):
             return "peak"
 
-        # 2. 检查是否 mimo 优先时段
+        # 2. 检查是否 off-peak 时段（优先级最高）
+        if self.is_off_peak_hour():
+            return "off_peak"
+
+        # 3. 检查是否 mimo 优先时段
         if self.is_mimo_priority_time(now):
             return "mimo_priority"
 
-        # 3. 正常时段
+        # 4. 正常时段
         return "normal"
 
     def get_parallel_limit(self) -> int:
@@ -138,10 +222,13 @@ class TimeController:
             "timezone": str(self.timezone),
             "strategy": strategy,
             "is_peak_hour": self.is_peak_hour(now),
+            "is_off_peak_hour": self.is_off_peak_hour(),
             "is_mimo_priority": self.is_mimo_priority_time(now),
             "is_weekend": self.is_weekend(now),
             "parallel_limit": self.get_parallel_limit(),
             "peak_end_time": self.get_peak_end_time().isoformat() if self.get_peak_end_time() else None,
             "peak_hours": self.peak_hours,
             "mimo_priority_hours": self.mimo_priority_hours,
+            "off_peak_hours": self.off_peak_hours if self.off_peak_enabled else None,
+            "off_peak_models": self.off_peak_models if self.off_peak_enabled else None,
         }

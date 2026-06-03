@@ -9,3 +9,5 @@ build/
 .venv/
 venv/
 proxy_config.yaml
+llm_proxy.pid
+proxy.log

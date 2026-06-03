@@ -2,7 +2,7 @@
   <img src="images/ChatGPT Image May 27, 2026, 11_09_44 AM.png" width="180" />
 </p>
 
-<h1 align="center">LLM Proxy</h1>
+<h1 align="center">LLM Proxy Hub</h1>
 
 <p align="center">
   一个轻量级、高性能的 LLM API 代理服务器
@@ -24,6 +24,8 @@
 - **多模型管理** - 支持配置多个 LLM 提供商，统一 OpenAI 兼容接口
 - **Anthropic API 支持** - 原生支持 Anthropic Claude 模型，自动完成 OpenAI ↔ Anthropic 格式转换（含流式）
 - **智能负载均衡** - 自动分发请求到可用模型
+- **离峰调度** - 非高峰时段动态提升指定模型优先级（可配置时区）
+- **速率限制感知** - 自动跳过触发速率限制的模型，回退到可用模型
 - **故障转移** - 检测失败自动切换备用模型，保障服务可用性
 - **自动禁用** - 健康检查连续失败超阈值后自动禁用模型
 - **请求日志** - 完整记录所有 API 请求和响应
@@ -46,7 +48,7 @@
 ### 1. 安装依赖
 
 ```bash
-pip install fastapi uvicorn httpx pyyaml
+pip install -r requirements.txt
 ```
 
 ### 2. 配置模型
@@ -54,32 +56,72 @@ pip install fastapi uvicorn httpx pyyaml
 创建或编辑 `proxy_config.yaml`：
 
 ```yaml
+server:
+  host: "127.0.0.1"
+  port: 8888
+
 models:
   available:
     # OpenAI 兼容模型
-    my-model:
-      api_base: https://api.example.com/v1
+    my-openai:
+      api_base: https://api.openai.com/v1
       api_key: your-api-key
+      model: gpt-4
+      provider: openai
+      priority: 100
       enabled: true
-      model: model-name
 
     # Anthropic Claude 模型
     my-claude:
       api_base: https://api.anthropic.com
       api_key: your-anthropic-key
-      enabled: true
       model: claude-sonnet-4-20250514
       provider: anthropic
       api_format: anthropic
+      priority: 90
+      enabled: true
+
+# 时间调度策略（可选）
+schedule:
+  timezone: "Asia/Shanghai"
+  peak_hours: [18, 19, 20, 21, 22, 23]
+  peak_strategy: openrouter
+  off_peak_hours:
+    enabled: true
+    hours: [[20, 4]]        # UTC+4 20:00 - 04:00
+    timezone: "Asia/Dubai"
+    models: ["my-openai"]
+    priority_boost: true
+    boost_priority: 1       # 离峰时段优先级提升
+    default_priority: 100
 ```
 
 ### 3. 启动服务
 
 ```bash
-uvicorn llm_proxy.server:app --host 0.0.0.0 --port 8000
+# 使用脚本
+chmod +x start.sh stop.sh
+./start.sh    # 启动
+./stop.sh     # 停止
+
+# 或直接启动
+python start_proxy.py --config proxy_config.yaml --port 8888
 ```
 
-服务启动后访问 `http://localhost:8000`，管理面板在 `http://localhost:8000/`。
+服务启动后访问 `http://127.0.0.1:8888`，管理面板在同一地址。
+
+### 4. 命令行参数
+
+```
+python start_proxy.py [选项]
+
+选项:
+  --config, -c    配置文件路径 (默认: proxy_config.yaml)
+  --host          监听地址 (默认: 使用配置文件中的值)
+  --port, -p      监听端口 (默认: 使用配置文件中的值)
+  --log-level     日志级别 (debug/info/warning/error)
+  --reload        启用自动重载 (开发模式)
+```
 
 ## API 调用
 
@@ -90,10 +132,10 @@ uvicorn llm_proxy.server:app --host 0.0.0.0 --port 8000
 **cURL（非流式）：**
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:8888/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "my-model",
+    "model": "my-openai",
     "messages": [
       {"role": "system", "content": "You are a helpful assistant."},
       {"role": "user", "content": "你好！"}
@@ -104,10 +146,10 @@ curl http://localhost:8000/v1/chat/completions \
 **cURL（流式）：**
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:8888/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "my-model",
+    "model": "my-openai",
     "stream": true,
     "messages": [
       {"role": "user", "content": "讲个笑话。"}
@@ -121,44 +163,34 @@ curl http://localhost:8000/v1/chat/completions \
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:8000/v1",
+    base_url="http://localhost:8888/v1",
     api_key="any-string"  # 代理会处理真实的 API Key
 )
 
 response = client.chat.completions.create(
-    model="my-model",
+    model="auto",  # 自动选择模型
     messages=[{"role": "user", "content": "你好！"}]
 )
 print(response.choices[0].message.content)
-```
-
-**自动选择模型：**
-
-省略 `model` 字段，代理会自动选择可用模型：
-
-```python
-response = client.chat.completions.create(
-    messages=[{"role": "user", "content": "你好！"}]
-)
 ```
 
 ### 管理接口
 
 ```bash
 # 获取模型列表
-curl http://localhost:8000/v1/models
+curl http://localhost:8888/v1/models
 
 # 代理状态
-curl http://localhost:8000/proxy/status
+curl http://localhost:8888/proxy/status
 
 # 健康检查
-curl http://localhost:8000/proxy/health
+curl http://localhost:8888/proxy/health
 
 # 用量统计
-curl http://localhost:8000/proxy/usage
+curl http://localhost:8888/proxy/usage
 
 # 请求日志
-curl http://localhost:8000/proxy/logs
+curl http://localhost:8888/proxy/logs
 ```
 
 ## 接口参考
@@ -182,19 +214,24 @@ curl http://localhost:8000/proxy/logs
 
 ```
 llm_proxy/
-├── server.py           # 主服务器
+├── server.py           # FastAPI 服务器
 ├── model_manager.py    # 模型管理与负载均衡
 ├── config_watcher.py   # 配置文件热重载
 ├── health_checker.py   # 模型健康检查
 ├── request_logger.py   # 请求日志记录
 ├── usage_controller.py # 用量控制
-├── time_controller.py  # 时间控制
+├── time_controller.py  # 时间调度与离峰策略
+├── start_proxy.py      # 启动脚本（支持命令行参数）
+├── start.sh            # Shell 启动脚本
+├── stop.sh             # Shell 停止脚本
+├── requirements.txt    # Python 依赖
 ├── proxy_config.yaml   # 配置文件
 ├── static/             # 前端静态资源
 ├── images/             # README 截图
-└── logs/               # 日志目录
+├── logs/               # 日志目录
+└── stats/              # 统计数据目录
 ```
 
-## License
+## 许可证
 
 MIT
