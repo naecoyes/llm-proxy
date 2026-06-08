@@ -14,42 +14,37 @@ def setup_logging(level: str = "info"):
     logging.basicConfig(
         level=getattr(logging, level.upper()),
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
 
 
 def main():
     parser = argparse.ArgumentParser(description="LLM Proxy Server")
     parser.add_argument(
-        "--config", "-c",
+        "--config",
+        "-c",
         type=str,
         default="proxy_config.yaml",
-        help="配置文件路径 (默认: proxy_config.yaml)"
+        help="配置文件路径 (默认: proxy_config.yaml)",
     )
     parser.add_argument(
-        "--host",
-        type=str,
-        default=None,
-        help="监听地址 (默认: 使用配置文件中的值)"
+        "--host", type=str, default=None, help="监听地址 (默认: 使用配置文件中的值)"
     )
     parser.add_argument(
-        "--port", "-p",
+        "--port",
+        "-p",
         type=int,
         default=None,
-        help="监听端口 (默认: 使用配置文件中的值)"
+        help="监听端口 (默认: 使用配置文件中的值)",
     )
     parser.add_argument(
         "--log-level",
         type=str,
         default=None,
         choices=["debug", "info", "warning", "error"],
-        help="日志级别 (默认: 使用配置文件中的值)"
+        help="日志级别 (默认: 使用配置文件中的值)",
     )
-    parser.add_argument(
-        "--reload",
-        action="store_true",
-        help="启用自动重载 (开发模式)"
-    )
+    parser.add_argument("--reload", action="store_true", help="启用自动重载 (开发模式)")
 
     args = parser.parse_args()
 
@@ -61,6 +56,7 @@ def main():
 
     # 加载配置获取默认值
     import yaml
+
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
@@ -73,13 +69,14 @@ def main():
     setup_logging(log_level)
 
     logger = logging.getLogger(__name__)
-    logger.info(f"启动 LLM Proxy Server")
+    logger.info("启动 LLM Proxy Server")
     logger.info(f"配置文件: {config_path.absolute()}")
     logger.info(f"监听地址: {host}:{port}")
     logger.info(f"日志级别: {log_level}")
 
     # 创建应用
     from server import create_app
+
     app = create_app(str(config_path.absolute()))
 
     # 启动服务

@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  English | <a href="README.md">中文</a>
+  <a href="README.md">English</a> | 中文
 </p>
 
 <p align="center">
@@ -21,17 +21,21 @@
 
 ## 功能特性
 
-- **多模型管理** - 支持配置多个 LLM 提供商，统一 OpenAI 兼容接口
-- **Anthropic API 支持** - 原生支持 Anthropic Claude 模型，自动完成 OpenAI ↔ Anthropic 格式转换（含流式）
-- **智能负载均衡** - 自动分发请求到可用模型
-- **离峰调度** - 非高峰时段动态提升指定模型优先级（可配置时区）
-- **速率限制感知** - 自动跳过触发速率限制的模型，回退到可用模型
-- **故障转移** - 检测失败自动切换备用模型，保障服务可用性
-- **自动禁用** - 健康检查连续失败超阈值后自动禁用模型
-- **请求日志** - 完整记录所有 API 请求和响应
-- **IP 白名单** - 精细化访问控制
-- **热重载配置** - 修改配置无需重启服务
-- **Web 管理面板** - 直观的可视化管理界面，支持在线编辑模型
+- **多模型管理** - 支持配置多个 LLM 提供商，统一为 OpenAI 兼容接口。
+- **Anthropic API 支持** - 原生支持 Anthropic Claude 模型，自动完成 OpenAI ↔ Anthropic 格式转换（含流式）。
+- **固定槽位路由 (Slot Routing)** - 支持通过请求指定 `auto1`、`auto2` 等固定槽位，实现智能的会话保持和连接复用。**严格遵守并发控制**：当高优先级模型达到 `max_concurrent` 并发上限时，剩余槽位将自动分配给次优优先级的备用模型；且在模型被禁用（如触及额度熔断）时，槽位支持自动无缝漂移。
+- **智能负载均衡** - 自动分发请求到可用模型，支持基于近期成功率的动态过滤（自动跳过成功率低于 70% 的模型）。
+- **离峰调度** - 非高峰时段动态提升指定模型优先级（可配置时区），支持 `mimo_priority` 等灵活时间策略。
+- **额度感知与自动恢复** - 识别由于额度限制或速率限制导致的错误，自动解析重置时间（如 Minimax 5小时限制）并在到期后重新启用模型。
+- **速率限制感知** - 自动跳过触发速率限制的模型，回退到同 Provider 或其他 Provider 的可用模型。
+- **免费模型回退 (Fallback to Free)** - 在所有付费模型不可用时，可自动安全回退到配置的免费模型以保障服务不中断。
+- **故障转移** - 动态检测失败并自动切换备用模型，保障服务高可用性。
+- **自动禁用与探测** - 连续健康检查失败自动禁用模型，并支持按概率对不健康的模型发起探测请求以自动恢复。
+- **并发控制** - 细粒度支持对每个模型配置最大并发数（如 `max_concurrent`）。
+- **IP 白名单** - 精细化访问控制，支持 `X-Forwarded-For` 和 `X-Real-IP`。
+- **请求日志与统计** - 完整记录所有 API 请求响应耗时及 Token 消耗。
+- **热重载配置** - 修改 `proxy_config.yaml` 无需重启服务，配置立即生效。
+- **Web 管理面板** - 直观的可视化管理界面，支持在线查看模型健康状态和监控。
 
 ## 界面预览
 
@@ -57,8 +61,11 @@ pip install -r requirements.txt
 
 ```yaml
 server:
-  host: "127.0.0.1"
+  host: "0.0.0.0"
   port: 8888
+  allowed_ips:
+    - 127.0.0.1
+    - ::1
 
 models:
   available:
@@ -84,16 +91,21 @@ models:
 # 时间调度策略（可选）
 schedule:
   timezone: "Asia/Shanghai"
-  peak_hours: [18, 19, 20, 21, 22, 23]
-  peak_strategy: openrouter
+  peak_hours:
+    - [18, 23]
   off_peak_hours:
     enabled: true
-    hours: [[20, 4]]        # UTC+4 20:00 - 04:00
+    hours: [[20, 4]]
     timezone: "Asia/Dubai"
     models: ["my-openai"]
     priority_boost: true
-    boost_priority: 1       # 离峰时段优先级提升
+    boost_priority: 1
     default_priority: 100
+
+usage:
+  per_model_limits:
+    my-openai:
+      max_concurrent: 3
 ```
 
 ### 3. 启动服务
@@ -101,8 +113,8 @@ schedule:
 ```bash
 # 使用脚本
 chmod +x start.sh stop.sh
-./start.sh    # 启动
-./stop.sh     # 停止
+./start.sh    # 启动后台服务
+./stop.sh     # 停止后台服务
 
 # 或直接启动
 python start_proxy.py --config proxy_config.yaml --port 8888
@@ -129,30 +141,16 @@ python start_proxy.py [选项]
 
 ### Chat Completions
 
-**cURL（非流式）：**
+**固定槽位请求（会话保持）：**
+在 `model` 参数中传入 `auto1`, `auto2` 等，系统会固定将该槽位映射到一个健康的后端模型。
 
 ```bash
 curl http://localhost:8888/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "my-openai",
+    "model": "auto1",
     "messages": [
-      {"role": "system", "content": "You are a helpful assistant."},
       {"role": "user", "content": "你好！"}
-    ]
-  }'
-```
-
-**cURL（流式）：**
-
-```bash
-curl http://localhost:8888/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "my-openai",
-    "stream": true,
-    "messages": [
-      {"role": "user", "content": "讲个笑话。"}
     ]
   }'
 ```
@@ -168,29 +166,10 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="auto",  # 自动选择模型
+    model="auto",  # 自动选择最优模型，或传入具体模型名/槽位名 (如 auto1)
     messages=[{"role": "user", "content": "你好！"}]
 )
 print(response.choices[0].message.content)
-```
-
-### 管理接口
-
-```bash
-# 获取模型列表
-curl http://localhost:8888/v1/models
-
-# 代理状态
-curl http://localhost:8888/proxy/status
-
-# 健康检查
-curl http://localhost:8888/proxy/health
-
-# 用量统计
-curl http://localhost:8888/proxy/usage
-
-# 请求日志
-curl http://localhost:8888/proxy/logs
 ```
 
 ## 接口参考
@@ -204,32 +183,21 @@ curl http://localhost:8888/proxy/logs
 | `/proxy/usage` | GET | 用量统计 |
 | `/proxy/logs` | GET | 请求日志 |
 | `/proxy/config` | GET/PUT | 读取或更新配置 |
-| `/proxy/models/{name}/enable` | POST | 启用模型 |
-| `/proxy/models/{name}/disable` | POST | 禁用模型 |
-| `/proxy/models/{name}` | PUT | 更新模型配置 |
-| `/proxy/models/{name}` | DELETE | 删除模型 |
-| `/proxy/models/{name}/test` | POST | 测试模型连接 |
 
 ## 项目结构
 
 ```
 llm_proxy/
 ├── server.py           # FastAPI 服务器
-├── model_manager.py    # 模型管理与负载均衡
+├── model_manager.py    # 模型管理、负载均衡、并发控制
 ├── config_watcher.py   # 配置文件热重载
-├── health_checker.py   # 模型健康检查
+├── health_checker.py   # 模型健康检查与探测
 ├── request_logger.py   # 请求日志记录
-├── usage_controller.py # 用量控制
+├── usage_controller.py # 用量与速率限制控制
 ├── time_controller.py  # 时间调度与离峰策略
-├── start_proxy.py      # 启动脚本（支持命令行参数）
-├── start.sh            # Shell 启动脚本
-├── stop.sh             # Shell 停止脚本
-├── requirements.txt    # Python 依赖
-├── proxy_config.yaml   # 配置文件
-├── static/             # 前端静态资源
-├── images/             # README 截图
-├── logs/               # 日志目录
-└── stats/              # 统计数据目录
+├── start_proxy.py      # 启动脚本
+├── proxy_config.yaml   # 主配置文件
+└── static/             # 前端静态资源
 ```
 
 ## 许可证

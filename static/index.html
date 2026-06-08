@@ -356,6 +356,68 @@
         .font-semibold { font-weight: 600; }
         .w-full { width: 100%; }
         
+        .process-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 12px;
+            padding: 8px 0;
+        }
+        .process-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 12px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .process-icon {
+            width: 36px;
+            height: 36px;
+            border-radius: 8px;
+            background: var(--primary);
+            color: var(--primary-foreground);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 600;
+            font-size: 14px;
+        }
+        .process-info {
+            flex: 1;
+            min-width: 0;
+        }
+        .process-name {
+            font-weight: 500;
+            font-size: 13px;
+            color: var(--foreground);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .process-model {
+            font-size: 11px;
+            color: var(--muted-foreground);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .process-status {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--badge-success);
+            animation: pulse 2s infinite;
+        }
+        .process-status.idle {
+            background: var(--muted-foreground);
+            animation: none;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
         @media (max-width: 1200px) { .stats-grid { grid-template-columns: repeat(2, 1fr); } .charts-grid { grid-template-columns: 1fr; } }
         @media (max-width: 768px) { .sidebar { display: none; } .main { margin-left: 0; } .stats-grid { grid-template-columns: 1fr; } .form-grid { grid-template-columns: 1fr; } }
         ::-webkit-scrollbar { width: 6px; height: 6px; }
@@ -587,6 +649,8 @@
                                     <th>Model</th>
                                     <th>Provider</th>
                                     <th>Priority</th>
+                                    <th>Max Concurrent</th>
+                                    <th>Max RPM</th>
                                     <th>Type</th>
                                     <th>Status</th>
                                     <th style="text-align: right;">Actions</th>
@@ -599,6 +663,18 @@
                 
                 <!-- Logs -->
                 <div id="logsSection" class="section">
+                    <div class="card mb-4">
+                        <div class="card-header">
+                            <div class="card-title">Active Processes</div>
+                            <div class="card-description">Current model usage per process</div>
+                        </div>
+                        <div class="card-content">
+                            <div id="activeProcesses" class="process-grid">
+                                <div class="text-muted">Loading...</div>
+                            </div>
+                        </div>
+                    </div>
+                    
                     <div class="charts-grid">
                         <div class="card">
                             <div class="card-header">
@@ -656,6 +732,25 @@
                     
                     <div class="card mb-4">
                         <div class="card-header">
+                            <div class="card-title">Concurrency Control</div>
+                            <div class="card-description">Set max concurrent threads per model</div>
+                        </div>
+                        <div class="card-content">
+                            <div class="form-grid">
+                                <div class="form-group">
+                                    <label class="form-label">Max Threads (Global)</label>
+                                    <input class="form-input" id="maxThreads" type="number" value="10" min="1" max="100">
+                                </div>
+                                <div class="form-group">
+                                    <label class="form-label">Peak Parallel Limit</label>
+                                    <input class="form-input" id="peakParallel" type="number" value="3">
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="card mb-4">
+                        <div class="card-header">
                             <div class="card-title">Usage Control</div>
                             <div class="card-description">Set token limits and budget</div>
                         </div>
@@ -695,10 +790,6 @@
                                         <option value="nvidia-deepseek">nvidia-deepseek</option>
                                         <option value="mimo">mimo</option>
                                     </select>
-                                </div>
-                                <div class="form-group">
-                                    <label class="form-label">Peak Parallel Limit</label>
-                                    <input class="form-input" id="peakParallel" type="number" value="1">
                                 </div>
                                 <div class="form-group">
                                     <label class="form-label">MIMO Priority Hours</label>
@@ -807,6 +898,10 @@
             try {
                 statusData = await fetchJSON('/proxy/status');
                 if (statusData) {
+                    // 确保 config 已加载
+                    if (!config || Object.keys(config).length === 0) {
+                        config = await fetchJSON('/proxy/config') || {};
+                    }
                     updateUI(statusData);
                     updateModelFilter();
                     await loadTrendData();
@@ -825,6 +920,76 @@
             logsData = data?.logs || [];
             renderLogs();
             renderCharts();
+            renderActiveProcesses();
+        }
+        
+        async function renderActiveProcesses() {
+            const container = document.getElementById('activeProcesses');
+            if (!container) return;
+            
+            try {
+                // 从日志获取每个进程当前使用的模型
+                const processMap = {};
+                const now = new Date();
+                
+                // 只看最近 2 分钟的日志
+                for (const log of logsData) {
+                    if (log.type === 'request') {
+                        const client = log.requested_model?.startsWith('auto') ? log.requested_model : log.client_ip;
+                        const time = new Date(log.timestamp);
+                        const diff = (now - time) / 1000;
+                        
+                        // 只显示最近 2 分钟的请求
+                        if (diff < 120) {
+                            processMap[client] = {
+                                name: client,
+                                model: log.actual_model || '-',
+                                modelId: log.model_id || '-',
+                                provider: log.provider || '-',
+                                lastSeen: time,
+                                isActive: diff < 60
+                            };
+                        }
+                    }
+                }
+                
+                const processes = Object.values(processMap).sort((a, b) => a.name.localeCompare(b.name));
+                
+                if (processes.length === 0) {
+                    container.innerHTML = '<div class="text-muted">No active processes</div>';
+                    return;
+                }
+                
+                let html = '';
+                for (const p of processes) {
+                    const statusClass = p.isActive ? '' : 'idle';
+                    const timeAgo = getTimeAgo(p.lastSeen);
+                    
+                    html += `
+                        <div class="process-card">
+                            <div class="process-icon">${p.name.replace('auto', 'A')}</div>
+                            <div class="process-info">
+                                <div class="process-name">${p.name}</div>
+                                <div class="process-model">${p.model} • ${timeAgo}</div>
+                            </div>
+                            <div class="process-status ${statusClass}" title="${p.isActive ? 'Active' : 'Idle'}"></div>
+                        </div>
+                    `;
+                }
+                
+                container.innerHTML = html;
+            } catch (e) {
+                container.innerHTML = '<div class="text-muted">Error loading data</div>';
+            }
+        }
+        
+        function getTimeAgo(date) {
+            const seconds = Math.floor((new Date() - date) / 1000);
+            if (seconds < 60) return `${seconds}s ago`;
+            const minutes = Math.floor(seconds / 60);
+            if (minutes < 60) return `${minutes}m ago`;
+            const hours = Math.floor(minutes / 60);
+            return `${hours}h ago`;
         }
         
         async function loadConfig() {
@@ -928,8 +1093,8 @@
                             label: function(context) {
                                 let label = context.dataset.label || '';
                                 let value = context.parsed.y;
-                                if (value >= 1e6) return label + ': ' + (value/1e6).toFixed(1) + 'M tokens';
-                                if (value >= 1e3) return label + ': ' + (value/1e3).toFixed(1) + 'K tokens';
+                                if (value >= 1e6) return label + ': ' + (value/1e6).toFixed(3) + 'M tokens';
+                                if (value >= 1e3) return label + ': ' + (value/1e3).toFixed(3) + 'K tokens';
                                 return label + ': ' + value + ' tokens';
                             }
                         }
@@ -1022,12 +1187,12 @@
             }
             
             // 格式化 token 数量
-            function formatTokens(n) {
-                if (n >= 1e9) return (n/1e9).toFixed(1) + 'B';
-                if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
-                if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
-                return n.toString();
-            }
+             function formatTokens(n) {
+                 if (n >= 1e9) return (n/1e9).toFixed(3) + 'B';
+                 if (n >= 1e6) return (n/1e6).toFixed(3) + 'M';
+                 if (n >= 1e3) return (n/1e3).toFixed(3) + 'K';
+                 return n.toString();
+             }
             
             let html = '';
             for (const [p, s] of Object.entries(providers)) {
@@ -1074,6 +1239,11 @@
                 const logo = providerLogos[m.provider] || '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="10"/></svg>';
                 const keyHint = m.api_key_hint || '';
                 
+                // 获取每个模型的并发设置
+                const modelLimits = config.usage?.per_model_limits?.[name] || {};
+                const maxConcurrent = modelLimits.max_concurrent || '∞';
+                const maxRpm = modelLimits.max_requests_per_minute || '∞';
+                
                 html += `
                     <tr>
                         <td>
@@ -1087,6 +1257,8 @@
                         </td>
                         <td class="text-sm">${m.provider || '-'}</td>
                         <td class="text-sm">${m.priority}</td>
+                        <td class="text-sm">${maxConcurrent}</td>
+                        <td class="text-sm">${maxRpm}</td>
                         <td class="text-sm">${m.free ? 'Free' : 'Paid'}</td>
                         <td><span class="badge ${statusCls}" title="${statusTitle}"><span class="dot"></span>${statusTxt}${!ok && healthReason ? `<br><span style="font-weight:400;font-size:10px;opacity:0.8">${healthReason.substring(0, 60)}</span>` : ''}</span></td>
                         <td style="text-align: right;">
@@ -1167,7 +1339,6 @@
                 const modelId = r.model_id || r.actual_model;
                 const provider = r.provider || '';
                 const modelShort = modelId.includes('/') ? modelId.split('/').pop() : modelId;
-                // 显示 actual_model + provider/model（如 openrouter-1/openrouter/owl-alpha）
                 const modelDisplay = r.actual_model ? `${r.actual_model}/${modelShort}` : (provider ? `${provider}/${modelShort}` : modelShort);
                 html += `
                     <tr>
@@ -1259,13 +1430,16 @@
             
             const s = config.schedule || {};
             document.getElementById('peakStrategy').value = s.peak_strategy || 'minimax';
-            document.getElementById('peakParallel').value = s.peak_parallel_limit || 1;
+            document.getElementById('peakParallel').value = s.peak_parallel_limit || 3;
             document.getElementById('mimoHours').value = (s.mimo_priority_hours || [0,1,2,3,4,5,6,7]).join(',');
             document.getElementById('skipWeekend').value = s.peak_skip_weekends !== false ? 'true' : 'false';
             
+            // Max Threads (from server config or default)
+            document.getElementById('maxThreads').value = config.server?.max_threads || 10;
+            
             const f = config.failover || {};
             document.getElementById('maxRetries').value = f.max_retries || 5;
-            document.getElementById('maxFailures').value = f.max_consecutive_failures || 3;
+            document.getElementById('maxFailures').value = f.max_consecutive_failures || 5;
             document.getElementById('recoveryTime').value = f.recovery_time || 3600;
             document.getElementById('fallbackFree').value = f.fallback_to_free !== false ? 'true' : 'false';
         }
@@ -1385,10 +1559,41 @@
         
         async function saveConfig() {
             try {
-                config = JSON.parse(document.getElementById('configEditor').value);
+                // 从 JSON 编辑器获取配置
+                const editorConfig = JSON.parse(document.getElementById('configEditor').value);
+                
+                // 从表单获取设置
+                const formConfig = {
+                    usage: {
+                        daily_budget: parseFloat(document.getElementById('dailyBudget').value) || 50,
+                        monthly_budget: parseFloat(document.getElementById('monthlyBudget').value) || 500,
+                        max_tokens_per_day: parseInt(document.getElementById('maxTokensDay').value) || 5000000,
+                        max_tokens_per_request: parseInt(document.getElementById('maxTokensReq').value) || 100000,
+                    },
+                    schedule: {
+                        peak_strategy: document.getElementById('peakStrategy').value,
+                        peak_parallel_limit: parseInt(document.getElementById('peakParallel').value) || 3,
+                        mimo_priority_hours: document.getElementById('mimoHours').value.split(',').map(Number),
+                        peak_skip_weekends: document.getElementById('skipWeekend').value === 'true',
+                    },
+                    server: {
+                        ...editorConfig.server,
+                        max_threads: parseInt(document.getElementById('maxThreads').value) || 10,
+                    },
+                    failover: {
+                        max_retries: parseInt(document.getElementById('maxRetries').value) || 5,
+                        max_consecutive_failures: parseInt(document.getElementById('maxFailures').value) || 5,
+                        recovery_time: parseInt(document.getElementById('recoveryTime').value) || 3600,
+                        fallback_to_free: document.getElementById('fallbackFree').value === 'true',
+                    },
+                };
+                
+                // 合并配置
+                config = { ...editorConfig, ...formConfig };
+                
                 const res = await fetch('/proxy/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) });
                 if (res.ok) toast('Config saved', 'success'); else toast('Failed', 'error');
-            } catch (e) { toast('Invalid JSON', 'error'); }
+            } catch (e) { toast('Invalid JSON: ' + e.message, 'error'); }
         }
         
         function fmt(n) {

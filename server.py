@@ -6,7 +6,7 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import AsyncGenerator, Dict, List, Optional, Set
 
@@ -78,8 +78,7 @@ class LLMProxyServer:
 
         # 初始化配置监控
         self.config_watcher = ConfigWatcher(
-            str(self.config_path),
-            self._on_config_change
+            str(self.config_path), self._on_config_change
         )
 
         # HTTP 客户端
@@ -125,7 +124,7 @@ class LLMProxyServer:
         self.config_watcher.stop()
 
         # 停止健康检查
-        if hasattr(self, 'health_check_task'):
+        if hasattr(self, "health_check_task"):
             self.health_check_task.cancel()
             try:
                 await self.health_check_task
@@ -141,17 +140,23 @@ class LLMProxyServer:
         """定时健康检查循环 - 每天凌晨3点执行"""
         while True:
             try:
-                # 计算到下一个凌晨3点的时间
+                # 每 30 分钟检查一次需要重新启用的模型
+                await asyncio.sleep(1800)  # 30 分钟
+
+                # 检查并重新启用已到期的模型
+                re_enabled = (
+                    self.model_manager.health_checker.check_and_re_enable_models(
+                        self.model_manager
+                    )
+                )
+                if re_enabled:
+                    logger.info(f"自动重新启用模型: {re_enabled}")
+
+                # 每天凌晨 3 点执行完整健康检查
                 now = datetime.now()
-                next_check = now.replace(hour=3, minute=0, second=0, microsecond=0)
-                if now >= next_check:
-                    next_check += timedelta(days=1)
-                
-                wait_seconds = (next_check - now).total_seconds()
-                logger.info(f"下次健康检查: {next_check.strftime('%Y-%m-%d %H:%M:%S')} ({wait_seconds:.0f}秒后)")
-                
-                await asyncio.sleep(wait_seconds)
-                await self.check_all_models()
+                if now.hour == 3 and now.minute < 30:
+                    await self.check_all_models()
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -162,49 +167,55 @@ class LLMProxyServer:
         """检查所有模型的连接状态"""
         logger.info("开始检查所有模型连接状态...")
         results = {}
-        
+
         for model_name, model_config in self.model_manager.models.items():
             if not model_config.enabled:
                 results[model_name] = {
                     "status": "disabled",
-                    "message": "Model is disabled"
+                    "message": "Model is disabled",
                 }
                 continue
-            
+
             try:
                 start_time = time.time()
-                
+
                 # 构建测试请求
                 model_id = model_config.model
                 if "/" in model_id:
                     parts = model_id.split("/", 1)
-                    if parts[0] in ["nvidia", "openai", "openrouter", "minimax", "anthropic"]:
+                    if parts[0] in [
+                        "nvidia",
+                        "openai",
+                        "openrouter",
+                        "minimax",
+                        "anthropic",
+                    ]:
                         model_id = parts[1]
-                
+
                 test_body = {
                     "model": model_id,
                     "messages": [{"role": "user", "content": "Hi"}],
-                    "max_tokens": 5
+                    "max_tokens": 5,
                 }
-                
+
                 headers = {
                     "Content-Type": "application/json",
-                    "Authorization": f"Bearer {model_config.api_key}"
+                    "Authorization": f"Bearer {model_config.api_key}",
                 }
-                
+
                 url = f"{model_config.api_base}/chat/completions"
-                
+
                 response = await self.http_client.post(
                     url, json=test_body, headers=headers, timeout=30
                 )
-                
+
                 duration = time.time() - start_time
-                
+
                 if response.status_code == 200:
                     results[model_name] = {
                         "status": "healthy",
                         "latency": round(duration, 3),
-                        "message": "OK"
+                        "message": "OK",
                     }
                     self.model_manager.handle_success(model_name)
                 else:
@@ -212,46 +223,44 @@ class LLMProxyServer:
                         "status": "unhealthy",
                         "latency": round(duration, 3),
                         "message": f"HTTP {response.status_code}",
-                        "error": response.text[:200]
+                        "error": response.text[:200],
                     }
-                    self.model_manager.health_checker.mark_unhealthy(model_name, f"HTTP {response.status_code}")
-                    
+                    self.model_manager.health_checker.mark_unhealthy(
+                        model_name, f"HTTP {response.status_code}"
+                    )
+
             except httpx.TimeoutException:
                 results[model_name] = {
                     "status": "timeout",
-                    "message": "Request timeout (30s)"
+                    "message": "Request timeout (30s)",
                 }
                 self.model_manager.health_checker.mark_unhealthy(model_name, "Timeout")
             except Exception as e:
-                results[model_name] = {
-                    "status": "error",
-                    "message": str(e)[:200]
-                }
-                self.model_manager.health_checker.mark_unhealthy(model_name, str(e)[:100])
-        
+                results[model_name] = {"status": "error", "message": str(e)[:200]}
+                self.model_manager.health_checker.mark_unhealthy(
+                    model_name, str(e)[:100]
+                )
+
         # 记录结果
         healthy_count = sum(1 for r in results.values() if r["status"] == "healthy")
         total_count = len(results)
         logger.info(f"健康检查完成: {healthy_count}/{total_count} 模型可用")
-        
+
         return results
 
     async def test_model(self, model_name: str) -> dict:
         """测试单个模型连接（支持禁用模型）"""
         if model_name not in self.model_manager.models:
-            return {
-                "status": "error",
-                "message": f"Model {model_name} not found"
-            }
-        
+            return {"status": "error", "message": f"Model {model_name} not found"}
+
         model_config = self.model_manager.models[model_name]
-        
+
         try:
             start_time = time.time()
-            
+
             # 判断是否使用 Anthropic 格式
-            use_anthropic = getattr(model_config, 'api_format', 'openai') == 'anthropic'
-            
+            use_anthropic = getattr(model_config, "api_format", "openai") == "anthropic"
+
             if use_anthropic:
                 # Anthropic 格式测试
                 url = f"{model_config.api_base}/v1/messages"
@@ -262,22 +271,26 @@ class LLMProxyServer:
                 }
                 test_body = {
                     "model": model_config.model,
-                    "messages": [{"role": "user", "content": "Hello, respond with one word."}],
-                    "max_tokens": 10
+                    "messages": [
+                        {"role": "user", "content": "Hello, respond with one word."}
+                    ],
+                    "max_tokens": 10,
                 }
-                
-                response = await self.http_client.post(url, json=test_body, headers=headers, timeout=30)
+
+                response = await self.http_client.post(
+                    url, json=test_body, headers=headers, timeout=30
+                )
                 duration = time.time() - start_time
-                
+
                 if response.status_code == 200:
                     data = response.json()
                     content = ""
                     if "content" in data and len(data["content"]) > 0:
                         content = data["content"][0].get("text", "")
-                    
+
                     usage = data.get("usage", {})
                     self.model_manager.handle_success(model_name)
-                    
+
                     return {
                         "status": "success",
                         "latency": round(duration, 3),
@@ -288,98 +301,111 @@ class LLMProxyServer:
                             "input_tokens": usage.get("input_tokens", 0),
                             "output_tokens": usage.get("output_tokens", 0),
                         },
-                        "message": "Connection successful"
+                        "message": "Connection successful",
                     }
                 else:
                     error_text = response.text[:500]
-                    self.model_manager.health_checker.mark_unhealthy(model_name, f"HTTP {response.status_code}")
+                    self.model_manager.health_checker.mark_unhealthy(
+                        model_name, f"HTTP {response.status_code}"
+                    )
                     return {
                         "status": "error",
                         "latency": round(duration, 3),
                         "message": f"HTTP {response.status_code}",
-                        "error": error_text
+                        "error": error_text,
                     }
             else:
                 # OpenAI 格式测试
                 model_id = model_config.model
                 if "/" in model_id:
                     parts = model_id.split("/", 1)
-                    if parts[0] in ["nvidia", "openai", "openrouter", "minimax", "anthropic", "xiaomi"]:
+                    if parts[0] in [
+                        "nvidia",
+                        "openai",
+                        "openrouter",
+                        "minimax",
+                        "anthropic",
+                        "xiaomi",
+                    ]:
                         model_id = parts[1]
-                
+
                 test_body = {
                     "model": model_id,
-                    "messages": [{"role": "user", "content": "Hello, respond with one word."}],
-                    "max_tokens": 10
+                    "messages": [
+                        {"role": "user", "content": "Hello, respond with one word."}
+                    ],
+                    "max_tokens": 10,
                 }
-                
+
                 headers = {
                     "Content-Type": "application/json",
-                    "Authorization": f"Bearer {model_config.api_key}"
+                    "Authorization": f"Bearer {model_config.api_key}",
                 }
-                
+
                 url = f"{model_config.api_base}/chat/completions"
-                
-                response = await self.http_client.post(url, json=test_body, headers=headers, timeout=30)
+
+                response = await self.http_client.post(
+                    url, json=test_body, headers=headers, timeout=30
+                )
                 duration = time.time() - start_time
-                
+
                 if response.status_code == 200:
                     data = response.json()
                     content = ""
                     if "choices" in data and len(data["choices"]) > 0:
-                        content = data["choices"][0].get("message", {}).get("content", "")
-                    
+                        content = (
+                            data["choices"][0].get("message", {}).get("content", "")
+                        )
+
                     self.model_manager.handle_success(model_name)
-                    
+
                     return {
                         "status": "success",
                         "latency": round(duration, 3),
                         "model": model_config.model,
                         "provider": model_config.provider,
                         "response_preview": content[:100],
-                        "message": "Connection successful"
+                        "message": "Connection successful",
                     }
                 else:
                     error_text = response.text[:500]
-                    self.model_manager.health_checker.mark_unhealthy(model_name, f"HTTP {response.status_code}")
+                    self.model_manager.health_checker.mark_unhealthy(
+                        model_name, f"HTTP {response.status_code}"
+                    )
                     return {
                         "status": "error",
                         "latency": round(duration, 3),
                         "message": f"HTTP {response.status_code}",
-                        "error": error_text
+                        "error": error_text,
                     }
-                
+
         except httpx.TimeoutException:
             self.model_manager.health_checker.mark_unhealthy(model_name, "Timeout")
-            return {
-                "status": "timeout",
-                "message": "Request timeout (30s)"
-            }
+            return {"status": "timeout", "message": "Request timeout (30s)"}
         except Exception as e:
             self.model_manager.health_checker.mark_unhealthy(model_name, str(e)[:100])
-            return {
-                "status": "error",
-                "message": str(e)[:300]
-            }
+            return {"status": "error", "message": str(e)[:300]}
 
     async def forward_request(
-        self,
-        model_name: str,
-        model_config,
-        request_body: dict,
-        stream: bool = False
+        self, model_name: str, model_config, request_body: dict, stream: bool = False
     ):
         """转发请求到后端 LLM API，内部自动适配 OpenAI/Anthropic 格式"""
-        
-        # 判断是否使用 Anthropic 格式
-        use_anthropic = getattr(model_config, 'api_format', 'openai') == 'anthropic'
-        
-        if use_anthropic:
-            return await self._forward_anthropic(model_name, model_config, request_body, stream)
-        else:
-            return await self._forward_openai(model_name, model_config, request_body, stream)
 
-    async def _forward_openai(self, model_name: str, model_config, request_body: dict, stream: bool):
+        # 判断是否使用 Anthropic 格式
+        use_anthropic = getattr(model_config, "api_format", "openai") == "anthropic"
+
+        if use_anthropic:
+            return await self._forward_anthropic(
+                model_name, model_config, request_body, stream
+            )
+        else:
+            return await self._forward_openai(
+                model_name, model_config, request_body, stream
+            )
+
+    async def _forward_openai(
+        self, model_name: str, model_config, request_body: dict, stream: bool
+    ):
         """转发到 OpenAI 兼容 API"""
         url = f"{model_config.api_base}/chat/completions"
         headers = {
@@ -390,26 +416,43 @@ class LLMProxyServer:
         model_id = model_config.model
         if "/" in model_id:
             parts = model_id.split("/", 1)
-            if parts[0] in ["nvidia", "openai", "openrouter", "minimax", "anthropic", "xiaomi"]:
+            if parts[0] in [
+                "nvidia",
+                "openai",
+                "openrouter",
+                "minimax",
+                "anthropic",
+                "xiaomi",
+            ]:
                 model_id = parts[1]
         body["model"] = model_id
 
         if stream:
+
             async def stream_generator() -> AsyncGenerator[bytes, None]:
-                async with self.http_client.stream("POST", url, json=body, headers=headers) as response:
+                async with self.http_client.stream(
+                    "POST", url, json=body, headers=headers
+                ) as response:
                     if response.status_code != 200:
                         error_body = await response.aread()
-                        raise HTTPException(status_code=response.status_code, detail=error_body.decode())
+                        raise HTTPException(
+                            status_code=response.status_code, detail=error_body.decode()
+                        )
                     async for chunk in response.aiter_bytes():
                         yield chunk
+
             return StreamingResponse(stream_generator(), media_type="text/event-stream")
         else:
             response = await self.http_client.post(url, json=body, headers=headers)
             if response.status_code != 200:
-                raise HTTPException(status_code=response.status_code, detail=response.text)
+                raise HTTPException(
+                    status_code=response.status_code, detail=response.text
+                )
             return response.json()
 
-    async def _forward_anthropic(self, model_name: str, model_config, request_body: dict, stream: bool):
+    async def _forward_anthropic(
+        self, model_name: str, model_config, request_body: dict, stream: bool
+    ):
         """转发到 Anthropic API，自动转换 OpenAI 格式"""
         url = f"{model_config.api_base}/v1/messages"
         headers = {
@@ -421,14 +464,14 @@ class LLMProxyServer:
         # OpenAI -> Anthropic 格式转换
         body = request_body.copy()
         model_id = model_config.model
-        
+
         # 构建 Anthropic 请求
         anthropic_body = {
             "model": model_id,
             "max_tokens": body.get("max_tokens", 4096),
             "messages": body.get("messages", []),
         }
-        
+
         # 添加 system prompt（如果有）
         if "system" in body:
             anthropic_body["system"] = body["system"]
@@ -438,7 +481,7 @@ class LLMProxyServer:
             if messages and messages[0].get("role") == "system":
                 anthropic_body["system"] = messages[0].get("content", "")
                 anthropic_body["messages"] = messages[1:]
-        
+
         # 添加可选参数
         if "temperature" in body:
             anthropic_body["temperature"] = body["temperature"]
@@ -447,12 +490,17 @@ class LLMProxyServer:
 
         if stream:
             anthropic_body["stream"] = True
+
             async def stream_generator() -> AsyncGenerator[bytes, None]:
-                async with self.http_client.stream("POST", url, json=anthropic_body, headers=headers) as response:
+                async with self.http_client.stream(
+                    "POST", url, json=anthropic_body, headers=headers
+                ) as response:
                     if response.status_code != 200:
                         error_body = await response.aread()
-                        raise HTTPException(status_code=response.status_code, detail=error_body.decode())
-                    
+                        raise HTTPException(
+                            status_code=response.status_code, detail=error_body.decode()
+                        )
+
                     # 转换 Anthropic SSE 到 OpenAI SSE
                     async for line in response.aiter_lines():
                         if not line.strip():
@@ -464,17 +512,24 @@ class LLMProxyServer:
                                 continue
                             try:
                                 event = json.loads(data_str)
-                                openai_chunk = self._anthropic_stream_to_openai(event, model_id)
+                                openai_chunk = self._anthropic_stream_to_openai(
+                                    event, model_id
+                                )
                                 if openai_chunk:
                                     yield f"data: {json.dumps(openai_chunk)}\n\n"
                             except json.JSONDecodeError:
                                 pass
+
             return StreamingResponse(stream_generator(), media_type="text/event-stream")
         else:
-            response = await self.http_client.post(url, json=anthropic_body, headers=headers)
+            response = await self.http_client.post(
+                url, json=anthropic_body, headers=headers
+            )
             if response.status_code != 200:
-                raise HTTPException(status_code=response.status_code, detail=response.text)
-            
+                raise HTTPException(
+                    status_code=response.status_code, detail=response.text
+                )
+
             # Anthropic -> OpenAI 格式转换
             anthropic_resp = response.json()
             return self._anthropic_to_openai(anthropic_resp, model_id)
@@ -485,33 +540,36 @@ class LLMProxyServer:
         for block in anthropic_resp.get("content", []):
             if block.get("type") == "text":
                 content += block.get("text", "")
-        
+
         usage = anthropic_resp.get("usage", {})
-        
+
         return {
             "id": anthropic_resp.get("id", ""),
             "object": "chat.completion",
             "created": int(datetime.now().timestamp()),
             "model": model_id,
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": content,
-                },
-                "finish_reason": anthropic_resp.get("stop_reason", "stop"),
-            }],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": content,
+                    },
+                    "finish_reason": anthropic_resp.get("stop_reason", "stop"),
+                }
+            ],
             "usage": {
                 "prompt_tokens": usage.get("input_tokens", 0),
                 "completion_tokens": usage.get("output_tokens", 0),
-                "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+                "total_tokens": usage.get("input_tokens", 0)
+                + usage.get("output_tokens", 0),
             },
         }
 
     def _anthropic_stream_to_openai(self, event: dict, model_id: str) -> dict:
         """将 Anthropic 流式事件转换为 OpenAI 格式"""
         event_type = event.get("type", "")
-        
+
         if event_type == "message_start":
             # message_start 包含 input_tokens
             message = event.get("message", {})
@@ -522,11 +580,13 @@ class LLMProxyServer:
                     "object": "chat.completion.chunk",
                     "created": int(datetime.now().timestamp()),
                     "model": model_id,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": ""},
-                        "finish_reason": None,
-                    }],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": ""},
+                            "finish_reason": None,
+                        }
+                    ],
                     "usage": {
                         "prompt_tokens": usage.get("input_tokens", 0),
                         "completion_tokens": 0,
@@ -534,7 +594,7 @@ class LLMProxyServer:
                     },
                 }
             return None
-        
+
         elif event_type == "content_block_delta":
             delta = event.get("delta", {})
             if delta.get("type") == "text_delta":
@@ -543,13 +603,15 @@ class LLMProxyServer:
                     "object": "chat.completion.chunk",
                     "created": int(datetime.now().timestamp()),
                     "model": model_id,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": delta.get("text", "")},
-                        "finish_reason": None,
-                    }],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": delta.get("text", "")},
+                            "finish_reason": None,
+                        }
+                    ],
                 }
-        
+
         elif event_type == "message_delta":
             # message_delta 包含 output_tokens
             delta = event.get("delta", {})
@@ -559,18 +621,20 @@ class LLMProxyServer:
                 "object": "chat.completion.chunk",
                 "created": int(datetime.now().timestamp()),
                 "model": model_id,
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": delta.get("stop_reason", "stop"),
-                }],
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": delta.get("stop_reason", "stop"),
+                    }
+                ],
                 "usage": {
                     "prompt_tokens": 0,
                     "completion_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("output_tokens", 0),
                 },
             }
-        
+
         return None
 
 
@@ -588,7 +652,7 @@ def create_app(config_path: str) -> FastAPI:
         title="LLM Proxy Hub",
         description="多 LLM API 管理与自动调度代理服务",
         version="1.0.0",
-        lifespan=lifespan
+        lifespan=lifespan,
     )
 
     # CORS 中间件
@@ -629,12 +693,13 @@ def create_app(config_path: str) -> FastAPI:
             return response
 
         # API 端点检查白名单
-        if request.url.path.startswith("/proxy/") or request.url.path.startswith("/v1/"):
+        if request.url.path.startswith("/proxy/") or request.url.path.startswith(
+            "/v1/"
+        ):
             if not server.ip_whitelist.is_allowed(client_ip):
                 logger.warning(f"拒绝访问: {client_ip} - {request.url.path}")
                 return JSONResponse(
-                    status_code=403,
-                    content={"detail": f"IP {client_ip} not allowed"}
+                    status_code=403, content={"detail": f"IP {client_ip} not allowed"}
                 )
 
         response = await call_next(request)
@@ -679,13 +744,16 @@ def create_app(config_path: str) -> FastAPI:
 
         for attempt in range(max_retries + 1):
             try:
-                model_name, model_config = server.model_manager.select_model(requested_model)
+                model_name, model_config = server.model_manager.select_model(
+                    requested_model
+                )
             except NoAvailableModelError as e:
                 raise HTTPException(status_code=503, detail=str(e))
 
             # 检查模型是否被禁用（禁用后自动切换）
             if model_name in server.model_manager.disabled_models:
                 logger.info(f"[{request_id}] 模型 {model_name} 已禁用，重新选择")
+                server.model_manager.usage_controller.release_model(model_name)
                 continue
 
             try:
@@ -693,6 +761,7 @@ def create_app(config_path: str) -> FastAPI:
 
                 # 标记模型为活跃状态（避免 fallback 时选中正在使用的模型）
                 server.model_manager.mark_model_active(model_name)
+                # 并发锁已在 select_model 中原子获取
 
                 # 记录请求开始
                 request_logger.log_request(
@@ -717,75 +786,107 @@ def create_app(config_path: str) -> FastAPI:
                         total_tokens = 0
                         input_tokens = 0
                         output_tokens = 0
-                        final_usage = {}
                         model_switched = False
                         try:
                             async for chunk in response.body_iterator:
                                 # 检查模型是否被禁用，如果是则中断流
-                                if model_name in server.model_manager.disabled_models and not model_switched:
-                                    logger.warning(f"[{request_id}] 流式中检测到模型 {model_name} 被禁用，中断切换")
+                                if (
+                                    model_name in server.model_manager.disabled_models
+                                    and not model_switched
+                                ):
+                                    logger.warning(
+                                        f"[{request_id}] 流式中检测到模型 {model_name} 被禁用，中断切换"
+                                    )
                                     model_switched = True
                                     # 发送错误事件，客户端可据此重试
-                                    error_event = json.dumps({
-                                        "error": {
-                                            "message": f"Model {model_name} was disabled, please retry",
-                                            "type": "model_disabled",
-                                            "code": "model_switched"
+                                    error_event = json.dumps(
+                                        {
+                                            "error": {
+                                                "message": f"Model {model_name} was disabled, please retry",
+                                                "type": "model_disabled",
+                                                "code": "model_switched",
+                                            }
                                         }
-                                    })
+                                    )
                                     yield f"data: {error_event}\n\n"
                                     break
                                 yield chunk
                                 try:
-                                    chunk_str = chunk.decode() if isinstance(chunk, bytes) else chunk
-                                    if chunk_str.startswith("data: ") and chunk_str.strip() != "data: [DONE]":
+                                    chunk_str = (
+                                        chunk.decode()
+                                        if isinstance(chunk, bytes)
+                                        else chunk
+                                    )
+                                    if (
+                                        chunk_str.startswith("data: ")
+                                        and chunk_str.strip() != "data: [DONE]"
+                                    ):
                                         data = json.loads(chunk_str[6:])
                                         if "usage" in data:
                                             usage = data["usage"]
                                             total_tokens = usage.get("total_tokens", 0)
                                             input_tokens = usage.get("prompt_tokens", 0)
-                                            output_tokens = usage.get("completion_tokens", 0)
-                                            final_usage = usage
-                                            server.model_manager.record_usage(model_name, usage)
+                                            output_tokens = usage.get(
+                                                "completion_tokens", 0
+                                            )
+                                            server.model_manager.record_usage(
+                                                model_name, usage
+                                            )
                                 except Exception:
                                     pass
                         except Exception as e:
                             logger.warning(f"[{request_id}] 流式响应异常: {e}")
+                            # 处理错误（429 重试不禁用，额度/key 错误禁用）
+                            server.model_manager.handle_error(model_name, e)
                         finally:
+                            # 释放模型并发锁
+                            server.model_manager.usage_controller.release_model(
+                                model_name
+                            )
                             # 释放模型活跃状态
                             server.model_manager.mark_model_inactive(model_name)
 
                         duration = time.time() - start_time
+
+                        # 判断是否成功（有异常或无 token 统计视为失败）
+                        is_success = total_tokens > 0
+                        status = "success" if is_success else "failed"
+                        error_msg = (
+                            None if is_success else "Empty response or rate limited"
+                        )
 
                         # 记录请求完成
                         request_logger.log_response(
                             request_id=request_id,
                             model_name=model_name,
                             duration=duration,
-                            status="success",
+                            status=status,
                             usage={
                                 "total_tokens": total_tokens,
                                 "prompt_tokens": input_tokens,
                                 "completion_tokens": output_tokens,
                             },
+                            error=error_msg,
                         )
 
                         logger.info(
-                            f"[{request_id}] 流式请求完成: {model_name} | "
+                            f"[{request_id}] 流式请求{'完成' if is_success else '失败'}: {model_name} | "
                             f"耗时: {duration:.2f}s | tokens: {total_tokens}"
                         )
 
                     return StreamingResponse(
-                        stream_with_logging(),
-                        media_type="text/event-stream"
+                        stream_with_logging(), media_type="text/event-stream"
                     )
                 else:
                     # 非流式请求前检查模型是否被禁用
                     if model_name in server.model_manager.disabled_models:
-                        logger.warning(f"[{request_id}] 模型 {model_name} 在发送前被禁用，重新选择")
+                        logger.warning(
+                            f"[{request_id}] 模型 {model_name} 在发送前被禁用，重新选择"
+                        )
+                        server.model_manager.usage_controller.release_model(model_name)
                         server.model_manager.mark_model_inactive(model_name)
                         continue
-                    
+
                     response_data = await server.forward_request(
                         model_name, model_config, body, stream=False
                     )
@@ -795,6 +896,8 @@ def create_app(config_path: str) -> FastAPI:
                     server.model_manager.record_usage(model_name, usage)
                     server.model_manager.handle_success(model_name)
 
+                    # 释放模型并发锁
+                    server.model_manager.usage_controller.release_model(model_name)
                     # 释放模型活跃状态
                     server.model_manager.mark_model_inactive(model_name)
 
@@ -817,6 +920,8 @@ def create_app(config_path: str) -> FastAPI:
 
             except HTTPException as e:
                 last_error = e
+                # 释放模型并发锁
+                server.model_manager.usage_controller.release_model(model_name)
                 # 释放模型活跃状态
                 server.model_manager.mark_model_inactive(model_name)
                 should_switch = server.model_manager.handle_error(model_name, e)
@@ -868,6 +973,8 @@ def create_app(config_path: str) -> FastAPI:
 
             except Exception as e:
                 last_error = e
+                # 释放模型并发锁
+                server.model_manager.usage_controller.release_model(model_name)
                 # 释放模型活跃状态
                 server.model_manager.mark_model_inactive(model_name)
                 should_switch = server.model_manager.handle_error(model_name, e)
@@ -924,13 +1031,15 @@ def create_app(config_path: str) -> FastAPI:
         """返回可用模型列表"""
         models = []
         for name, config in server.model_manager.models.items():
-            models.append({
-                "id": name,
-                "object": "model",
-                "created": 0,
-                "owned_by": "proxy",
-                "permission": [],
-            })
+            models.append(
+                {
+                    "id": name,
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "proxy",
+                    "permission": [],
+                }
+            )
 
         return {
             "object": "list",
@@ -971,10 +1080,116 @@ def create_app(config_path: str) -> FastAPI:
         """
         return server.model_manager.usage_controller.get_trend_data(granularity, model)
 
+    # ==================== 扫描程序 API ====================
+
+    @app.get("/v1/models/available")
+    async def get_available_models_for_scanner():
+        """供扫描程序使用的 API - 获取可用模型状态
+
+        返回:
+            - 可用模型列表及当前状态
+            - 并发信息
+            - 成功率
+            - 推荐模型
+        """
+        server.model_manager.get_all_models_status()
+        health_report = server.model_manager.health_checker.get_health_report()
+
+        available_models = []
+        recommended_model = None
+        best_score = -1
+
+        for name, model_config in server.model_manager.models.items():
+            if not model_config.enabled or name in server.model_manager.disabled_models:
+                continue
+
+            health = health_report.get(name, {})
+            is_healthy = health.get("healthy", True)
+
+            # 计算成功率
+            total = health.get("total_successes", 0) + health.get("total_failures", 0)
+            success_rate = (
+                health.get("total_successes", 0) / total if total > 0 else 1.0
+            )
+
+            # 获取并发信息
+            rate_limit_state = (
+                server.model_manager.usage_controller.rate_limit_states.get(name)
+            )
+            active_requests = (
+                rate_limit_state.active_requests if rate_limit_state else 0
+            )
+
+            model_limits = server.model_manager.usage_controller.per_model_limits.get(
+                name, {}
+            )
+            max_concurrent = model_limits.get("max_concurrent", 999)
+            max_rpm = model_limits.get("max_requests_per_minute", 999)
+
+            # 计算可用并发槽
+            available_slots = max(0, max_concurrent - active_requests)
+
+            model_info = {
+                "name": name,
+                "model": model_config.model,
+                "provider": model_config.provider,
+                "priority": model_config.priority,
+                "healthy": is_healthy,
+                "success_rate": round(success_rate, 3),
+                "active_requests": active_requests,
+                "max_concurrent": max_concurrent,
+                "available_slots": available_slots,
+                "max_rpm": max_rpm,
+                "health_reason": health.get("reason", ""),
+            }
+
+            available_models.append(model_info)
+
+            # 计算推荐模型（健康 + 成功率高 + 有可用槽）
+            if is_healthy and available_slots > 0 and success_rate >= 0.7:
+                score = (1 if success_rate >= 0.9 else 0) + (
+                    available_slots / max_concurrent
+                )
+                if score > best_score:
+                    best_score = score
+                    recommended_model = name
+
+        # 按可用槽位排序
+        available_models.sort(key=lambda x: (-x["available_slots"], x["priority"]))
+
+        return {
+            "timestamp": time.time(),
+            "total_models": len(available_models),
+            "healthy_models": sum(1 for m in available_models if m["healthy"]),
+            "recommended_model": recommended_model,
+            "models": available_models,
+        }
+
+    @app.get("/v1/models/recommended")
+    async def get_recommended_model():
+        """供扫描程序使用的 API - 获取推荐模型
+
+        返回最适合使用的模型名称
+        """
+        result = await get_available_models_for_scanner()
+        recommended = result.get("recommended_model")
+
+        if not recommended:
+            raise HTTPException(status_code=503, detail="No available models")
+
+        # 返回 OpenAI 兼容格式
+        return {
+            "object": "model",
+            "id": recommended,
+            "created": int(time.time()),
+            "owned_by": "proxy",
+        }
+
     @app.get("/proxy/logs")
     async def proxy_logs(limit: int = 100):
         """返回请求日志"""
         from datetime import datetime
+
         today = datetime.now().strftime("%Y-%m-%d")
         # 使用 request_logger 的日志目录（绝对路径）
         log_file = request_logger.log_dir / f"requests_{today}.log"
@@ -1006,17 +1221,25 @@ def create_app(config_path: str) -> FastAPI:
             "summary": {
                 "total": len(results),
                 "healthy": sum(1 for r in results.values() if r["status"] == "healthy"),
-                "unhealthy": sum(1 for r in results.values() if r["status"] in ["unhealthy", "error", "timeout"]),
-                "disabled": sum(1 for r in results.values() if r["status"] == "disabled"),
-            }
+                "unhealthy": sum(
+                    1
+                    for r in results.values()
+                    if r["status"] in ["unhealthy", "error", "timeout"]
+                ),
+                "disabled": sum(
+                    1 for r in results.values() if r["status"] == "disabled"
+                ),
+            },
         }
 
     @app.post("/proxy/models/{model_name}/test")
     async def test_model(model_name: str):
         """测试单个模型连接"""
         if model_name not in server.model_manager.models:
-            raise HTTPException(status_code=404, detail=f"Model not found: {model_name}")
-        
+            raise HTTPException(
+                status_code=404, detail=f"Model not found: {model_name}"
+            )
+
         result = await server.test_model(model_name)
         return result
 
@@ -1043,12 +1266,74 @@ def create_app(config_path: str) -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+    @app.post("/proxy/models/{model_name}/schedule-re-enable")
+    async def schedule_model_re_enable(model_name: str, request: Request):
+        """设置模型定时重新启用
+
+        请求体:
+            re_enable_at: ISO 格式的时间字符串，或 seconds: 秒数（从现在开始）
+            reason: 原因（可选）
+        """
+        if model_name not in server.model_manager.models:
+            raise HTTPException(
+                status_code=404, detail=f"Model not found: {model_name}"
+            )
+
+        try:
+            body = await request.json()
+
+            # 解析重新启用时间
+            re_enable_at = body.get("re_enable_at")
+            seconds = body.get("seconds")
+
+            if re_enable_at:
+                # ISO 格式时间
+                from datetime import datetime
+
+                if isinstance(re_enable_at, str):
+                    dt = datetime.fromisoformat(re_enable_at.replace("Z", "+00:00"))
+                    re_enable_timestamp = dt.timestamp()
+                else:
+                    re_enable_timestamp = float(re_enable_at)
+            elif seconds:
+                # 从现在开始的秒数
+                re_enable_timestamp = time.time() + int(seconds)
+            else:
+                raise HTTPException(
+                    status_code=400, detail="Either re_enable_at or seconds is required"
+                )
+
+            reason = body.get("reason", "Scheduled re-enable")
+
+            # 禁用模型
+            server.model_manager.disable_model(model_name)
+
+            # 设置重新启用时间
+            server.model_manager.health_checker.set_re_enable_time(
+                model_name, re_enable_timestamp, reason
+            )
+
+            from datetime import datetime
+
+            re_enable_time = datetime.fromtimestamp(re_enable_timestamp).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+
+            return {
+                "message": f"Model {model_name} scheduled for re-enable at {re_enable_time}",
+                "model": model_name,
+                "re_enable_at": re_enable_time,
+                "reason": reason,
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
     @app.get("/proxy/ip-whitelist")
     async def get_ip_whitelist():
         """获取 IP 白名单"""
-        return {
-            "allowed_ips": server.ip_whitelist.get_allowed_ips()
-        }
+        return {"allowed_ips": server.ip_whitelist.get_allowed_ips()}
 
     @app.post("/proxy/ip-whitelist/add")
     async def add_ip_whitelist(request: Request):
@@ -1103,7 +1388,9 @@ def create_app(config_path: str) -> FastAPI:
     async def enable_model(model_name: str):
         """启用模型"""
         if model_name not in server.model_manager.models:
-            raise HTTPException(status_code=404, detail=f"Model not found: {model_name}")
+            raise HTTPException(
+                status_code=404, detail=f"Model not found: {model_name}"
+            )
 
         server.model_manager.enable_model(model_name)
         # 持久化到配置文件
@@ -1114,7 +1401,9 @@ def create_app(config_path: str) -> FastAPI:
     async def disable_model(model_name: str):
         """禁用模型"""
         if model_name not in server.model_manager.models:
-            raise HTTPException(status_code=404, detail=f"Model not found: {model_name}")
+            raise HTTPException(
+                status_code=404, detail=f"Model not found: {model_name}"
+            )
 
         server.model_manager.disable_model(model_name)
         # 持久化到配置文件
@@ -1129,11 +1418,13 @@ def create_app(config_path: str) -> FastAPI:
             name = body.get("name")
             if not name:
                 raise HTTPException(status_code=400, detail="Model name is required")
-            
+
             # 检查模型是否已存在
             if name in server.model_manager.models:
-                raise HTTPException(status_code=409, detail=f"Model {name} already exists")
-            
+                raise HTTPException(
+                    status_code=409, detail=f"Model {name} already exists"
+                )
+
             # 构建模型配置
             model_config = {
                 "model": body.get("model", ""),
@@ -1147,20 +1438,20 @@ def create_app(config_path: str) -> FastAPI:
                 "free": body.get("free", False),
                 "label": body.get("label", ""),
             }
-            
+
             # 添加到配置
             if "models" not in server.config:
                 server.config["models"] = {}
             if "available" not in server.config["models"]:
                 server.config["models"]["available"] = {}
             server.config["models"]["available"][name] = model_config
-            
+
             # 更新模型管理器
             server.model_manager.update_config(server.config)
-            
+
             # 保存配置
             server.model_manager.save_config(str(server.config_path))
-            
+
             return {"message": f"Model {name} added", "model": name}
         except HTTPException:
             raise
@@ -1171,12 +1462,14 @@ def create_app(config_path: str) -> FastAPI:
     async def update_model(model_name: str, request: Request):
         """更新模型配置"""
         if model_name not in server.model_manager.models:
-            raise HTTPException(status_code=404, detail=f"Model not found: {model_name}")
-        
+            raise HTTPException(
+                status_code=404, detail=f"Model not found: {model_name}"
+            )
+
         try:
             body = await request.json()
             model_config = server.model_manager.models[model_name]
-            
+
             # 更新允许的字段
             if "api_key" in body:
                 model_config.api_key = body["api_key"]
@@ -1194,20 +1487,22 @@ def create_app(config_path: str) -> FastAPI:
                     server.model_manager.enable_model(model_name)
                 else:
                     server.model_manager.disable_model(model_name)
-            
+
             # 更新配置文件
             if "models" in server.config and "available" in server.config["models"]:
                 if model_name in server.config["models"]["available"]:
-                    server.config["models"]["available"][model_name].update({
-                        "api_key": model_config.api_key,
-                        "api_base": model_config.api_base,
-                        "model": model_config.model,
-                        "provider": model_config.provider,
-                        "priority": model_config.priority,
-                    })
-            
+                    server.config["models"]["available"][model_name].update(
+                        {
+                            "api_key": model_config.api_key,
+                            "api_base": model_config.api_base,
+                            "model": model_config.model,
+                            "provider": model_config.provider,
+                            "priority": model_config.priority,
+                        }
+                    )
+
             server.model_manager.save_config(str(server.config_path))
-            
+
             return {"message": f"Model {model_name} updated"}
         except HTTPException:
             raise
@@ -1218,33 +1513,37 @@ def create_app(config_path: str) -> FastAPI:
     async def delete_model(model_name: str):
         """删除模型"""
         if model_name not in server.model_manager.models:
-            raise HTTPException(status_code=404, detail=f"Model not found: {model_name}")
-        
+            raise HTTPException(
+                status_code=404, detail=f"Model not found: {model_name}"
+            )
+
         # 从配置中删除
         if "models" in server.config and "available" in server.config["models"]:
             if model_name in server.config["models"]["available"]:
                 del server.config["models"]["available"][model_name]
-        
+
         # 从providers配置中删除
         if "providers" in server.config:
             for provider, provider_config in server.config["providers"].items():
                 if "fallback_models" in provider_config:
                     if model_name in provider_config["fallback_models"]:
                         provider_config["fallback_models"].remove(model_name)
-        
+
         # 更新模型管理器
         server.model_manager.update_config(server.config)
-        
+
         # 保存配置
         server.model_manager.save_config(str(server.config_path))
-        
+
         return {"message": f"Model {model_name} deleted"}
 
     @app.post("/proxy/models/{model_name}/reset")
     async def reset_model(model_name: str):
         """重置模型健康状态"""
         if model_name not in server.model_manager.models:
-            raise HTTPException(status_code=404, detail=f"Model not found: {model_name}")
+            raise HTTPException(
+                status_code=404, detail=f"Model not found: {model_name}"
+            )
 
         server.model_manager.reset_model_health(model_name)
         return {"message": f"Model {model_name} health reset"}
@@ -1253,7 +1552,9 @@ def create_app(config_path: str) -> FastAPI:
     async def get_model(model_name: str):
         """获取模型详情"""
         if model_name not in server.model_manager.models:
-            raise HTTPException(status_code=404, detail=f"Model not found: {model_name}")
+            raise HTTPException(
+                status_code=404, detail=f"Model not found: {model_name}"
+            )
 
         config = server.model_manager.models[model_name]
         health = server.model_manager.health_checker.health_state.get(model_name)
@@ -1265,14 +1566,17 @@ def create_app(config_path: str) -> FastAPI:
             "api_key": config.api_key,
             "provider": config.provider,
             "priority": config.priority,
-            "enabled": config.enabled and model_name not in server.model_manager.disabled_models,
+            "enabled": config.enabled
+            and model_name not in server.model_manager.disabled_models,
             "peak_only": config.peak_only,
             "free": config.free,
             "health": {
                 "healthy": health.healthy if health else True,
                 "reason": health.reason if health else "",
                 "consecutive_failures": health.consecutive_failures if health else 0,
-            } if health else None,
+            }
+            if health
+            else None,
         }
 
     return app

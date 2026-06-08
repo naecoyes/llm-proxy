@@ -2,7 +2,7 @@
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,9 @@ class TimeController:
         self.peak_skip_weekends = schedule.get("peak_skip_weekends", True)
 
         # mimo 优先时段
-        self.mimo_priority_hours = schedule.get("mimo_priority_hours", [0, 1, 2, 3, 4, 5, 6, 7])
+        self.mimo_priority_hours = schedule.get(
+            "mimo_priority_hours", [0, 1, 2, 3, 4, 5, 6, 7]
+        )
 
         # off-peak 配置（用于非高峰时段优先级提升）
         off_peak_config = schedule.get("off_peak_hours", {})
@@ -51,7 +53,7 @@ class TimeController:
         self.off_peak_priority_boost = off_peak_config.get("priority_boost", False)
         self.off_peak_default_priority = off_peak_config.get("default_priority", 10)
         self.off_peak_boost_priority = off_peak_config.get("boost_priority", 1)
-        
+
         # off-peak 时区（默认使用主时区）
         off_peak_tz_str = off_peak_config.get("timezone", timezone_str)
         if off_peak_tz_str in TIMEZONE_MAP:
@@ -93,13 +95,13 @@ class TimeController:
         """检查当前是否 off-peak 时段（迪拜时区 UTC+4 8PM-4AM）"""
         if not self.off_peak_enabled:
             return False
-        
+
         # 使用 off-peak 时区获取时间
         if now is None:
             now = datetime.now(self.off_peak_timezone)
-        
+
         current_hour = now.hour
-        
+
         # 检查是否在 off-peak 时段内（支持跨越午夜）
         for start_hour, end_hour in self.off_peak_hours:
             if start_hour > end_hour:
@@ -110,7 +112,7 @@ class TimeController:
                 # 正常情况：例如 09:00-17:00
                 if start_hour <= current_hour < end_hour:
                     return True
-        
+
         return False
 
     def get_off_peak_models(self) -> List[str]:
@@ -131,15 +133,15 @@ class TimeController:
         """
         if not self.off_peak_enabled or not self.off_peak_priority_boost:
             return base_priority
-        
+
         # 检查模型是否在 off-peak 提升列表中
         if model_name not in self.off_peak_models:
             return base_priority
-        
+
         # 检查当前是否 off-peak 时段
         if self.is_off_peak_hour():
             return self.off_peak_boost_priority
-        
+
         # 非 off-peak 时段，使用默认优先级
         return self.off_peak_default_priority
 
@@ -193,7 +195,9 @@ class TimeController:
 
         return None
 
-    def should_skip_model(self, model_name: str, model_config: dict, now: Optional[datetime] = None) -> bool:
+    def should_skip_model(
+        self, model_name: str, model_config: dict, now: Optional[datetime] = None
+    ) -> bool:
         """检查模型是否在当前时段应该跳过
 
         Args:
@@ -226,7 +230,9 @@ class TimeController:
             "is_mimo_priority": self.is_mimo_priority_time(now),
             "is_weekend": self.is_weekend(now),
             "parallel_limit": self.get_parallel_limit(),
-            "peak_end_time": self.get_peak_end_time().isoformat() if self.get_peak_end_time() else None,
+            "peak_end_time": self.get_peak_end_time().isoformat()
+            if self.get_peak_end_time()
+            else None,
             "peak_hours": self.peak_hours,
             "mimo_priority_hours": self.mimo_priority_hours,
             "off_peak_hours": self.off_peak_hours if self.off_peak_enabled else None,

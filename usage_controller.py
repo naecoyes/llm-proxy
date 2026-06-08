@@ -7,7 +7,7 @@ from collections import defaultdict
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class UsageStats:
     """使用量统计"""
+
     tokens: int = 0
     cost: float = 0.0
     requests: int = 0
@@ -25,8 +26,10 @@ class UsageStats:
 @dataclass
 class RateLimitState:
     """速率限制状态"""
+
     requests: list = None
     tokens: list = None
+    active_requests: int = 0  # 当前正在处理的请求数
 
     def __post_init__(self):
         self.requests = self.requests or []
@@ -50,7 +53,9 @@ class UsageController:
         self.model_stats: Dict[str, UsageStats] = defaultdict(UsageStats)
 
         # 4小时时段统计: {"0-3": {"total": UsageStats, "model_name": UsageStats}}
-        self.hourly_stats: Dict[str, Dict[str, UsageStats]] = defaultdict(lambda: defaultdict(UsageStats))
+        self.hourly_stats: Dict[str, Dict[str, UsageStats]] = defaultdict(
+            lambda: defaultdict(UsageStats)
+        )
 
         # 速率限制状态 (每模型)
         self.rate_limit_states: Dict[str, RateLimitState] = defaultdict(RateLimitState)
@@ -112,14 +117,16 @@ class UsageController:
             try:
                 with open(stats_file, "r") as f:
                     data = json.load(f)
-                
+
                 # 检查日期是否是今天
                 file_date = data.get("date", "")
                 today = datetime.now().strftime("%Y-%m-%d")
                 if file_date != today:
-                    logger.info(f"统计文件日期 ({file_date}) 不是今天 ({today})，跳过加载")
+                    logger.info(
+                        f"统计文件日期 ({file_date}) 不是今天 ({today})，跳过加载"
+                    )
                     return
-                
+
                 for model_name, stats in data.get("models", {}).items():
                     self.model_stats[model_name] = UsageStats(**stats)
                 self.daily_stats["total"] = UsageStats(**data.get("total", {}))
@@ -143,12 +150,16 @@ class UsageController:
             # 构建每小时数据
             hourly_data = {}
             for slot, models in self.hourly_stats.items():
-                hourly_data[slot] = {name: asdict(stats) for name, stats in models.items()}
+                hourly_data[slot] = {
+                    name: asdict(stats) for name, stats in models.items()
+                }
 
             data = {
                 "date": datetime.now().strftime("%Y-%m-%d"),
                 "total": asdict(self.daily_stats.get("total", UsageStats())),
-                "models": {name: asdict(stats) for name, stats in self.model_stats.items()},
+                "models": {
+                    name: asdict(stats) for name, stats in self.model_stats.items()
+                },
                 "hourly": hourly_data,
             }
             with open(stats_file, "w") as f:
@@ -165,24 +176,30 @@ class UsageController:
         # 检查每日预算
         total_stats = self.daily_stats.get("total", UsageStats())
         if total_stats.cost >= self.daily_budget:
-            logger.warning(f"每日预算已用完: {total_stats.cost:.2f} / {self.daily_budget:.2f}")
+            logger.warning(
+                f"每日预算已用完: {total_stats.cost:.2f} / {self.daily_budget:.2f}"
+            )
             return False
 
         # 检查每月预算
         monthly_total = self.monthly_stats.get("total", UsageStats())
         if monthly_total.cost >= self.monthly_budget:
-            logger.warning(f"每月预算已用完: {monthly_total.cost:.2f} / {self.monthly_budget:.2f}")
+            logger.warning(
+                f"每月预算已用完: {monthly_total.cost:.2f} / {self.monthly_budget:.2f}"
+            )
             return False
 
         # 检查每日 Token 限制
         if total_stats.tokens >= self.max_tokens_per_day:
-            logger.warning(f"每日 Token 限制已达到: {total_stats.tokens} / {self.max_tokens_per_day}")
+            logger.warning(
+                f"每日 Token 限制已达到: {total_stats.tokens} / {self.max_tokens_per_day}"
+            )
             return False
 
         return True
 
     def check_rate_limit(self, model_name: str) -> bool:
-        """检查是否触发速率限制
+        """检查是否触发速率限制或并发限制
 
         Returns:
             True 表示触发了限制，应该等待或切换模型
@@ -201,10 +218,46 @@ class UsageController:
         # 检查请求次数限制
         max_rpm = limits.get("max_requests_per_minute", 0)
         if max_rpm > 0 and len(state.requests) >= max_rpm:
-            logger.warning(f"模型 {model_name} 请求次数限制: {len(state.requests)} / {max_rpm}")
+            logger.warning(
+                f"模型 {model_name} 请求次数限制: {len(state.requests)} / {max_rpm}"
+            )
+            return True
+
+        # 检查并发限制（当前正在处理的请求数）
+        max_concurrent = limits.get("max_concurrent", 0)
+        if max_concurrent > 0 and state.active_requests >= max_concurrent:
+            logger.warning(
+                f"模型 {model_name} 并发限制: {state.active_requests} / {max_concurrent}"
+            )
             return True
 
         return False
+
+    def acquire_model(self, model_name: str, force: bool = False) -> bool:
+        """获取模型并发锁（请求开始时调用）
+
+        Returns:
+            True 获取成功，False 并发已满
+        """
+        limits = self.per_model_limits.get(model_name, {})
+        max_concurrent = limits.get("max_concurrent", 0)
+        state = self.rate_limit_states[model_name]
+
+        if not force and max_concurrent > 0 and state.active_requests >= max_concurrent:
+            logger.warning(
+                f"模型 {model_name} 并发已满: {state.active_requests}/{max_concurrent}"
+            )
+            return False
+
+        state.active_requests += 1
+        logger.debug(f"模型 {model_name} 获取锁: {state.active_requests} 个活跃请求")
+        return True
+
+    def release_model(self, model_name: str):
+        """释放模型并发锁（请求完成时调用）"""
+        state = self.rate_limit_states[model_name]
+        state.active_requests = max(0, state.active_requests - 1)
+        logger.debug(f"模型 {model_name} 释放锁: {state.active_requests} 个活跃请求")
 
     def check_token_limit(self, token_count: int) -> bool:
         """检查单次请求 Token 是否超限
@@ -216,7 +269,9 @@ class UsageController:
             True 表示在限制内
         """
         if token_count > self.max_tokens_per_request:
-            logger.warning(f"单次请求 Token 超限: {token_count} > {self.max_tokens_per_request}")
+            logger.warning(
+                f"单次请求 Token 超限: {token_count} > {self.max_tokens_per_request}"
+            )
             return False
         return True
 
@@ -419,11 +474,11 @@ class UsageController:
 
         # 按 provider 分组聚合
         provider_data = {}  # provider -> {tokens: [], input: [], output: [], requests: []}
-        
+
         for model_name in models_to_show:
             # 获取 provider（从模型名推断）
             provider = self._get_provider_from_model(model_name)
-            
+
             if provider not in provider_data:
                 provider_data[provider] = {
                     "tokens": [0] * len(labels),
@@ -431,9 +486,11 @@ class UsageController:
                     "output_tokens": [0] * len(labels),
                     "requests": [0] * len(labels),
                 }
-            
+
             for i, slot in enumerate(labels):
-                slot_stats = self.hourly_stats.get(slot, {}).get(model_name, UsageStats())
+                slot_stats = self.hourly_stats.get(slot, {}).get(
+                    model_name, UsageStats()
+                )
                 provider_data[provider]["tokens"][i] += slot_stats.tokens
                 provider_data[provider]["input_tokens"][i] += slot_stats.input_tokens
                 provider_data[provider]["output_tokens"][i] += slot_stats.output_tokens
@@ -441,13 +498,15 @@ class UsageController:
 
         # 构建数据集
         for provider, data in sorted(provider_data.items()):
-            datasets.append({
-                "model": provider,
-                "tokens": data["tokens"],
-                "input_tokens": data["input_tokens"],
-                "output_tokens": data["output_tokens"],
-                "requests": data["requests"],
-            })
+            datasets.append(
+                {
+                    "model": provider,
+                    "tokens": data["tokens"],
+                    "input_tokens": data["input_tokens"],
+                    "output_tokens": data["output_tokens"],
+                    "requests": data["requests"],
+                }
+            )
 
         return {
             "granularity": "4h",
@@ -497,10 +556,10 @@ class UsageController:
 
         # 按 provider 分组聚合
         provider_data = {}  # provider -> {tokens: [], input: [], output: [], requests: []}
-        
+
         for model_name in models_to_show:
             provider = self._get_provider_from_model(model_name)
-            
+
             if provider not in provider_data:
                 provider_data[provider] = {
                     "tokens": [0] * len(dates),
@@ -508,24 +567,30 @@ class UsageController:
                     "output_tokens": [0] * len(dates),
                     "requests": [0] * len(dates),
                 }
-            
+
             for i, date in enumerate(dates):
                 model_stats = historical[date].get("models", {}).get(model_name, {})
                 provider_data[provider]["tokens"][i] += model_stats.get("tokens", 0)
-                provider_data[provider]["input_tokens"][i] += model_stats.get("input_tokens", 0)
-                provider_data[provider]["output_tokens"][i] += model_stats.get("output_tokens", 0)
+                provider_data[provider]["input_tokens"][i] += model_stats.get(
+                    "input_tokens", 0
+                )
+                provider_data[provider]["output_tokens"][i] += model_stats.get(
+                    "output_tokens", 0
+                )
                 provider_data[provider]["requests"][i] += model_stats.get("requests", 0)
 
         # 构建数据集
         datasets = []
         for provider, data in sorted(provider_data.items()):
-            datasets.append({
-                "model": provider,
-                "tokens": data["tokens"],
-                "input_tokens": data["input_tokens"],
-                "output_tokens": data["output_tokens"],
-                "requests": data["requests"],
-            })
+            datasets.append(
+                {
+                    "model": provider,
+                    "tokens": data["tokens"],
+                    "input_tokens": data["input_tokens"],
+                    "output_tokens": data["output_tokens"],
+                    "requests": data["requests"],
+                }
+            )
 
         return {
             "granularity": "day",

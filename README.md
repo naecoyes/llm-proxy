@@ -5,11 +5,11 @@
 <h1 align="center">LLM Proxy Hub</h1>
 
 <p align="center">
-  A lightweight, high-performance LLM API proxy server
+  A Lightweight, High-Performance LLM API Proxy Server
 </p>
 
 <p align="center">
-  <a href="README_CN.md">中文</a> | English
+  English | <a href="README_CN.md">中文</a>
 </p>
 
 <p align="center">
@@ -21,27 +21,21 @@
 
 ## Features
 
-- **Multi-Model Management** - Configure multiple LLM providers with a unified OpenAI-compatible endpoint
-- **Anthropic API Support** - Native support for Anthropic Claude models with automatic OpenAI ↔ Anthropic format conversion (including streaming)
-- **Smart Load Balancing** - Automatically distribute requests across available models
-- **Off-Peak Scheduling** - Dynamic priority boost for specified models during off-peak hours (configurable timezone)
-- **Rate Limit Awareness** - Skip models that have triggered rate limits, auto fallback to available ones
-- **Failover** - Detect failures and switch to backup models to ensure availability
-- **Auto-Disable** - Automatically disable models after consecutive health check failures
-- **Request Logging** - Complete logging of all API requests and responses
-- **IP Whitelist** - Fine-grained access control
-- **Hot Reload** - Update configuration without restarting the server
-- **Web Dashboard** - Intuitive visual management interface with model editing support
-
-## Screenshots
-
-| Dashboard | Model Management |
-|-----------|------------------|
-| ![Dashboard](images/dashboard.png) | ![Models](images/models.png) |
-
-| Configuration | Request Logs |
-|---------------|--------------|
-| ![Config](images/cofing.png) | ![Logs](images/logs.png) |
+- **Multi-Model Management** - Configure multiple LLM providers behind a unified OpenAI-compatible interface.
+- **Anthropic API Support** - Native support for Anthropic Claude models with automatic conversion between OpenAI and Anthropic formats (including streaming).
+- **Slot Routing (Session Affinity)** - Request specific "slots" (e.g., `auto1`, `auto2`) to consistently map to the same underlying model for better context caching and connection reuse. **Strictly respects `max_concurrent` limits**: if a high-priority model reaches its max concurrency, remaining slots automatically map to the next best priority models. Slots also automatically failover upon model quota exhaustion.
+- **Intelligent Load Balancing** - Automatically dispatch requests to healthy models with dynamic filtering (skips models with recent success rates < 70%).
+- **Off-Peak Scheduling** - Dynamically boost priority of specified models during off-peak hours (with timezone support) to optimize costs.
+- **Quota Awareness & Auto-Recovery** - Recognizes rate limit and quota exhaustion errors, parsing the reset time (e.g., Minimax's 5-hour limit) to automatically re-enable models when their quota resets.
+- **Rate Limit Awareness** - Automatically skips models hitting rate limits, gracefully falling back to other models in the same or different providers.
+- **Fallback to Free Models** - Seamlessly switch to designated free models when all paid models are exhausted or unavailable, ensuring zero downtime.
+- **High Availability Failover** - Detects failures in real-time and switches to backup models seamlessly.
+- **Auto-Disable & Active Probing** - Automatically disables models after consecutive health check failures, and occasionally probes them to automatically restore them when they become healthy again.
+- **Concurrency Control** - Fine-grained concurrency limits (`max_concurrent`) per model to prevent overloading upstream APIs.
+- **IP Whitelist** - Strict access control based on client IPs, supporting `X-Forwarded-For` and `X-Real-IP` headers.
+- **Usage & Request Logging** - Detailed tracking of API requests, response times, and token usage.
+- **Hot Configuration Reload** - Modify `proxy_config.yaml` on the fly without restarting the server.
+- **Web Dashboard** - Intuitive visual management panel for real-time monitoring and model health checks.
 
 ## Quick Start
 
@@ -51,18 +45,21 @@
 pip install -r requirements.txt
 ```
 
-### 2. Configure Models
+### 2. Configuration
 
 Create or edit `proxy_config.yaml`:
 
 ```yaml
 server:
-  host: "127.0.0.1"
+  host: "0.0.0.0"
   port: 8888
+  allowed_ips:
+    - 127.0.0.1
+    - ::1
 
 models:
   available:
-    # OpenAI-compatible model
+    # OpenAI compatible model
     my-openai:
       api_base: https://api.openai.com/v1
       api_key: your-api-key
@@ -81,63 +78,68 @@ models:
       priority: 90
       enabled: true
 
-# Time-based scheduling (optional)
+# Time-based scheduling strategy (optional)
 schedule:
   timezone: "Asia/Shanghai"
-  peak_hours: [18, 19, 20, 21, 22, 23]
-  peak_strategy: openrouter
+  peak_hours:
+    - [18, 23]
   off_peak_hours:
     enabled: true
-    hours: [[20, 4]]        # UTC+4 8PM - 4AM
+    hours: [[20, 4]]
     timezone: "Asia/Dubai"
     models: ["my-openai"]
     priority_boost: true
-    boost_priority: 1       # Higher priority during off-peak
+    boost_priority: 1
     default_priority: 100
+
+usage:
+  per_model_limits:
+    my-openai:
+      max_concurrent: 3
 ```
 
-### 3. Start Server
+### 3. Start the Service
 
 ```bash
 # Using shell scripts
 chmod +x start.sh stop.sh
-./start.sh    # Start
-./stop.sh     # Stop
+./start.sh    # Start in background
+./stop.sh     # Stop background service
 
-# Or directly
+# Or start directly
 python start_proxy.py --config proxy_config.yaml --port 8888
 ```
 
-Server will be available at `http://127.0.0.1:8888`, with the dashboard at the same address.
+Once started, the Web Dashboard will be available at `http://127.0.0.1:8888`.
 
-### 4. Command Line Options
+### 4. Command Line Arguments
 
 ```
 python start_proxy.py [options]
 
 Options:
-  --config, -c    Config file path (default: proxy_config.yaml)
+  --config, -c    Path to config file (default: proxy_config.yaml)
   --host          Listen address (default: from config)
   --port, -p      Listen port (default: from config)
   --log-level     Log level (debug/info/warning/error)
-  --reload        Enable auto-reload (dev mode)
+  --reload        Enable auto-reload (development mode)
 ```
 
 ## API Usage
 
-The proxy is fully compatible with the **OpenAI Chat Completions API** format.
+The proxy server is fully compatible with the **OpenAI Chat Completions API**.
 
 ### Chat Completions
 
-**cURL (non-streaming):**
+**Slot Routing (Session Affinity):**
+Pass `auto1`, `auto2`, etc., as the `model` parameter to firmly map requests from the same session to the same backend model.
 
 ```bash
 curl http://localhost:8888/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "my-openai",
+    "model": "auto1",
     "messages": [
-      {"role": "system", "content": "You are a helpful assistant."},
       {"role": "user", "content": "Hello!"}
     ]
   }'
@@ -150,73 +152,27 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="http://localhost:8888/v1",
-    api_key="any-string"  # Proxy handles the real API key
+    api_key="any-string"  # API keys are handled by the proxy
 )
 
 response = client.chat.completions.create(
-    model="auto",  # Auto model selection
+    model="auto",  # Automatically selects the best model, or use specific model/slot name like 'auto1'
     messages=[{"role": "user", "content": "Hello!"}]
 )
 print(response.choices[0].message.content)
-```
-
-### Management API
-
-```bash
-# List available models
-curl http://localhost:8888/v1/models
-
-# Proxy status
-curl http://localhost:8888/proxy/status
-
-# Health check
-curl http://localhost:8888/proxy/health
-
-# Usage statistics
-curl http://localhost:8888/proxy/usage
-
-# Request logs
-curl http://localhost:8888/proxy/logs
 ```
 
 ## API Reference
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/v1/chat/completions` | POST | Chat Completions compatible API |
+| `/v1/chat/completions` | POST | Chat Completions compatible endpoint |
 | `/v1/models` | GET | List available models |
 | `/proxy/status` | GET | Proxy status overview |
 | `/proxy/health` | GET | Model health check results |
 | `/proxy/usage` | GET | Usage statistics |
 | `/proxy/logs` | GET | Request logs |
 | `/proxy/config` | GET/PUT | Read or update configuration |
-| `/proxy/models/{name}/enable` | POST | Enable a model |
-| `/proxy/models/{name}/disable` | POST | Disable a model |
-| `/proxy/models/{name}` | PUT | Update a model's configuration |
-| `/proxy/models/{name}` | DELETE | Delete a model |
-| `/proxy/models/{name}/test` | POST | Test a model connection |
-
-## Project Structure
-
-```
-llm_proxy/
-├── server.py           # FastAPI server
-├── model_manager.py    # Model management & load balancing
-├── config_watcher.py   # Config file hot reload
-├── health_checker.py   # Model health checks
-├── request_logger.py   # Request logging
-├── usage_controller.py # Usage control
-├── time_controller.py  # Time-based scheduling & off-peak
-├── start_proxy.py      # Startup script with CLI args
-├── start.sh            # Shell start script
-├── stop.sh             # Shell stop script
-├── requirements.txt    # Python dependencies
-├── proxy_config.yaml   # Configuration file
-├── static/             # Frontend static assets
-├── images/             # README screenshots
-├── logs/               # Log directory
-└── stats/              # Statistics data
-```
 
 ## License
 
