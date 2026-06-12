@@ -39,8 +39,10 @@ class HealthChecker:
     # 速率限制/临时错误检测关键词（只重试不禁用）
     RATE_LIMIT_PATTERNS = [
         "429",
+        "529",
         "ratelimit",
         "rate limit",
+        "overloaded_error",
         "too many requests",
         "rate_limit_exceeded",
         "requests per min",
