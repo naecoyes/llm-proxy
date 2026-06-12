@@ -462,30 +462,38 @@ class LLMProxyServer:
                     else f"{model_config.api_base}/chat/completions"
                 )
 
-                api_key = model_config.api_key
-                headers = {
-                    "Content-Type": "application/json",
-                }
+                retry_mimo = 0
+                while True:
+                    api_key = model_config.api_key
+                    headers = {
+                        "Content-Type": "application/json",
+                    }
 
-                if getattr(model_config, "provider", "") == "mimo-free":
-                    api_key = await self._get_mimo_free_token()
-                    headers["X-Mimo-Source"] = "mimocode-cli-free"
+                    if getattr(model_config, "provider", "") == "mimo-free":
+                        api_key = await self._get_mimo_free_token()
+                        headers["X-Mimo-Source"] = "mimocode-cli-free"
 
-                headers["Authorization"] = f"Bearer {api_key}"
+                    headers["Authorization"] = f"Bearer {api_key}"
 
-                if (
-                    hasattr(model_config, "custom_headers")
-                    and model_config.custom_headers
-                ):
-                    headers.update(model_config.custom_headers)
+                    if (
+                        hasattr(model_config, "custom_headers")
+                        and model_config.custom_headers
+                    ):
+                        headers.update(model_config.custom_headers)
 
-                response = await self.http_client.post(
-                    url, json=test_body, headers=headers, timeout=30
-                )
-                duration = time.time() - start_time
+                    response = await self.http_client.post(
+                        url, json=test_body, headers=headers, timeout=30
+                    )
+                    duration = time.time() - start_time
+                    
+                    if response.status_code == 403 and getattr(model_config, "provider", "") == "mimo-free" and retry_mimo == 0:
+                        self._mimo_free_token = None
+                        self._mimo_free_token_expiry = 0
+                        retry_mimo += 1
+                        continue
 
-                if response.status_code == 200:
-                    data = response.json()
+                    if response.status_code == 200:
+                        data = response.json()
                     content = ""
                     if "choices" in data and len(data["choices"]) > 0:
                         content = (
@@ -662,13 +670,7 @@ class LLMProxyServer:
         headers = {
             "Content-Type": "application/json",
         }
-
-        if getattr(model_config, "provider", "") == "mimo-free":
-            api_key = await self._get_mimo_free_token()
-            headers["X-Mimo-Source"] = "mimocode-cli-free"
-
-        headers["Authorization"] = f"Bearer {api_key}"
-
+        
         # Add custom headers
         if hasattr(model_config, "custom_headers") and model_config.custom_headers:
             headers.update(model_config.custom_headers)
@@ -679,28 +681,52 @@ class LLMProxyServer:
             model_id = model_id.split("/", 1)[1]
         body["model"] = model_id
 
-        if stream:
+        retry_mimo = 0
+        while True:
+            if getattr(model_config, "provider", "") == "mimo-free":
+                api_key = await self._get_mimo_free_token()
+                headers["X-Mimo-Source"] = "mimocode-cli-free"
 
-            async def stream_generator() -> AsyncGenerator[bytes, None]:
-                async with self.http_client.stream(
-                    "POST", url, json=body, headers=headers
-                ) as response:
-                    if response.status_code != 200:
-                        error_body = await response.aread()
-                        raise HTTPException(
-                            status_code=response.status_code, detail=error_body.decode()
-                        )
-                    async for chunk in response.aiter_bytes():
-                        yield chunk
+            headers["Authorization"] = f"Bearer {api_key}"
 
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
-        else:
-            response = await self.http_client.post(url, json=body, headers=headers)
-            if response.status_code != 200:
-                raise HTTPException(
-                    status_code=response.status_code, detail=response.text
-                )
-            return response.json()
+            if stream:
+                req = self.http_client.build_request("POST", url, json=body, headers=headers)
+                response = await self.http_client.send(req, stream=True)
+                
+                if response.status_code == 403 and getattr(model_config, "provider", "") == "mimo-free" and retry_mimo == 0:
+                    await response.aclose()
+                    self._mimo_free_token = None
+                    self._mimo_free_token_expiry = 0
+                    retry_mimo += 1
+                    continue
+                    
+                if response.status_code != 200:
+                    error_body = await response.aread()
+                    await response.aclose()
+                    raise HTTPException(
+                        status_code=response.status_code, detail=error_body.decode()
+                    )
+
+                async def stream_generator(res) -> AsyncGenerator[bytes, None]:
+                    async with res:
+                        async for chunk in res.aiter_bytes():
+                            yield chunk
+
+                return StreamingResponse(stream_generator(response), media_type="text/event-stream")
+            else:
+                response = await self.http_client.post(url, json=body, headers=headers)
+                
+                if response.status_code == 403 and getattr(model_config, "provider", "") == "mimo-free" and retry_mimo == 0:
+                    self._mimo_free_token = None
+                    self._mimo_free_token_expiry = 0
+                    retry_mimo += 1
+                    continue
+                    
+                if response.status_code != 200:
+                    raise HTTPException(
+                        status_code=response.status_code, detail=response.text
+                    )
+                return response.json()
 
     async def _forward_anthropic(
         self, model_name: str, model_config, request_body: dict, stream: bool
