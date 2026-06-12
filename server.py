@@ -137,10 +137,9 @@ class LLMProxyServer:
         logger.info("LLM Proxy Server 已停止")
 
     async def _health_check_loop(self):
-        """定时健康检查循环 - 每天凌晨3点执行"""
+        """定时健康检查循环"""
         while True:
             try:
-                # 每 30 分钟检查一次需要重新启用的模型
                 await asyncio.sleep(1800)  # 30 分钟
 
                 # 检查并重新启用已到期的模型
@@ -152,16 +151,114 @@ class LLMProxyServer:
                 if re_enabled:
                     logger.info(f"自动重新启用模型: {re_enabled}")
 
-                # 每天凌晨 3 点执行完整健康检查
-                now = datetime.now()
-                if now.hour == 3 and now.minute < 30:
-                    await self.check_all_models()
+                # 检查所有 unhealthy 模型
+                await self._check_unhealthy_models()
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"健康检查循环错误: {e}")
                 await asyncio.sleep(60)
+
+    async def _check_unhealthy_models(self):
+        """检查所有 unhealthy 模型，401 直接删除"""
+        health_report = self.model_manager.health_checker.get_health_report()
+        models_to_delete = []
+        models_to_reset = []
+
+        for name, health in health_report.items():
+            if health.get("healthy", True):
+                continue
+            if name not in self.model_manager.models:
+                continue
+
+            model_config = self.model_manager.models[name]
+            reason = health.get("reason", "")
+
+            # 401 直接标记删除
+            if (
+                "401" in reason
+                or "Invalid API Key" in reason.lower()
+                or "authentication" in reason.lower()
+            ):
+                models_to_delete.append(name)
+                logger.warning(f"🗑️ 模型 {name} 认证失败，将删除: {reason}")
+                continue
+
+            # 其他错误尝试探测
+            try:
+                model_id = model_config.model
+                if "/" in model_id:
+                    parts = model_id.split("/", 1)
+                    if parts[0] in [
+                        "nvidia",
+                        "openai",
+                        "openrouter",
+                        "minimax",
+                        "anthropic",
+                        "xiaomi",
+                    ]:
+                        model_id = parts[1]
+
+                test_body = {
+                    "model": model_id,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1,
+                }
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {model_config.api_key}",
+                }
+                url = f"{model_config.api_base}/chat/completions"
+
+                response = await self.http_client.post(
+                    url, json=test_body, headers=headers, timeout=15
+                )
+
+                if response.status_code == 200:
+                    models_to_reset.append(name)
+                    logger.info(f"🟢 模型 {name} 探测成功，重置健康状态")
+                elif response.status_code == 401:
+                    models_to_delete.append(name)
+                    logger.warning(f"🗑️ 模型 {name} 探测返回 401，将删除")
+                else:
+                    logger.debug(
+                        f"模型 {name} 探测返回 {response.status_code}，保持状态"
+                    )
+
+            except httpx.TimeoutException:
+                logger.debug(f"模型 {name} 探测超时")
+            except Exception as e:
+                logger.debug(f"模型 {name} 探测异常: {e}")
+
+        # 重置恢复的模型
+        for name in models_to_reset:
+            self.model_manager.health_checker.mark_healthy(name)
+
+        # 删除 401 模型
+        for name in models_to_delete:
+            self._delete_model(name)
+
+    def _delete_model(self, model_name: str):
+        """从配置中删除模型"""
+        if model_name in self.config.get("models", {}).get("available", {}):
+            del self.config["models"]["available"][model_name]
+
+        # 从 fallback_models 中移除
+        for provider, provider_config in self.config.get("providers", {}).items():
+            if "fallback_models" in provider_config:
+                if model_name in provider_config["fallback_models"]:
+                    provider_config["fallback_models"].remove(model_name)
+
+        # 从 per_model_limits 中移除
+        if "usage" in self.config and "per_model_limits" in self.config["usage"]:
+            if model_name in self.config["usage"]["per_model_limits"]:
+                del self.config["usage"]["per_model_limits"][model_name]
+
+        # 更新模型管理器
+        self.model_manager.update_config(self.config)
+        self._save_config()
+        logger.info(f"🗑️ 模型 {model_name} 已从配置中删除")
 
     async def check_all_models(self) -> Dict[str, dict]:
         """检查所有模型的连接状态"""
@@ -198,12 +295,28 @@ class LLMProxyServer:
                     "max_tokens": 5,
                 }
 
+                url = (
+                    model_config.api_base
+                    if model_config.is_exact_url
+                    else f"{model_config.api_base}/chat/completions"
+                )
+
+                api_key = model_config.api_key
                 headers = {
                     "Content-Type": "application/json",
-                    "Authorization": f"Bearer {model_config.api_key}",
                 }
 
-                url = f"{model_config.api_base}/chat/completions"
+                if getattr(model_config, "provider", "") == "mimo-free":
+                    api_key = await self._get_mimo_free_token()
+                    headers["X-Mimo-Source"] = "mimocode-cli-free"
+
+                headers["Authorization"] = f"Bearer {api_key}"
+
+                if (
+                    hasattr(model_config, "custom_headers")
+                    and model_config.custom_headers
+                ):
+                    headers.update(model_config.custom_headers)
 
                 response = await self.http_client.post(
                     url, json=test_body, headers=headers, timeout=30
@@ -337,12 +450,28 @@ class LLMProxyServer:
                     "max_tokens": 10,
                 }
 
+                url = (
+                    model_config.api_base
+                    if model_config.is_exact_url
+                    else f"{model_config.api_base}/chat/completions"
+                )
+
+                api_key = model_config.api_key
                 headers = {
                     "Content-Type": "application/json",
-                    "Authorization": f"Bearer {model_config.api_key}",
                 }
 
-                url = f"{model_config.api_base}/chat/completions"
+                if getattr(model_config, "provider", "") == "mimo-free":
+                    api_key = await self._get_mimo_free_token()
+                    headers["X-Mimo-Source"] = "mimocode-cli-free"
+
+                headers["Authorization"] = f"Bearer {api_key}"
+
+                if (
+                    hasattr(model_config, "custom_headers")
+                    and model_config.custom_headers
+                ):
+                    headers.update(model_config.custom_headers)
 
                 response = await self.http_client.post(
                     url, json=test_body, headers=headers, timeout=30
@@ -386,6 +515,38 @@ class LLMProxyServer:
             self.model_manager.health_checker.mark_unhealthy(model_name, str(e)[:100])
             return {"status": "error", "message": str(e)[:300]}
 
+    async def _get_mimo_free_token(self) -> str:
+        """动态获取 Mimo Free API 的 JWT Token"""
+        if not hasattr(self, "_mimo_free_token") or not hasattr(
+            self, "_mimo_free_token_expiry"
+        ):
+            self._mimo_free_token = None
+            self._mimo_free_token_expiry = 0
+
+        import time
+
+        if self._mimo_free_token and time.time() < self._mimo_free_token_expiry:
+            return self._mimo_free_token
+
+        url = "https://api.xiaomimimo.com/api/free-ai/bootstrap"
+        try:
+            response = await self.http_client.post(
+                url, json={"client": "llm-proxy-auto"}
+            )
+            if response.status_code == 200:
+                data = response.json()
+                self._mimo_free_token = data.get("jwt")
+                # Token valid for ~1 hour, refresh after 50 minutes (3000 seconds)
+                self._mimo_free_token_expiry = time.time() + 3000
+                logger.info("成功获取 Mimo Free JWT Token")
+                return self._mimo_free_token
+            else:
+                logger.error(f"获取 Mimo Free Token 失败: HTTP {response.status_code}")
+                return ""
+        except Exception as e:
+            logger.error(f"获取 Mimo Free Token 异常: {e}")
+            return ""
+
     async def forward_request(
         self, model_name: str, model_config, request_body: dict, stream: bool = False
     ):
@@ -407,11 +568,27 @@ class LLMProxyServer:
         self, model_name: str, model_config, request_body: dict, stream: bool
     ):
         """转发到 OpenAI 兼容 API"""
-        url = f"{model_config.api_base}/chat/completions"
+        url = (
+            model_config.api_base
+            if model_config.is_exact_url
+            else f"{model_config.api_base}/chat/completions"
+        )
+
+        api_key = model_config.api_key
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {model_config.api_key}",
         }
+
+        if getattr(model_config, "provider", "") == "mimo-free":
+            api_key = await self._get_mimo_free_token()
+            headers["X-Mimo-Source"] = "mimocode-cli-free"
+
+        headers["Authorization"] = f"Bearer {api_key}"
+
+        # Add custom headers
+        if hasattr(model_config, "custom_headers") and model_config.custom_headers:
+            headers.update(model_config.custom_headers)
+
         body = request_body.copy()
         model_id = model_config.model
         if "/" in model_id:
@@ -1232,7 +1409,7 @@ def create_app(config_path: str) -> FastAPI:
             },
         }
 
-    @app.post("/proxy/models/{model_name}/test")
+    @app.post("/proxy/models/{model_name:path}/test")
     async def test_model(model_name: str):
         """测试单个模型连接"""
         if model_name not in server.model_manager.models:
@@ -1384,7 +1561,7 @@ def create_app(config_path: str) -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-    @app.post("/proxy/models/{model_name}/enable")
+    @app.post("/proxy/models/{model_name:path}/enable")
     async def enable_model(model_name: str):
         """启用模型"""
         if model_name not in server.model_manager.models:
@@ -1397,7 +1574,7 @@ def create_app(config_path: str) -> FastAPI:
         server.model_manager.save_config(str(server.config_path))
         return {"message": f"Model {model_name} enabled"}
 
-    @app.post("/proxy/models/{model_name}/disable")
+    @app.post("/proxy/models/{model_name:path}/disable")
     async def disable_model(model_name: str):
         """禁用模型"""
         if model_name not in server.model_manager.models:

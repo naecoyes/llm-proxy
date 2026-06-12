@@ -2,7 +2,7 @@
 
 import logging
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from health_checker import HealthChecker
@@ -27,6 +27,8 @@ class ModelConfig:
     free: bool = False
     label: str = ""
     api_format: str = "openai"  # openai 或 anthropic
+    is_exact_url: bool = False
+    custom_headers: dict = field(default_factory=dict)
 
 
 class NoAvailableModelError(Exception):
@@ -38,10 +40,13 @@ class NoAvailableModelError(Exception):
 class ModelManager:
     """模型选择和路由"""
 
+    AUTO_REENABLE_SECONDS = 1800  # 30 分钟后自动重新启用
+
     def __init__(self, config: dict, stats_dir: str = "stats"):
         self.config = config
         self.models: Dict[str, ModelConfig] = {}
         self.disabled_models: set = set()
+        self.disabled_until: Dict[str, float] = {}  # model_name -> re-enable timestamp
         self.providers: Dict[str, dict] = {}
         self._round_robin_counter = 0  # 轮询计数器
         self._active_models: set = set()  # 当前正在使用的模型
@@ -91,6 +96,8 @@ class ModelManager:
                 free=model_conf.get("free", False),
                 label=model_conf.get("label", ""),
                 api_format=model_conf.get("api_format", "openai"),
+                is_exact_url=model_conf.get("is_exact_url", False),
+                custom_headers=model_conf.get("custom_headers", {}),
             )
 
             self.models[name] = model
@@ -118,7 +125,33 @@ class ModelManager:
         logger.info("模型管理器配置已更新，slot 分配已重置")
 
     def _get_available_models(self) -> List[str]:
-        """获取所有可用模型名称"""
+        """获取所有可用模型名称（自动重试已过冷却期的模型，自动禁用低成功率模型）"""
+        import time as _time
+
+        now = _time.time()
+        # 检查是否有模型需要自动重新启用
+        to_reenable = [
+            name
+            for name, until in self.disabled_until.items()
+            if until and now >= until
+        ]
+        for name in to_reenable:
+            logger.info(f"模型 {name} 冷却期已过，自动重新启用")
+            self.enable_model(name)
+
+        # 检查成功率过低的模型，自动禁用
+        for name, model in list(self.models.items()):
+            if name in self.disabled_models or not model.enabled:
+                continue
+            if name == "minimax":
+                continue
+            if self.health_checker.should_auto_disable(
+                name, min_requests=20, min_rate=0.5
+            ):
+                rate = self.health_checker.get_success_rate(name)
+                logger.warning(f"模型 {name} 成功率过低 ({rate:.1%})，自动禁用")
+                self.disable_model(name)
+
         return [
             name
             for name, model in self.models.items()
@@ -425,7 +458,11 @@ class ModelManager:
             # 检查该 slot 是否已有分配且模型健康且成功率达标
             if slot in self._slot_model_map:
                 assigned = self._slot_model_map[slot]
-                if assigned in self.models and self.health_checker.is_healthy(assigned):
+                if (
+                    assigned in self.models
+                    and assigned not in self.disabled_models
+                    and self.health_checker.is_healthy(assigned)
+                ):
                     # 检查近期成功率
                     success_rate = self.health_checker.get_success_rate(assigned)
                     if success_rate >= 0.7:
@@ -435,6 +472,14 @@ class ModelManager:
                         logger.info(
                             f"模型 {assigned} 近期成功率过低 ({success_rate:.1%})，重新分配"
                         )
+                        # 成功率过低，自动禁用
+                        if self.health_checker.should_auto_disable(
+                            assigned, min_requests=20, min_rate=0.5
+                        ):
+                            logger.warning(
+                                f"模型 {assigned} 成功率过低 ({success_rate:.1%})，自动禁用"
+                            )
+                            self.disable_model(assigned)
 
         # 需要重新分配
         available = self._get_available_models()
@@ -641,8 +686,27 @@ class ModelManager:
         error_type = self.health_checker.classify_error(error_str)
 
         if error_type == "rate_limit":
-            # 速率限制错误：重试其他模型，但不禁用当前模型
+            # 速率限制错误：临时标记不健康，清除 slot 缓存，切换到其他模型
             logger.info(f"⏳ 模型 {model_name} 触发速率限制，切换到其他模型重试")
+            # 记录失败（用于成功率计算）
+            self.health_checker.mark_unhealthy(model_name, error_str)
+            # 强制标记不健康（让 slot 缓存失效）
+            state = self.health_checker.health_state.get(model_name)
+            if state:
+                state.healthy = False
+                state.reason = "rate_limit"
+                state.next_probe_at = time.time() + 60  # 60秒后探测恢复
+                self.health_checker.health_state[model_name] = state
+                self.health_checker._save_health_state()
+            # 清除使用该模型的 slot 缓存
+            with self._slot_model_lock:
+                slots_to_clear = [
+                    s for s, m in self._slot_model_map.items() if m == model_name
+                ]
+                for s in slots_to_clear:
+                    del self._slot_model_map[s]
+                if slots_to_clear:
+                    logger.info(f"清除 slot 缓存: {slots_to_clear}")
             return True
 
         if error_type == "quota_error":
@@ -663,8 +727,17 @@ class ModelManager:
                 )
                 return True
 
-            # 没有重置时间，立即禁用
-            logger.warning(f"🚫 模型 {model_name} 额度/key 错误，立即禁用")
+            # 没有重置时间，minimax 等待 5 小时，其他模型 30 分钟
+            import time as _time
+
+            if model_name == "minimax":
+                cooldown = 5 * 3600  # 5 小时
+            else:
+                cooldown = self.AUTO_REENABLE_SECONDS
+            self.disabled_until[model_name] = _time.time() + cooldown
+            logger.warning(
+                f"🚫 模型 {model_name} 额度用尽，{cooldown // 3600}小时{cooldown % 3600 // 60}分钟后自动重试"
+            )
             self.health_checker.mark_unhealthy(model_name, error_str)
             return True
 
@@ -691,17 +764,25 @@ class ModelManager:
         self.usage_controller.record_usage(model_name, usage)
 
     def disable_model(self, model_name: str):
-        """禁用模型"""
+        """禁用模型（自动重试，minimax 也不豁免）"""
+        import time as _time
+
         self.disabled_models.add(model_name)
+        self.disabled_until[model_name] = _time.time() + self.AUTO_REENABLE_SECONDS
         # 持久化到配置文件
         if "models" in self.config and "available" in self.config["models"]:
             if model_name in self.config["models"]["available"]:
                 self.config["models"]["available"][model_name]["enabled"] = False
-        logger.info(f"模型已禁用: {model_name}")
+        logger.info(
+            f"模型已禁用: {model_name}（{self.AUTO_REENABLE_SECONDS // 60}分钟后自动重试）"
+        )
 
     def enable_model(self, model_name: str):
         """启用模型"""
         self.disabled_models.discard(model_name)
+        self.disabled_until.pop(model_name, None)
+        # 重置健康状态
+        self.health_checker.mark_healthy(model_name)
         # 持久化到配置文件
         if "models" in self.config and "available" in self.config["models"]:
             if model_name in self.config["models"]["available"]:
