@@ -756,6 +756,11 @@ class ModelManager:
             self.health_checker.mark_unhealthy(model_name, error_str)
             return True
 
+        # 如果是 400/422 (如内容安全拦截/参数错误) 等客户端请求造成的异常，不应将模型标记为不健康
+        if "422" in error_str or "Unprocessable Entity" in error_str or "400" in error_str or "Bad Request" in error_str:
+            logger.info(f"模型 {model_name} 遇到请求参数或内容策略错误 ({error_str[:100]})，不标记为不健康")
+            return True
+
         # 404/500 等错误也切换
         if "404" in error_str or "Not Found" in error_str or "500" in error_str:
             self.health_checker.mark_unhealthy(model_name, error_str)
