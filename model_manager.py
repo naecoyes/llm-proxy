@@ -29,6 +29,8 @@ class ModelConfig:
     api_format: str = "openai"  # openai 或 anthropic
     is_exact_url: bool = False
     custom_headers: dict = field(default_factory=dict)
+    strip_provider_prefix: bool = True
+    no_auto_disable: bool = False
 
 
 class NoAvailableModelError(Exception):
@@ -54,6 +56,9 @@ class ModelManager:
         self._slot_model_map: Dict[int, str] = {}  # slot -> model_name 固定分配
         self._slot_model_lock = __import__("threading").Lock()
         self._select_lock = __import__("threading").Lock()  # 选择+获取锁的原子操作
+
+        self._available_cache: Optional[List[str]] = None
+        self._available_cache_ts: float = 0
 
         # 初始化子控制器
         self.time_controller = TimeController(config)
@@ -98,6 +103,8 @@ class ModelManager:
                 api_format=model_conf.get("api_format", "openai"),
                 is_exact_url=model_conf.get("is_exact_url", False),
                 custom_headers=model_conf.get("custom_headers", {}),
+                strip_provider_prefix=model_conf.get("strip_provider_prefix", True),
+                no_auto_disable=model_conf.get("no_auto_disable", False),
             )
 
             self.models[name] = model
@@ -120,15 +127,20 @@ class ModelManager:
         self.usage_controller.update_config(config)
         self.health_checker.update_config(config)
         # 清除 slot 分配缓存，强制重新分配
-        with self._slot_model_lock:
+        with self._select_lock:
             self._slot_model_map.clear()
         logger.info("模型管理器配置已更新，slot 分配已重置")
 
     def _get_available_models(self) -> List[str]:
-        """获取所有可用模型名称（自动重试已过冷却期的模型，自动禁用低成功率模型）"""
+        """获取所有可用模型名称（自动重试已过冷却期的模型，自动禁用低成功率模型，带30秒缓存）"""
         import time as _time
 
         now = _time.time()
+        
+        # 检查缓存（30秒刷新一次）
+        if self._available_cache is not None and (now - self._available_cache_ts < 30):
+            return self._available_cache
+
         # 检查是否有模型需要自动重新启用
         to_reenable = [
             name
@@ -143,7 +155,7 @@ class ModelManager:
         for name, model in list(self.models.items()):
             if name in self.disabled_models or not model.enabled:
                 continue
-            if name == "minimax":
+            if model.no_auto_disable:
                 continue
             if self.health_checker.should_auto_disable(
                 name, min_requests=20, min_rate=0.5
@@ -152,11 +164,15 @@ class ModelManager:
                 logger.warning(f"模型 {name} 成功率过低 ({rate:.1%})，自动禁用")
                 self.disable_model(name)
 
-        return [
+        result = [
             name
             for name, model in self.models.items()
             if name not in self.disabled_models and model.enabled
         ]
+        
+        self._available_cache = result
+        self._available_cache_ts = now
+        return result
 
     def _get_provider_models(self, provider: str) -> List[str]:
         """获取指定 provider 的所有模型名称"""
@@ -454,15 +470,14 @@ class ModelManager:
         Returns:
             (模型名称, 模型配置)
         """
-        with self._slot_model_lock:
-            # 检查该 slot 是否已有分配且模型健康且成功率达标
-            if slot in self._slot_model_map:
-                assigned = self._slot_model_map[slot]
-                if (
-                    assigned in self.models
-                    and assigned not in self.disabled_models
-                    and self.health_checker.is_healthy(assigned)
-                ):
+        # 检查该 slot 是否已有分配且模型健康且成功率达标
+        if slot in self._slot_model_map:
+            assigned = self._slot_model_map[slot]
+            if (
+                assigned in self.models
+                and assigned not in self.disabled_models
+                and self.health_checker.is_healthy(assigned)
+            ):
                     # 检查近期成功率
                     success_rate = self.health_checker.get_success_rate(assigned)
                     if success_rate >= 0.7:
@@ -497,14 +512,13 @@ class ModelManager:
             return self.time_controller.get_model_priority(name, model.priority)
 
         # 负载均衡选择：统计每个模型当前服务的 slot 数量
-        with self._slot_model_lock:
-            # 统计每个模型被分配了多少个 slot
-            model_slot_count: Dict[str, int] = {}
-            for m in available:
-                model_slot_count[m] = 0
-            for s, m in self._slot_model_map.items():
-                if m in model_slot_count:
-                    model_slot_count[m] += 1
+        # 统计每个模型被分配了多少个 slot
+        model_slot_count: Dict[str, int] = {}
+        for m in available:
+            model_slot_count[m] = 0
+        for s, m in self._slot_model_map.items():
+            if m in model_slot_count:
+                model_slot_count[m] += 1
 
             # 按优先级分组
             priority_groups = {}
@@ -565,13 +579,12 @@ class ModelManager:
                     selected = prioritized[0]
                     logger.warning(f"所有模型都不健康，强制分配给 {selected}")
 
-            # 记录分配
+            # 记录分配并更新活跃状态
             self._slot_model_map[slot] = selected
+            self._active_models.add(selected)
 
-        logger.debug(
-            f"固定分配模型: auto{slot} -> {selected} (已服务 {model_slot_count.get(selected, 0)} 个 slot)"
-        )
-        return selected, self.models[selected]
+            logger.info(f"分配固定模型: auto{slot} -> {selected} (已服务 {model_slot_count.get(selected, 0)} 个 slot)")
+            return selected, self.models[selected]
 
     def select_fallback_model(
         self, failed_model: str
@@ -699,7 +712,7 @@ class ModelManager:
                 self.health_checker.health_state[model_name] = state
                 self.health_checker._save_health_state()
             # 清除使用该模型的 slot 缓存
-            with self._slot_model_lock:
+            with self._select_lock:
                 slots_to_clear = [
                     s for s, m in self._slot_model_map.items() if m == model_name
                 ]

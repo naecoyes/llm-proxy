@@ -84,6 +84,11 @@ class LLMProxyServer:
         # HTTP 客户端
         self.http_client: Optional[httpx.AsyncClient] = None
 
+        # Mimo Free Token
+        self._mimo_free_token: Optional[str] = None
+        self._mimo_free_token_expiry: float = 0.0
+        self._mimo_token_lock: asyncio.Lock = asyncio.Lock()
+
     def _load_config(self) -> dict:
         """加载配置文件"""
         with open(self.config_path, "r", encoding="utf-8") as f:
@@ -418,10 +423,7 @@ class LLMProxyServer:
                     }
                 else:
                     error_text = response.text[:500]
-                    if response.status_code == 403 and getattr(model_config, "provider", "") == "mimo-free":
-                        self._mimo_free_token = None
-                        self._mimo_free_token_expiry = 0
-                        logger.info(f"探测模型 {model_name} 时发现 mimo-free 403 错误，已清理缓存的 Token")
+                    self._on_provider_error(model_config, response.status_code, f"[{model_name}]")
                     self.model_manager.health_checker.mark_unhealthy(
                         model_name, f"HTTP {response.status_code}"
                     )
@@ -502,10 +504,7 @@ class LLMProxyServer:
                     }
                 else:
                     error_text = response.text[:500]
-                    if response.status_code == 403 and getattr(model_config, "provider", "") == "mimo-free":
-                        self._mimo_free_token = None
-                        self._mimo_free_token_expiry = 0
-                        logger.info(f"探测模型 {model_name} 时发现 mimo-free 403 错误，已清理缓存的 Token")
+                    self._on_provider_error(model_config, response.status_code, f"[{model_name}]")
                     self.model_manager.health_checker.mark_unhealthy(
                         model_name, f"HTTP {response.status_code}"
                     )
@@ -523,39 +522,114 @@ class LLMProxyServer:
             self.model_manager.health_checker.mark_unhealthy(model_name, str(e)[:100])
             return {"status": "error", "message": str(e)[:300]}
 
-    async def _get_mimo_free_token(self) -> str:
-        """动态获取 Mimo Free API 的 JWT Token"""
-        if not hasattr(self, "_mimo_free_token") or not hasattr(
-            self, "_mimo_free_token_expiry"
-        ):
+    def _on_provider_error(self, model_config, status_code: int, request_id: str = ""):
+        """统一处理 Provider 返回的特定错误码"""
+        if status_code == 403 and getattr(model_config, "provider", "") == "mimo-free":
             self._mimo_free_token = None
             self._mimo_free_token_expiry = 0
+            prefix = f"{request_id} " if request_id else ""
+            logger.info(f"{prefix}检测到 mimo-free 403 错误，已清理缓存的 Token")
 
+    async def _get_mimo_free_token(self) -> str:
+        """动态获取 Mimo Free API 的 JWT Token"""
         import time
         import uuid
 
-        if self._mimo_free_token and time.time() < self._mimo_free_token_expiry:
-            return self._mimo_free_token
-
-        url = "https://api.xiaomimimo.com/api/free-ai/bootstrap"
-        client_id = f"proxy-{uuid.uuid4().hex[:8]}"
-        try:
-            response = await self.http_client.post(
-                url, json={"client": client_id}
-            )
-            if response.status_code == 200:
-                data = response.json()
-                self._mimo_free_token = data.get("jwt")
-                # 缩短缓存时间为 5 分钟 (300秒) 以防止意外过期
-                self._mimo_free_token_expiry = time.time() + 300
-                logger.info(f"成功获取 Mimo Free JWT Token (Client: {client_id})")
+        async with self._mimo_token_lock:
+            if self._mimo_free_token and time.time() < self._mimo_free_token_expiry:
                 return self._mimo_free_token
-            else:
-                logger.error(f"获取 Mimo Free Token 失败: HTTP {response.status_code}")
+
+            url = "https://api.xiaomimimo.com/api/free-ai/bootstrap"
+            client_id = f"proxy-{uuid.uuid4().hex[:8]}"
+            try:
+                response = await self.http_client.post(
+                    url, json={"client": client_id}
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    self._mimo_free_token = data.get("jwt")
+                    # 缩短缓存时间为 5 分钟 (300秒) 以防止意外过期
+                    self._mimo_free_token_expiry = time.time() + 300
+                    logger.info(f"成功获取 Mimo Free JWT Token (Client: {client_id})")
+                    return self._mimo_free_token
+                else:
+                    logger.error(f"获取 Mimo Free Token 失败: HTTP {response.status_code}")
+                    return ""
+            except Exception as e:
+                logger.error(f"获取 Mimo Free Token 异常: {e}")
                 return ""
-        except Exception as e:
-            logger.error(f"获取 Mimo Free Token 异常: {e}")
-            return ""
+
+    def _handle_request_error(
+        self,
+        request_id: str,
+        model_name: str,
+        model_config,
+        e: Exception,
+        attempt: int,
+        max_retries: int,
+        start_time: float,
+    ):
+        """处理请求异常并决定是否重试/切换模型"""
+        # 释放模型并发锁
+        self.model_manager.usage_controller.release_model(model_name)
+        # 释放模型活跃状态
+        self.model_manager.mark_model_inactive(model_name)
+
+        status_code = getattr(e, "status_code", None)
+        if status_code:
+            self._on_provider_error(model_config, status_code, request_id)
+
+        should_switch = self.model_manager.handle_error(model_name, e)
+
+        if should_switch and attempt < max_retries:
+            old_model = model_name
+            # 尝试选择备用模型（跨 provider）
+            fallback = self.model_manager.select_fallback_model(model_name)
+            
+            reason_str = f"HTTP {status_code}" if status_code else str(e)
+            
+            if fallback:
+                new_model_name, new_model_config = fallback
+                logger.warning(
+                    f"[{request_id}] 模型 {model_name} 请求失败 ({reason_str})，"
+                    f"切换到备用模型: {new_model_name} ({attempt + 1}/{max_retries})"
+                )
+                from request_logger import request_logger
+                request_logger.log_model_switch(
+                    request_id=request_id,
+                    from_model=old_model,
+                    to_model=new_model_name,
+                    reason=reason_str,
+                )
+                return new_model_name, new_model_config
+            else:
+                # 没有备用模型，使用自动选择
+                logger.warning(
+                    f"[{request_id}] 模型 {model_name} 请求失败 ({reason_str})，"
+                    f"切换模型重试 ({attempt + 1}/{max_retries})"
+                )
+                from request_logger import request_logger
+                request_logger.log_model_switch(
+                    request_id=request_id,
+                    from_model=old_model,
+                    to_model="auto",
+                    reason=reason_str,
+                )
+                return None, None
+        else:
+            # 记录失败
+            from request_logger import request_logger
+            error_detail = getattr(e, "detail", str(e)) if isinstance(e, HTTPException) else str(e)
+            request_logger.log_response(
+                request_id=request_id,
+                model_name=model_name,
+                duration=time.time() - start_time,
+                status="failed",
+                error=error_detail,
+            )
+            if isinstance(e, HTTPException):
+                raise e
+            raise HTTPException(status_code=500, detail=str(e))
 
     async def forward_request(
         self, model_name: str, model_config, request_body: dict, stream: bool = False
@@ -601,17 +675,8 @@ class LLMProxyServer:
 
         body = request_body.copy()
         model_id = model_config.model
-        if "/" in model_id:
-            parts = model_id.split("/", 1)
-            if parts[0] in [
-                "nvidia",
-                "openai",
-                "openrouter",
-                "minimax",
-                "anthropic",
-                "xiaomi",
-            ]:
-                model_id = parts[1]
+        if getattr(model_config, "strip_provider_prefix", True) and "/" in model_id:
+            model_id = model_id.split("/", 1)[1]
         body["model"] = model_id
 
         if stream:
@@ -974,6 +1039,8 @@ def create_app(config_path: str) -> FastAPI:
                         input_tokens = 0
                         output_tokens = 0
                         model_switched = False
+                        valid_chunk_count = 0
+                        finish_reason_stop = False
                         try:
                             async for chunk in response.body_iterator:
                                 # 检查模型是否被禁用，如果是则中断流
@@ -1004,12 +1071,14 @@ def create_app(config_path: str) -> FastAPI:
                                         if isinstance(chunk, bytes)
                                         else chunk
                                     )
+                                    if chunk_str.strip():
+                                        valid_chunk_count += 1
                                     if (
                                         chunk_str.startswith("data: ")
                                         and chunk_str.strip() != "data: [DONE]"
                                     ):
                                         data = json.loads(chunk_str[6:])
-                                        if "usage" in data:
+                                        if "usage" in data and data["usage"]:
                                             usage = data["usage"]
                                             total_tokens = usage.get("total_tokens", 0)
                                             input_tokens = usage.get("prompt_tokens", 0)
@@ -1019,6 +1088,9 @@ def create_app(config_path: str) -> FastAPI:
                                             server.model_manager.record_usage(
                                                 model_name, usage
                                             )
+                                        if data.get("choices") and isinstance(data["choices"], list):
+                                            if data["choices"][0].get("finish_reason") in ("stop", "length"):
+                                                finish_reason_stop = True
                                 except Exception:
                                     pass
                         except Exception as e:
@@ -1035,8 +1107,13 @@ def create_app(config_path: str) -> FastAPI:
 
                         duration = time.time() - start_time
 
-                        # 判断是否成功（有异常或无 token 统计视为失败）
-                        is_success = total_tokens > 0
+                        # 判断是否成功
+                        is_success = total_tokens > 0 or finish_reason_stop or valid_chunk_count > 2
+                        if is_success and total_tokens == 0:
+                            total_tokens = 1
+                            usage = {"total_tokens": 1, "prompt_tokens": 0, "completion_tokens": 1}
+                            server.model_manager.record_usage(model_name, usage)
+
                         status = "success" if is_success else "failed"
                         error_msg = (
                             None if is_success else "Empty response or rate limited"
@@ -1105,115 +1182,18 @@ def create_app(config_path: str) -> FastAPI:
 
                     return JSONResponse(content=response_data)
 
-            except HTTPException as e:
-                last_error = e
-                # 释放模型并发锁
-                server.model_manager.usage_controller.release_model(model_name)
-                # 释放模型活跃状态
-                server.model_manager.mark_model_inactive(model_name)
-
-                if e.status_code == 403 and getattr(model_config, "provider", "") == "mimo-free":
-                    server._mimo_free_token = None
-                    server._mimo_free_token_expiry = 0
-                    logger.info(f"[{request_id}] 检测到 mimo-free 403 错误，已清理缓存的 Token")
-
-                should_switch = server.model_manager.handle_error(model_name, e)
-
-                if should_switch and attempt < max_retries:
-                    old_model = model_name
-                    # 尝试选择备用模型（跨 provider）
-                    fallback = server.model_manager.select_fallback_model(model_name)
-                    if fallback:
-                        new_model_name, new_model_config = fallback
-                        logger.warning(
-                            f"[{request_id}] 模型 {model_name} 请求失败 (HTTP {e.status_code})，"
-                            f"切换到备用模型: {new_model_name} ({attempt + 1}/{max_retries})"
-                        )
-                        request_logger.log_model_switch(
-                            request_id=request_id,
-                            from_model=old_model,
-                            to_model=new_model_name,
-                            reason=f"HTTP {e.status_code}",
-                        )
-                        model_name = new_model_name
-                        model_config = new_model_config
-                        requested_model = new_model_name
-                        continue
-                    else:
-                        # 没有备用模型，使用自动选择
-                        logger.warning(
-                            f"[{request_id}] 模型 {model_name} 请求失败 (HTTP {e.status_code})，"
-                            f"切换模型重试 ({attempt + 1}/{max_retries})"
-                        )
-                        request_logger.log_model_switch(
-                            request_id=request_id,
-                            from_model=old_model,
-                            to_model="auto",
-                            reason=f"HTTP {e.status_code}",
-                        )
-                        requested_model = None
-                        continue
-                else:
-                    # 记录失败
-                    request_logger.log_response(
-                        request_id=request_id,
-                        model_name=model_name,
-                        duration=time.time() - start_time,
-                        status="failed",
-                        error=str(e.detail),
-                    )
-                    raise
-
             except Exception as e:
                 last_error = e
-                # 释放模型并发锁
-                server.model_manager.usage_controller.release_model(model_name)
-                # 释放模型活跃状态
-                server.model_manager.mark_model_inactive(model_name)
-                should_switch = server.model_manager.handle_error(model_name, e)
-
-                if should_switch and attempt < max_retries:
-                    old_model = model_name
-                    # 尝试选择备用模型（跨 provider）
-                    fallback = server.model_manager.select_fallback_model(model_name)
-                    if fallback:
-                        new_model_name, new_model_config = fallback
-                        logger.warning(
-                            f"[{request_id}] 模型 {model_name} 请求失败: {e}，"
-                            f"切换到备用模型: {new_model_name} ({attempt + 1}/{max_retries})"
-                        )
-                        request_logger.log_model_switch(
-                            request_id=request_id,
-                            from_model=old_model,
-                            to_model=new_model_name,
-                            reason=str(e),
-                        )
-                        model_name = new_model_name
-                        model_config = new_model_config
-                        requested_model = new_model_name
-                        continue
-                    else:
-                        logger.warning(
-                            f"[{request_id}] 模型 {model_name} 请求失败: {e}，"
-                            f"切换模型重试 ({attempt + 1}/{max_retries})"
-                        )
-                        request_logger.log_model_switch(
-                            request_id=request_id,
-                            from_model=model_name,
-                            to_model="auto",
-                            reason=str(e),
-                        )
-                        continue
-                else:
-                    # 记录失败
-                    request_logger.log_response(
-                        request_id=request_id,
-                        model_name=model_name,
-                        duration=time.time() - start_time,
-                        status="failed",
-                        error=str(e),
+                try:
+                    next_model, next_config = server._handle_request_error(
+                        request_id, model_name, model_config, e, attempt, max_retries, start_time
                     )
-                    raise HTTPException(status_code=500, detail=str(e))
+                    model_name = next_model
+                    model_config = next_config
+                    requested_model = next_model
+                    continue
+                except HTTPException as he:
+                    raise he
 
         if last_error:
             raise last_error
