@@ -708,9 +708,11 @@ class LLMProxyServer:
                     )
 
                 async def stream_generator(res) -> AsyncGenerator[bytes, None]:
-                    async with res:
+                    try:
                         async for chunk in res.aiter_bytes():
                             yield chunk
+                    finally:
+                        await res.aclose()
 
                 return StreamingResponse(stream_generator(response), media_type="text/event-stream")
             else:
