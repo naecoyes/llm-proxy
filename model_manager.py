@@ -692,6 +692,11 @@ class ModelManager:
         """处理错误请求 - 失败立即切换"""
         error_str = str(error)
 
+        cfg = self.get_model_config(model_name)
+        if cfg and getattr(cfg, "provider", "") == "mimo-free" and "403" in error_str:
+            logger.info(f"💡 模型 {model_name} (mimo-free) 遇到 403 错误，系统已准备好重新获取 Token，不影响健康度")
+            return True
+
         # 分类错误
         error_type = self.health_checker.classify_error(error_str)
 

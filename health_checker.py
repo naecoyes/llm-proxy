@@ -186,6 +186,13 @@ class HealthChecker:
         # 检查是否是额度/key 错误（立即禁用）
         is_quota = self.is_quota_error(reason)
 
+        # 针对 mimo-free 的特判：403 只是 Token 过期，不应禁用模型
+        if "403" in reason.lower() and self.model_manager:
+            cfg = self.model_manager.get_model_config(model_name)
+            if cfg and getattr(cfg, "provider", "") == "mimo-free":
+                logger.info(f"💡 模型 {model_name} (mimo-free) 遇到 403 错误，系统将重新获取 Token，不影响健康度")
+                return
+
         if is_rate_limit:
             # 速率限制：短暂延迟后重试，不禁用模型
             logger.info(f"⏳ 模型 {model_name} 触发速率限制: {reason}，短暂延迟后重试")
