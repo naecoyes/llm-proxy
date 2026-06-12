@@ -291,13 +291,11 @@ class UsageController:
         if total_tokens == 0:
             total_tokens = input_tokens + output_tokens
 
-        # 统一按照 MiMo 2.5 Pro 价格计算费用 (基于 90% 缓存命中率)
-        # 输入缓存命中: 0.025元/M
-        # 输入未命中: 3.0元/M
-        # 综合输入单价 = (0.025 * 0.9) + (3.0 * 0.1) = 0.3225元/M
-        # 输出单价: 6.0元/M
+        # 统一按照 DeepSeek V4 Flash 价格计算费用
+        # 输入单价: $0.14 / 1M tokens
+        # 输出单价: $0.28 / 1M tokens
         if cost == 0.0:
-            cost = (input_tokens * 0.3225 / 1_000_000) + (output_tokens * 6.0 / 1_000_000)
+            cost = (input_tokens * 0.14 / 1_000_000) + (output_tokens * 0.28 / 1_000_000)
 
         # 更新每日统计
         total_stats = self.daily_stats.setdefault("total", UsageStats())
