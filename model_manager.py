@@ -512,79 +512,76 @@ class ModelManager:
             return self.time_controller.get_model_priority(name, model.priority)
 
         # 负载均衡选择：统计每个模型当前服务的 slot 数量
-        # 统计每个模型被分配了多少个 slot
-        model_slot_count: Dict[str, int] = {}
-        for m in available:
-            model_slot_count[m] = 0
+        model_slot_count: Dict[str, int] = {m: 0 for m in available}
         for s, m in self._slot_model_map.items():
             if m in model_slot_count:
                 model_slot_count[m] += 1
 
-            # 按优先级分组
-            priority_groups = {}
-            for m in prioritized:
-                p = get_dynamic_priority(m)
-                if p not in priority_groups:
-                    priority_groups[p] = []
-                priority_groups[p].append(m)
+        # 按优先级分组
+        priority_groups = {}
+        for m in prioritized:
+            p = get_dynamic_priority(m)
+            if p not in priority_groups:
+                priority_groups[p] = []
+            priority_groups[p].append(m)
 
-            sorted_priorities = sorted(priority_groups.keys())
+        sorted_priorities = sorted(priority_groups.keys())
 
-            selected = None
-            for p in sorted_priorities:
-                group = priority_groups[p]
-                # 同优先级按服务 slot 数量排序（少的优先）
-                candidates = sorted(group, key=lambda m: (model_slot_count[m], m))
+        selected = None
+        for p in sorted_priorities:
+            group = priority_groups[p]
+            # 同优先级按服务 slot 数量排序（少的优先）
+            candidates = sorted(group, key=lambda m: (model_slot_count[m], m))
 
-                for candidate in candidates:
-                    if not self.health_checker.is_healthy(candidate):
-                        continue
+            for candidate in candidates:
+                if not self.health_checker.is_healthy(candidate):
+                    continue
 
-                    # 检查是否达到并发限制
-                    limits = self.usage_controller.per_model_limits.get(candidate, {})
-                    max_concurrent = limits.get("max_concurrent", 0)
-                    if (
-                        max_concurrent > 0
-                        and model_slot_count[candidate] >= max_concurrent
-                    ):
-                        logger.debug(
-                            f"模型 {candidate} 槽位并发已满 ({model_slot_count[candidate]}/{max_concurrent})，跳过"
-                        )
-                        continue
+                # 检查是否达到并发限制
+                limits = self.usage_controller.per_model_limits.get(candidate, {})
+                max_concurrent = limits.get("max_concurrent", 0)
+                if (
+                    max_concurrent > 0
+                    and model_slot_count[candidate] >= max_concurrent
+                ):
+                    logger.debug(
+                        f"模型 {candidate} 槽位并发已满 ({model_slot_count[candidate]}/{max_concurrent})，跳过"
+                    )
+                    continue
 
-                    selected = candidate
-                    break
+                selected = candidate
+                break
 
-                if selected:
-                    break
+            if selected:
+                break
 
-            if not selected:
-                # 所有健康模型都达到并发限制，强行选一个并发超出最少的
-                healthy_models = [
-                    m for m in prioritized if self.health_checker.is_healthy(m)
-                ]
-                if healthy_models:
-                    selected = sorted(
-                        healthy_models,
-                        key=lambda m: (
-                            get_dynamic_priority(m),
-                            model_slot_count[m]
-                            - self.usage_controller.per_model_limits.get(m, {}).get(
-                                "max_concurrent", 0
-                            ),
+        if not selected:
+            # 所有健康模型都达到并发限制，强行选一个并发超出最少的
+            healthy_models = [
+                m for m in prioritized if self.health_checker.is_healthy(m)
+            ]
+            if healthy_models:
+                selected = sorted(
+                    healthy_models,
+                    key=lambda m: (
+                        get_dynamic_priority(m),
+                        model_slot_count[m]
+                        - self.usage_controller.per_model_limits.get(m, {}).get(
+                            "max_concurrent", 0
                         ),
-                    )[0]
-                    logger.warning(f"所有健康模型槽位并发已满，强制分配给 {selected}")
-                else:
-                    selected = prioritized[0]
-                    logger.warning(f"所有模型都不健康，强制分配给 {selected}")
+                    ),
+                )[0]
+                logger.warning(f"所有健康模型槽位并发已满，强制分配给 {selected}")
+            else:
+                selected = prioritized[0]
+                logger.warning(f"所有模型都不健康，强制分配给 {selected}")
 
-            # 记录分配并更新活跃状态
-            self._slot_model_map[slot] = selected
-            self._active_models.add(selected)
+        # 记录分配并更新活跃状态
+        self._slot_model_map[slot] = selected
+        self._active_models.add(selected)
 
-            logger.info(f"分配固定模型: auto{slot} -> {selected} (已服务 {model_slot_count.get(selected, 0)} 个 slot)")
-            return selected, self.models[selected]
+        logger.info(f"分配固定模型: auto{slot} -> {selected} (已服务 {model_slot_count.get(selected, 0)} 个 slot)")
+        return selected, self.models[selected]
 
     def select_fallback_model(
         self, failed_model: str
