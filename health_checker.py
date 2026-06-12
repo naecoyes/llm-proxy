@@ -423,6 +423,32 @@ class HealthChecker:
         success_count = sum(state.recent_results)
         return success_count / len(state.recent_results)
 
+    def get_recent_request_count(self, model_name: str) -> int:
+        """获取模型近期请求次数"""
+        state = self.health_state.get(model_name)
+        if not state or not state.recent_results:
+            return 0
+        return len(state.recent_results)
+
+    def should_auto_disable(self, model_name: str, min_requests: int = 20, min_rate: float = 0.5) -> bool:
+        """判断模型是否应该被自动禁用（连续失败过多）
+
+        Args:
+            model_name: 模型名称
+            min_requests: 最少请求数才开始判断
+            min_rate: 最低成功率阈值
+
+        Returns:
+            True 表示应该禁用
+        """
+        state = self.health_state.get(model_name)
+        if not state or not state.recent_results:
+            return False
+        if len(state.recent_results) < min_requests:
+            return False
+        rate = sum(state.recent_results) / len(state.recent_results)
+        return rate < min_rate
+
     def filter_by_success_rate(
         self, model_names: List[str], min_rate: float = 0.7
     ) -> List[str]:

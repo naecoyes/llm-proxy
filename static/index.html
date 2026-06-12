@@ -872,7 +872,8 @@
             'nvidia': '<svg viewBox="0 0 24 24" fill="#76b900"><path d="M10.212 8.976V7.62c.127-.01.256-.017.388-.021 3.596-.117 5.957 3.184 5.957 3.184s-2.548 3.647-5.282 3.647a3.227 3.227 0 01-1.063-.175v-4.109c1.4.174 1.681.812 2.523 2.258l1.873-1.627a4.905 4.905 0 00-3.67-1.846 6.594 6.594 0 00-.729.044m0-4.476v2.025c.13-.01.259-.019.388-.024 5.002-.174 8.261 4.226 8.261 4.226s-3.743 4.69-7.643 4.69c-.338 0-.675-.031-1.007-.092v1.25c.278.038.558.057.838.057 3.629 0 6.253-1.91 8.794-4.169.421.347 2.146 1.193 2.501 1.564-2.416 2.083-8.048 3.763-11.24 3.763-.308 0-.603-.02-.894-.048V19.5H24v-15H10.21zm0 9.756v1.068c-3.356-.616-4.287-4.21-4.287-4.21a7.173 7.173 0 014.287-2.138v1.172h-.005a3.182 3.182 0 00-2.502 1.178s.615 2.276 2.507 2.931m-5.961-3.3c1.436-1.935 3.604-3.148 5.961-3.336V6.523C5.81 6.887 2 10.723 2 10.723s2.158 6.427 8.21 7.015v-1.166C5.77 16 4.25 10.958 4.25 10.958h-.002z"/></svg>',
             'xiaomi': '<svg viewBox="0 0 32 32"><rect x="2" y="2" width="28" height="28" rx="6" fill="#ff6700"/><text x="16" y="22" text-anchor="middle" font-family="Arial,sans-serif" font-size="16" font-weight="bold" fill="white">Mi</text></svg>',
             'openrouter': '<svg viewBox="0 0 24 24" fill="#8b5cf6"><path d="M16.804 1.957l7.22 4.105v.087L16.73 10.21l.017-2.117-.821-.03c-1.059-.028-1.611.002-2.268.11-1.064.175-2.038.577-3.147 1.352L8.345 11.03c-.284.195-.495.336-.68.455l-.515.322-.397.234.385.23.53.338c.476.314 1.17.796 2.701 1.866 1.11.775 2.083 1.177 3.147 1.352l.3.045c.694.091 1.375.094 2.825.033l.022-2.159 7.22 4.105v.087L16.589 22l.014-1.862-.635.022c-1.386.042-2.137.002-3.138-.162-1.694-.28-3.26-.926-4.881-2.059l-2.158-1.5a21.997 21.997 0 00-.755-.498l-.467-.28a55.927 55.927 0 00-.76-.43C2.908 14.73.563 14.116 0 14.116V9.888l.14.004c.564-.007 2.91-.622 3.809-1.124l1.016-.58.438-.274c.428-.28 1.072-.726 2.686-1.853 1.621-1.133 3.186-1.78 4.881-2.059 1.152-.19 1.974-.213 3.814-.138l.02-1.907z"/></svg>',
-            'minimax': '<img src="/static/logos/minimax.jpeg" style="width:100%;height:100%;object-fit:contain;" alt="MiniMax">'
+            'minimax': '<img src="/static/logos/minimax.jpeg" style="width:100%;height:100%;object-fit:contain;" alt="MiniMax">',
+            'misaka': '<svg viewBox="0 0 24 24" fill="#06b6d4"><circle cx="12" cy="12" r="10"/><text x="12" y="16" text-anchor="middle" font-size="10" fill="white">M</text></svg>'
         };
         
         let statusData = null;
@@ -1223,61 +1224,55 @@
         function renderModelsTable(models) {
             let html = '';
             for (const [name, m] of Object.entries(models)) {
-                const ok = m.health?.healthy !== false;
-                const en = m.enabled;
-                const statusCls = !en ? 'badge-muted' : !ok ? 'badge-danger' : 'badge-success';
-                const statusTxt = !en ? 'Disabled' : !ok ? 'Unhealthy' : 'Healthy';
-                const healthReason = m.health?.reason || '';
-                const statusTitle = !en ? 'Model is disabled' : !ok ? healthReason : 'Healthy';
-                
-                let tags = '';
-                if (m.free) tags += '<span class="tag tag-success">Free</span> ';
-                if (m.peak_only) tags += '<span class="tag tag-warning">Peak</span> ';
-                if (m.label) tags += `<span class="tag tag-primary">${m.label}</span> `;
-                if (!m.free && !m.peak_only && !m.label) tags += '<span class="tag tag-default">Paid</span>';
-                
-                const logo = providerLogos[m.provider] || '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="10"/></svg>';
-                const keyHint = m.api_key_hint || '';
-                
-                // 获取每个模型的并发设置
-                const modelLimits = config.usage?.per_model_limits?.[name] || {};
-                const maxConcurrent = modelLimits.max_concurrent || '∞';
-                const maxRpm = modelLimits.max_requests_per_minute || '∞';
-                
-                html += `
-                    <tr>
-                        <td>
-                            <div class="model-cell">
-                                <div class="model-avatar">${logo}</div>
-                                <div>
-                                    <div class="model-name">${name} ${tags}</div>
-                                    <div class="model-id">${m.model} <span class="copy-key" onclick="copyApiKey('${name}', this)" title="Click to copy API key" style="cursor:pointer;color:var(--primary);text-decoration:underline dotted;">${keyHint ? `•••${keyHint}` : '•••'}</span></div>
-                                </div>
-                            </div>
-                        </td>
-                        <td class="text-sm">${m.provider || '-'}</td>
-                        <td class="text-sm">${m.priority}</td>
-                        <td class="text-sm">${maxConcurrent}</td>
-                        <td class="text-sm">${maxRpm}</td>
-                        <td class="text-sm">${m.free ? 'Free' : 'Paid'}</td>
-                        <td><span class="badge ${statusCls}" title="${statusTitle}"><span class="dot"></span>${statusTxt}${!ok && healthReason ? `<br><span style="font-weight:400;font-size:10px;opacity:0.8">${healthReason.substring(0, 60)}</span>` : ''}</span></td>
-                        <td style="text-align: right;">
-                            <div class="actions" style="justify-content: flex-end;">
-                                <button class="btn btn-ghost btn-xs" onclick="testModel('${name}', this)">Test</button>
-                                <button class="btn btn-ghost btn-xs" onclick="editModel('${name}')">Edit</button>
-                                <button class="btn btn-ghost btn-xs" onclick="toggleModel('${name}', ${!en}, this)">${en ? 'Disable' : 'Enable'}</button>
-                                <button class="btn btn-ghost btn-xs" onclick="deleteModel('${name}', this)" style="color: var(--destructive);">Delete</button>
-                            </div>
-                        </td>
-                    </tr>
-                `;
+                try {
+                    const ok = m.health?.healthy !== false;
+                    const en = m.enabled;
+                    const statusCls = !en ? 'badge-muted' : !ok ? 'badge-danger' : 'badge-success';
+                    const statusTxt = !en ? 'Disabled' : !ok ? 'Unhealthy' : 'Healthy';
+                    const healthReason = (m.health?.reason || '').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/`/g, '&#96;');
+                    const statusTitle = !en ? 'Model is disabled' : !ok ? healthReason : 'Healthy';
+                    
+                    let tags = '';
+                    if (m.free) tags += '<span class="tag tag-success">Free</span> ';
+                    if (m.peak_only) tags += '<span class="tag tag-warning">Peak</span> ';
+                    if (m.label) tags += '<span class="tag tag-primary">' + m.label.replace(/</g, '&lt;') + '</span> ';
+                    if (!m.free && !m.peak_only && !m.label) tags += '<span class="tag tag-default">Paid</span>';
+                    
+                    const logo = providerLogos[m.provider] || '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="10"/></svg>';
+                    const keyHint = m.api_key_hint || '';
+                    
+                    const modelLimits = (config.usage?.per_model_limits || {})[name] || {};
+                    const maxConcurrent = modelLimits.max_concurrent || '∞';
+                    const maxRpm = modelLimits.max_requests_per_minute || '∞';
+                    const safeName = name.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+                    
+                    html += '<tr data-model="' + safeName + '">' +
+                        '<td><div class="model-cell"><div class="model-avatar">' + logo + '</div><div>' +
+                        '<div class="model-name">' + safeName + ' ' + tags + '</div>' +
+                        '<div class="model-id">' + (m.model || '-').replace(/</g, '&lt;') + ' <span class="copy-key" onclick="copyApiKey(this.closest(\'tr\').dataset.model, this)" title="Click to copy API key" style="cursor:pointer;color:var(--primary);text-decoration:underline dotted;">' + (keyHint ? '•••' + keyHint : '•••') + '</span></div>' +
+                        '</div></div></td>' +
+                        '<td class="text-sm">' + (m.provider || '-') + '</td>' +
+                        '<td class="text-sm">' + (m.priority || '-') + '</td>' +
+                        '<td class="text-sm">' + maxConcurrent + '</td>' +
+                        '<td class="text-sm">' + maxRpm + '</td>' +
+                        '<td class="text-sm">' + (m.free ? 'Free' : 'Paid') + '</td>' +
+                        '<td><span class="badge ' + statusCls + '" title="' + statusTitle + '"><span class="dot"></span>' + statusTxt + (!ok && healthReason ? '<br><span style="font-weight:400;font-size:10px;opacity:0.8">' + healthReason.substring(0, 60) + '</span>' : '') + '</span></td>' +
+                        '<td style="text-align: right;"><div class="actions" style="justify-content: flex-end;">' +
+                        '<button class="btn btn-ghost btn-xs" onclick="testModel(this.closest(\'tr\').dataset.model, this)">Test</button> ' +
+                        '<button class="btn btn-ghost btn-xs" onclick="editModel(this.closest(\'tr\').dataset.model)">Edit</button> ' +
+                        '<button class="btn btn-ghost btn-xs" onclick="toggleModel(this.closest(\'tr\').dataset.model, ' + !en + ', this)">' + (en ? 'Disable' : 'Enable') + '</button> ' +
+                        '<button class="btn btn-ghost btn-xs" onclick="deleteModel(this.closest(\'tr\').dataset.model, this)" style="color: var(--destructive);">Delete</button>' +
+                        '</div></td></tr>';
+                } catch (e) {
+                    console.error('Error rendering model ' + name + ':', e);
+                }
             }
             document.getElementById('modelsBody').innerHTML = html;
         }
         
         async function copyApiKey(modelName, el) {
             try {
-                const res = await fetch('/proxy/models/' + modelName);
+                const res = await fetch('/proxy/models/' + encodeURIComponent(modelName));
                 if (!res.ok) {
                     toast('Failed to get model info', 'error');
                     return;
@@ -1298,7 +1293,7 @@
             } catch (e) {
                 // Fallback for older browsers
                 try {
-                    const res = await fetch('/proxy/models/' + modelName);
+                    const res = await fetch('/proxy/models/' + encodeURIComponent(modelName));
                     const data = await res.json();
                     const apiKey = data.api_key || '';
                     
@@ -1477,13 +1472,13 @@
         async function deleteModel(name, btn) {
             if (!confirm('Delete ' + name + '?')) return;
             if (btn) { btn.disabled = true; btn.textContent = '...'; }
-            const res = await fetch('/proxy/models/' + name, { method: 'DELETE' });
+            const res = await fetch('/proxy/models/' + encodeURIComponent(name), { method: 'DELETE' });
             if (res.ok) { toast('Model deleted', 'success'); refreshData(); } 
             else { toast('Failed', 'error'); if (btn) { btn.disabled = false; btn.textContent = 'Delete'; } }
         }
         
         async function editModel(name) {
-            const res = await fetch('/proxy/models/' + name);
+            const res = await fetch('/proxy/models/' + encodeURIComponent(name));
             if (!res.ok) { toast('Failed to load model', 'error'); return; }
             const data = await res.json();
             
@@ -1503,7 +1498,7 @@
             
             if (Object.keys(body).length === 0) { toast('No changes', 'error'); return; }
             
-            const updateRes = await fetch('/proxy/models/' + name, {
+            const updateRes = await fetch('/proxy/models/' + encodeURIComponent(name), {
                 method: 'PUT',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body)
@@ -1515,7 +1510,7 @@
         
         async function toggleModel(name, enable, btn) {
             if (btn) { btn.disabled = true; btn.textContent = '...'; }
-            const res = await fetch(`/proxy/models/${name}/${enable ? 'enable' : 'disable'}`, { method: 'POST' });
+            const res = await fetch(`/proxy/models/${encodeURIComponent(name)}/${enable ? 'enable' : 'disable'}`, { method: 'POST' });
             if (res.ok) { toast(`${name} ${enable ? 'enabled' : 'disabled'}`, 'success'); refreshData(); }
             else { toast('Failed', 'error'); if (btn) { btn.disabled = false; btn.textContent = enable ? 'Enable' : 'Disable'; } }
         }
@@ -1523,7 +1518,7 @@
         async function testModel(name, btn) {
             if (btn) { btn.disabled = true; btn.textContent = '...'; }
             try {
-                const res = await fetch('/proxy/models/' + name + '/test', { method: 'POST' });
+                const res = await fetch('/proxy/models/' + encodeURIComponent(name) + '/test', { method: 'POST' });
                 const r = await res.json();
                 if (r.status === 'success') {
                     toast(`${name}: OK (${r.latency}s) - ${r.response_preview || ''}`, 'success');
