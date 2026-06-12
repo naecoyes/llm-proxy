@@ -418,6 +418,10 @@ class LLMProxyServer:
                     }
                 else:
                     error_text = response.text[:500]
+                    if response.status_code == 403 and getattr(model_config, "provider", "") == "mimo-free":
+                        self._mimo_free_token = None
+                        self._mimo_free_token_expiry = 0
+                        logger.info(f"探测模型 {model_name} 时发现 mimo-free 403 错误，已清理缓存的 Token")
                     self.model_manager.health_checker.mark_unhealthy(
                         model_name, f"HTTP {response.status_code}"
                     )
@@ -498,6 +502,10 @@ class LLMProxyServer:
                     }
                 else:
                     error_text = response.text[:500]
+                    if response.status_code == 403 and getattr(model_config, "provider", "") == "mimo-free":
+                        self._mimo_free_token = None
+                        self._mimo_free_token_expiry = 0
+                        logger.info(f"探测模型 {model_name} 时发现 mimo-free 403 错误，已清理缓存的 Token")
                     self.model_manager.health_checker.mark_unhealthy(
                         model_name, f"HTTP {response.status_code}"
                     )
@@ -524,21 +532,23 @@ class LLMProxyServer:
             self._mimo_free_token_expiry = 0
 
         import time
+        import uuid
 
         if self._mimo_free_token and time.time() < self._mimo_free_token_expiry:
             return self._mimo_free_token
 
         url = "https://api.xiaomimimo.com/api/free-ai/bootstrap"
+        client_id = f"proxy-{uuid.uuid4().hex[:8]}"
         try:
             response = await self.http_client.post(
-                url, json={"client": "llm-proxy-auto"}
+                url, json={"client": client_id}
             )
             if response.status_code == 200:
                 data = response.json()
                 self._mimo_free_token = data.get("jwt")
-                # Token valid for ~1 hour, refresh after 50 minutes (3000 seconds)
-                self._mimo_free_token_expiry = time.time() + 3000
-                logger.info("成功获取 Mimo Free JWT Token")
+                # 缩短缓存时间为 5 分钟 (300秒) 以防止意外过期
+                self._mimo_free_token_expiry = time.time() + 300
+                logger.info(f"成功获取 Mimo Free JWT Token (Client: {client_id})")
                 return self._mimo_free_token
             else:
                 logger.error(f"获取 Mimo Free Token 失败: HTTP {response.status_code}")
@@ -1101,6 +1111,12 @@ def create_app(config_path: str) -> FastAPI:
                 server.model_manager.usage_controller.release_model(model_name)
                 # 释放模型活跃状态
                 server.model_manager.mark_model_inactive(model_name)
+
+                if e.status_code == 403 and getattr(model_config, "provider", "") == "mimo-free":
+                    server._mimo_free_token = None
+                    server._mimo_free_token_expiry = 0
+                    logger.info(f"[{request_id}] 检测到 mimo-free 403 错误，已清理缓存的 Token")
+
                 should_switch = server.model_manager.handle_error(model_name, e)
 
                 if should_switch and attempt < max_retries:
