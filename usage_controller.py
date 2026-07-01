@@ -24,6 +24,7 @@ def synchronized_usage(method):
 
 DEFAULT_INPUT_COST_PER_1M = 0.14
 DEFAULT_OUTPUT_COST_PER_1M = 0.28
+ZERO_COST_BILLING_MODES = {"free", "subscription", "prepaid", "token_plan", "token-plan"}
 
 
 @dataclass
@@ -96,6 +97,7 @@ class UsageController:
 
         # 每模型速率限制
         self.per_model_limits = usage.get("per_model_limits", {})
+        self.model_configs = (config.get("models", {}) or {}).get("available", {}) or {}
 
     def update_config(self, config: dict):
         """热更新配置"""
@@ -372,22 +374,7 @@ class UsageController:
         # Prefer per-model pricing when configured; otherwise use the default
         # DeepSeek V4 Flash-compatible estimate.
         if cost == 0.0:
-            model_limits = self.per_model_limits.get(model_name, {})
-            input_cost_per_1m = float(
-                model_limits.get("input_cost_per_1m")
-                or model_limits.get("prompt_cost_per_1m")
-                or DEFAULT_INPUT_COST_PER_1M
-            )
-            output_cost_per_1m = float(
-                model_limits.get("output_cost_per_1m")
-                or model_limits.get("completion_cost_per_1m")
-                or DEFAULT_OUTPUT_COST_PER_1M
-            )
-            cost = (
-                input_tokens * input_cost_per_1m / 1_000_000
-            ) + (
-                output_tokens * output_cost_per_1m / 1_000_000
-            )
+            cost = self.estimate_cost(model_name, input_tokens, output_tokens)
 
         # 更新每日统计
         total_stats = self.daily_stats.setdefault("total", UsageStats())
@@ -559,6 +546,49 @@ class UsageController:
                 for name, stats in per_model.items()
             },
         }
+
+    def estimate_cost(self, model_name: str, input_tokens: int, output_tokens: int) -> float:
+        """Estimate marginal request cost from model billing metadata and token counts."""
+        model_limits = self.per_model_limits.get(model_name, {}) or {}
+        model_config = self.model_configs.get(model_name, {}) or {}
+        if self._is_zero_marginal_cost(model_limits, model_config):
+            return 0.0
+        input_cost_per_1m = self._configured_price(
+            model_limits,
+            model_config,
+            ("input_cost_per_1m", "prompt_cost_per_1m", "input_price", "prompt_price"),
+            DEFAULT_INPUT_COST_PER_1M,
+        )
+        output_cost_per_1m = self._configured_price(
+            model_limits,
+            model_config,
+            ("output_cost_per_1m", "completion_cost_per_1m", "output_price", "completion_price"),
+            DEFAULT_OUTPUT_COST_PER_1M,
+        )
+        return (input_tokens * input_cost_per_1m / 1_000_000) + (
+            output_tokens * output_cost_per_1m / 1_000_000
+        )
+
+    def _is_zero_marginal_cost(self, model_limits: dict, model_config: dict) -> bool:
+        if bool(model_limits.get("free") or model_config.get("free")):
+            return True
+        billing_mode = str(
+            model_limits.get("billing_mode")
+            or model_limits.get("billing")
+            or model_config.get("billing_mode")
+            or model_config.get("billing")
+            or ""
+        ).strip().lower()
+        return billing_mode in ZERO_COST_BILLING_MODES
+
+    @staticmethod
+    def _configured_price(model_limits: dict, model_config: dict, keys: tuple[str, ...], default: float) -> float:
+        for source in (model_limits, model_config):
+            for key in keys:
+                value = source.get(key)
+                if value is not None and value != "":
+                    return float(value)
+        return default
 
     @synchronized_usage
     def reset_daily_stats(self):
