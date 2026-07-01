@@ -181,6 +181,12 @@ class UsageController:
             tmp_file = stats_file.with_suffix(".json.tmp")
             tmp_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
             tmp_file.replace(stats_file)
+            try:
+                from asset_database import get_asset_database
+
+                get_asset_database().sync_usage_snapshot(data)
+            except Exception as exc:
+                logger.warning("SQLite usage mirror failed: %s", exc)
         except Exception as e:
             logger.warning(f"保存统计文件失败: {e}")
 

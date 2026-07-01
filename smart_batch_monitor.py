@@ -126,6 +126,13 @@ def set_smart_batch_parallel(batch_id: str, parallel: int, source: str = "dashbo
     tmp_path = control_path.with_suffix(".control.json.tmp")
     tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp_path, control_path)
+    try:
+        from asset_database import get_asset_database
+
+        get_asset_database().record_batch_control(payload)
+    except Exception:
+        # The control file is authoritative for the running scanner.
+        pass
 
     updated = dict(batch)
     updated["parallel_control"] = payload

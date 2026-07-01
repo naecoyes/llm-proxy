@@ -421,6 +421,13 @@ class FindingsService:
             self._state_cache_mtime = int(self.state_file.stat().st_mtime_ns)
         except OSError:
             self._state_cache_mtime = None
+        try:
+            from asset_database import get_asset_database
+
+            get_asset_database().sync_finding_review_state(state)
+        except Exception:
+            # The legacy state file remains authoritative if SQLite is unavailable.
+            pass
 
     @staticmethod
     def _public(record: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:

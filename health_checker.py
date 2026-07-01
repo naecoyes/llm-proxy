@@ -189,6 +189,12 @@ class HealthChecker:
                 encoding="utf-8",
             )
             tmp_file.replace(health_file)
+            try:
+                from asset_database import get_asset_database
+
+                get_asset_database().sync_health_snapshot(data)
+            except Exception as exc:
+                logger.warning("SQLite health mirror failed: %s", exc)
         except Exception as e:
             logger.warning(f"保存健康状态失败: {e}")
 

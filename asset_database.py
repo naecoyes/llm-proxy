@@ -22,7 +22,7 @@ from typing import Any, Iterator
 from urllib.parse import urlsplit
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def now_iso() -> str:
@@ -288,6 +288,119 @@ class AssetDatabase:
                     records INTEGER NOT NULL DEFAULT 0,
                     error TEXT NOT NULL DEFAULT ''
                 );
+
+                CREATE TABLE IF NOT EXISTS llm_requests (
+                    request_id TEXT PRIMARY KEY,
+                    requested_at TEXT NOT NULL,
+                    client_ip TEXT NOT NULL DEFAULT '',
+                    requested_model TEXT NOT NULL DEFAULT '',
+                    actual_model TEXT NOT NULL DEFAULT '',
+                    model_id TEXT NOT NULL DEFAULT '',
+                    provider TEXT NOT NULL DEFAULT '',
+                    stream INTEGER NOT NULL DEFAULT 0,
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    first_message_preview TEXT NOT NULL DEFAULT '',
+                    scan_id TEXT NOT NULL DEFAULT '',
+                    scan_target TEXT NOT NULL DEFAULT '',
+                    scan_root_domain TEXT NOT NULL DEFAULT '',
+                    scan_mode TEXT NOT NULL DEFAULT '',
+                    proxy_slot TEXT NOT NULL DEFAULT '',
+                    scan_retry TEXT NOT NULL DEFAULT '',
+                    scan_pid TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_llm_requests_time ON llm_requests(requested_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_llm_requests_scan ON llm_requests(scan_id, requested_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_llm_requests_model ON llm_requests(actual_model, provider, requested_at DESC);
+
+                CREATE TABLE IF NOT EXISTS llm_responses (
+                    request_id TEXT PRIMARY KEY,
+                    responded_at TEXT NOT NULL,
+                    model_name TEXT NOT NULL DEFAULT '',
+                    duration_seconds REAL,
+                    status TEXT NOT NULL DEFAULT '',
+                    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                    completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    cost REAL NOT NULL DEFAULT 0,
+                    error TEXT NOT NULL DEFAULT '',
+                    scan_id TEXT NOT NULL DEFAULT '',
+                    scan_target TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_llm_responses_time ON llm_responses(responded_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_llm_responses_status ON llm_responses(status, responded_at DESC);
+
+                CREATE TABLE IF NOT EXISTS model_switches (
+                    id INTEGER PRIMARY KEY,
+                    request_id TEXT NOT NULL,
+                    switched_at TEXT NOT NULL,
+                    from_model TEXT NOT NULL DEFAULT '',
+                    to_model TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    scan_id TEXT NOT NULL DEFAULT '',
+                    fingerprint TEXT NOT NULL UNIQUE
+                );
+                CREATE INDEX IF NOT EXISTS idx_model_switch_request ON model_switches(request_id, switched_at);
+
+                CREATE TABLE IF NOT EXISTS model_usage_daily (
+                    usage_date TEXT NOT NULL,
+                    hour_slot TEXT NOT NULL DEFAULT '',
+                    model_name TEXT NOT NULL,
+                    requests INTEGER NOT NULL DEFAULT 0,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    cost REAL NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(usage_date, hour_slot, model_name)
+                );
+                CREATE INDEX IF NOT EXISTS idx_model_usage_date ON model_usage_daily(usage_date DESC, model_name);
+
+                CREATE TABLE IF NOT EXISTS model_health_state (
+                    model_name TEXT PRIMARY KEY,
+                    healthy INTEGER NOT NULL DEFAULT 1,
+                    reason TEXT NOT NULL DEFAULT '',
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    total_failures INTEGER NOT NULL DEFAULT 0,
+                    total_successes INTEGER NOT NULL DEFAULT 0,
+                    last_success_at REAL NOT NULL DEFAULT 0,
+                    last_failure_at REAL NOT NULL DEFAULT 0,
+                    next_probe_at REAL NOT NULL DEFAULT 0,
+                    re_enable_at REAL NOT NULL DEFAULT 0,
+                    state_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS model_health_events (
+                    id INTEGER PRIMARY KEY,
+                    model_name TEXT NOT NULL,
+                    healthy INTEGER NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    state_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX IF NOT EXISTS idx_health_events_model ON model_health_events(model_name, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS batch_controls (
+                    id INTEGER PRIMARY KEY,
+                    batch_id TEXT NOT NULL,
+                    requested_parallel INTEGER NOT NULL,
+                    source TEXT NOT NULL DEFAULT '',
+                    requested_at TEXT NOT NULL,
+                    UNIQUE(batch_id, requested_at)
+                );
+                CREATE INDEX IF NOT EXISTS idx_batch_controls_batch ON batch_controls(batch_id, requested_at DESC);
+
+                CREATE TABLE IF NOT EXISTS finding_review_state (
+                    state_key TEXT PRIMARY KEY,
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    unread INTEGER NOT NULL DEFAULT 1,
+                    marked INTEGER NOT NULL DEFAULT 0,
+                    starred INTEGER NOT NULL DEFAULT 0,
+                    starred_at TEXT,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    verified INTEGER,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_finding_review_updated ON finding_review_state(updated_at DESC);
                 """
             )
             connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -623,6 +736,237 @@ class AssetDatabase:
                         fingerprint,
                     ),
                 )
+
+    def record_llm_event(
+        self, entry: dict[str, Any], connection: sqlite3.Connection | None = None,
+    ) -> None:
+        event_type = str(entry.get("type") or "")
+        request_id = str(entry.get("request_id") or "")
+        if not event_type or not request_id:
+            return
+        timestamp = str(entry.get("timestamp") or now_iso())
+        if connection is None:
+            with self.transaction() as owned_connection:
+                self.record_llm_event(entry, owned_connection)
+            return
+        if connection is not None:
+            if event_type == "request":
+                connection.execute(
+                    """INSERT INTO llm_requests(
+                      request_id,requested_at,client_ip,requested_model,actual_model,model_id,provider,
+                      stream,message_count,first_message_preview,scan_id,scan_target,scan_root_domain,
+                      scan_mode,proxy_slot,scan_retry,scan_pid)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(request_id) DO UPDATE SET requested_at=excluded.requested_at,
+                      client_ip=excluded.client_ip,requested_model=excluded.requested_model,
+                      actual_model=excluded.actual_model,model_id=excluded.model_id,provider=excluded.provider,
+                      stream=excluded.stream,message_count=excluded.message_count,
+                      first_message_preview=excluded.first_message_preview,scan_id=excluded.scan_id,
+                      scan_target=excluded.scan_target,scan_root_domain=excluded.scan_root_domain,
+                      scan_mode=excluded.scan_mode,proxy_slot=excluded.proxy_slot,
+                      scan_retry=excluded.scan_retry,scan_pid=excluded.scan_pid""",
+                    (
+                        request_id, timestamp, str(entry.get("client_ip") or ""),
+                        str(entry.get("requested_model") or ""), str(entry.get("actual_model") or ""),
+                        str(entry.get("model_id") or ""), str(entry.get("provider") or ""),
+                        int(bool(entry.get("stream"))), int(entry.get("message_count") or 0),
+                        str(entry.get("first_message_preview") or "")[:500],
+                        *(str(entry.get(key) or "") for key in (
+                            "scan_id", "scan_target", "scan_root_domain", "scan_mode",
+                            "proxy_slot", "scan_retry", "scan_pid",
+                        )),
+                    ),
+                )
+            elif event_type == "response":
+                usage = entry.get("usage") or {}
+                connection.execute(
+                    """INSERT INTO llm_responses(
+                      request_id,responded_at,model_name,duration_seconds,status,prompt_tokens,
+                      completion_tokens,total_tokens,cost,error,scan_id,scan_target)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(request_id) DO UPDATE SET responded_at=excluded.responded_at,
+                      model_name=excluded.model_name,duration_seconds=excluded.duration_seconds,
+                      status=excluded.status,prompt_tokens=excluded.prompt_tokens,
+                      completion_tokens=excluded.completion_tokens,total_tokens=excluded.total_tokens,
+                      cost=excluded.cost,error=excluded.error,scan_id=excluded.scan_id,
+                      scan_target=excluded.scan_target""",
+                    (
+                        request_id, timestamp, str(entry.get("model_name") or ""),
+                        entry.get("duration_seconds"), str(entry.get("status") or ""),
+                        int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0),
+                        int(usage.get("total_tokens") or 0), float(usage.get("cost") or 0),
+                        str(entry.get("error") or "")[:4000], str(entry.get("scan_id") or ""),
+                        str(entry.get("scan_target") or ""),
+                    ),
+                )
+            elif event_type == "model_switch":
+                fingerprint = str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps([
+                    request_id, timestamp, entry.get("from_model"), entry.get("to_model"), entry.get("reason")
+                ], ensure_ascii=False, default=str)))
+                connection.execute(
+                    """INSERT OR IGNORE INTO model_switches(
+                      request_id,switched_at,from_model,to_model,reason,scan_id,fingerprint)
+                    VALUES(?,?,?,?,?,?,?)""",
+                    (request_id, timestamp, str(entry.get("from_model") or ""),
+                     str(entry.get("to_model") or ""), str(entry.get("reason") or "")[:2000],
+                    str(entry.get("scan_id") or ""), fingerprint),
+                )
+
+    def record_llm_events(self, entries: list[dict[str, Any]]) -> None:
+        """Bulk-import JSONL events in one WAL transaction."""
+        with self.transaction() as connection:
+            for entry in entries:
+                self.record_llm_event(entry, connection)
+
+    def read_llm_events(
+        self, *, start_date: str, end_date: str, limit: int = 1000,
+        scan_id: str = "", proxy_slot: str = "",
+    ) -> list[dict[str, Any]]:
+        start = f"{start_date}T00:00:00"
+        end = f"{end_date}T23:59:59.999999"
+        where = ["requested_at BETWEEN ? AND ?"]
+        params: list[Any] = [start, end]
+        if scan_id:
+            where.append("scan_id=?")
+            params.append(scan_id)
+        if proxy_slot:
+            where.append("proxy_slot=?")
+            params.append(proxy_slot)
+        safe_limit = max(1, min(int(limit), 10000))
+        with self.connect() as connection:
+            requests = connection.execute(
+                f"SELECT * FROM llm_requests WHERE {' AND '.join(where)} ORDER BY requested_at DESC LIMIT ?",
+                [*params, safe_limit],
+            ).fetchall()
+            request_ids = [str(row["request_id"]) for row in requests]
+            if not request_ids:
+                return []
+            placeholders = ",".join("?" for _ in request_ids)
+            responses = {str(row["request_id"]): row for row in connection.execute(
+                f"SELECT * FROM llm_responses WHERE request_id IN ({placeholders})", request_ids
+            )}
+            switches: dict[str, list[sqlite3.Row]] = {}
+            for row in connection.execute(
+                f"SELECT * FROM model_switches WHERE request_id IN ({placeholders}) ORDER BY switched_at", request_ids
+            ):
+                switches.setdefault(str(row["request_id"]), []).append(row)
+        events: list[dict[str, Any]] = []
+        for row in reversed(requests):
+            request = dict(row)
+            request["type"], request["timestamp"] = "request", request.pop("requested_at")
+            request["stream"] = bool(request["stream"])
+            events.append(request)
+            for switch in switches.get(str(row["request_id"]), []):
+                item = dict(switch)
+                item.pop("id", None); item.pop("fingerprint", None)
+                item["type"], item["timestamp"] = "model_switch", item.pop("switched_at")
+                events.append(item)
+            response_row = responses.get(str(row["request_id"]))
+            if response_row:
+                item = dict(response_row)
+                item["type"], item["timestamp"] = "response", item.pop("responded_at")
+                item["usage"] = {
+                    "prompt_tokens": item.pop("prompt_tokens"),
+                    "completion_tokens": item.pop("completion_tokens"),
+                    "total_tokens": item.pop("total_tokens"), "cost": item.pop("cost"),
+                }
+                events.append(item)
+        return events
+
+    def sync_usage_snapshot(self, payload: dict[str, Any]) -> None:
+        usage_date = str(payload.get("date") or "")
+        if not usage_date:
+            return
+        updated_at = now_iso()
+        rows: list[tuple[Any, ...]] = []
+        for model_name, stats in (payload.get("models") or {}).items():
+            rows.append(self._usage_row(usage_date, "", str(model_name), stats, updated_at))
+        total = payload.get("total") or {}
+        rows.append(self._usage_row(usage_date, "", "__total__", total, updated_at))
+        for slot, models in (payload.get("hourly") or {}).items():
+            for model_name, stats in (models or {}).items():
+                rows.append(self._usage_row(usage_date, str(slot), str(model_name), stats, updated_at))
+        with self.transaction() as connection:
+            connection.executemany(
+                """INSERT INTO model_usage_daily(usage_date,hour_slot,model_name,requests,input_tokens,
+                  output_tokens,total_tokens,cost,updated_at) VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(usage_date,hour_slot,model_name) DO UPDATE SET requests=excluded.requests,
+                  input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,
+                  total_tokens=excluded.total_tokens,cost=excluded.cost,updated_at=excluded.updated_at""", rows,
+            )
+
+    @staticmethod
+    def _usage_row(usage_date: str, hour_slot: str, model_name: str, stats: dict[str, Any], updated_at: str) -> tuple[Any, ...]:
+        return (usage_date, hour_slot, model_name, int(stats.get("requests") or 0),
+                int(stats.get("input_tokens") or 0), int(stats.get("output_tokens") or 0),
+                int(stats.get("tokens") or stats.get("total_tokens") or 0),
+                float(stats.get("cost") or 0), updated_at)
+
+    def sync_health_snapshot(self, payload: dict[str, Any]) -> None:
+        updated_at = now_iso()
+        with self.transaction() as connection:
+            for model_name, raw_state in payload.items():
+                state = raw_state or {}
+                previous = connection.execute(
+                    "SELECT healthy,reason FROM model_health_state WHERE model_name=?", (model_name,)
+                ).fetchone()
+                values = (
+                    str(model_name), int(bool(state.get("healthy", True))), str(state.get("reason") or ""),
+                    int(state.get("consecutive_failures") or 0), int(state.get("total_failures") or 0),
+                    int(state.get("total_successes") or 0), float(state.get("last_success_at") or 0),
+                    float(state.get("last_failure_at") or 0), float(state.get("next_probe_at") or 0),
+                    float(state.get("re_enable_at") or 0), json.dumps(state, ensure_ascii=False, default=str), updated_at,
+                )
+                connection.execute(
+                    """INSERT INTO model_health_state(model_name,healthy,reason,consecutive_failures,total_failures,
+                      total_successes,last_success_at,last_failure_at,next_probe_at,re_enable_at,state_json,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(model_name) DO UPDATE SET healthy=excluded.healthy,
+                      reason=excluded.reason,consecutive_failures=excluded.consecutive_failures,
+                      total_failures=excluded.total_failures,total_successes=excluded.total_successes,
+                      last_success_at=excluded.last_success_at,last_failure_at=excluded.last_failure_at,
+                      next_probe_at=excluded.next_probe_at,re_enable_at=excluded.re_enable_at,
+                      state_json=excluded.state_json,updated_at=excluded.updated_at""", values,
+                )
+                if previous is None or int(previous[0]) != values[1] or str(previous[1]) != values[2]:
+                    connection.execute(
+                        "INSERT INTO model_health_events(model_name,healthy,reason,created_at,state_json) VALUES(?,?,?,?,?)",
+                        (str(model_name), values[1], values[2], updated_at, values[10]),
+                    )
+
+    def record_batch_control(self, payload: dict[str, Any]) -> None:
+        with self.transaction() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO batch_controls(batch_id,requested_parallel,source,requested_at)
+                VALUES(?,?,?,?)""",
+                (str(payload.get("batch_id") or ""), int(payload.get("parallel") or 0),
+                 str(payload.get("source") or ""), str(payload.get("requested_at") or now_iso())),
+            )
+
+    def sync_finding_review_state(self, state: dict[str, Any]) -> None:
+        keys = set().union(*(set((state.get(bucket) or {}).keys()) for bucket in (
+            "tags", "unread", "marks", "stars", "starred_at", "archived", "verified"
+        )))
+        updated_at = now_iso()
+        rows = []
+        for key in keys:
+            verified = (state.get("verified") or {}).get(key)
+            rows.append((key, json.dumps((state.get("tags") or {}).get(key, []), ensure_ascii=False),
+                         int((state.get("unread") or {}).get(key, True) is not False),
+                         int((state.get("marks") or {}).get(key) is True),
+                         int((state.get("stars") or {}).get(key) is True),
+                         (state.get("starred_at") or {}).get(key),
+                         int((state.get("archived") or {}).get(key) is True),
+                         None if verified is None else int(bool(verified)), updated_at))
+        if not rows:
+            return
+        with self.transaction() as connection:
+            connection.executemany(
+                """INSERT INTO finding_review_state(state_key,tags_json,unread,marked,starred,starred_at,
+                  archived,verified,updated_at) VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(state_key) DO UPDATE SET tags_json=excluded.tags_json,unread=excluded.unread,
+                  marked=excluded.marked,starred=excluded.starred,starred_at=excluded.starred_at,
+                  archived=excluded.archived,verified=excluded.verified,updated_at=excluded.updated_at""", rows,
+            )
 
     def has_scanned(self, target: str) -> bool:
         key = normalize_target(target)["canonical_key"]

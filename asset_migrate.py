@@ -50,7 +50,20 @@ def probe_files(project: Path) -> list[Path]:
 
 def state_files(project: Path) -> list[Path]:
     root = project / "llm_proxy" / "runtime" / "smart_batch"
-    return sorted(root.glob("*.json")) if root.is_dir() else []
+    return sorted(path for path in root.glob("*.json") if not path.name.endswith(".control.json")) if root.is_dir() else []
+
+
+def control_files(project: Path) -> list[Path]:
+    root = project / "llm_proxy" / "runtime" / "smart_batch"
+    return sorted(root.glob("*.control.json")) if root.is_dir() else []
+
+
+def request_log_files(project: Path) -> list[Path]:
+    return sorted((project / "llm_proxy" / "logs").glob("requests_*.log"))
+
+
+def usage_files(project: Path) -> list[Path]:
+    return sorted((project / "llm_proxy" / "stats").glob("usage_????-??-??.json"))
 
 
 def read_run_target(events_path: Path) -> tuple[str, str]:
@@ -97,10 +110,14 @@ def parse_finding_markdown(path: Path) -> tuple[str, str]:
 
 
 class Migrator:
-    def __init__(self, db: AssetDatabase, project: Path, dry_run: bool = False) -> None:
+    def __init__(
+        self, db: AssetDatabase, project: Path, dry_run: bool = False,
+        operational_only: bool = False,
+    ) -> None:
         self.db = db
         self.project = project
         self.dry_run = dry_run
+        self.operational_only = operational_only
         self.counts = {
             "sources_seen": 0,
             "sources_skipped": 0,
@@ -110,6 +127,11 @@ class Migrator:
             "run_targets": 0,
             "artifacts": 0,
             "findings": 0,
+            "llm_events": 0,
+            "usage_snapshots": 0,
+            "health_models": 0,
+            "batch_controls": 0,
+            "finding_review_rows": 0,
             "errors": 0,
         }
 
@@ -178,6 +200,73 @@ class Migrator:
         self.counts["batches"] += 1
         self.mark_imported(path, "batch_state", len(payload.get("tasks") or []))
 
+    def import_request_log(self, path: Path) -> None:
+        if self.already_imported(path, "llm_request_log"):
+            return
+        entries = []
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get("type") not in {"request", "response", "model_switch"}:
+                continue
+            entries.append(entry)
+        records = len(entries)
+        if not self.dry_run:
+            self.db.record_llm_events(entries)
+        self.counts["llm_events"] += records
+        self.mark_imported(path, "llm_request_log", records)
+
+    def import_usage(self, path: Path) -> None:
+        if self.already_imported(path, "model_usage"):
+            return
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not self.dry_run:
+            self.db.sync_usage_snapshot(payload)
+        self.counts["usage_snapshots"] += 1
+        self.mark_imported(path, "model_usage", len(payload.get("models") or {}))
+
+    def import_health(self, path: Path) -> None:
+        if not path.is_file() or self.already_imported(path, "model_health"):
+            return
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not self.dry_run:
+            self.db.sync_health_snapshot(payload)
+        self.counts["health_models"] += len(payload)
+        self.mark_imported(path, "model_health", len(payload))
+
+    def import_control(self, path: Path) -> None:
+        if self.already_imported(path, "batch_control"):
+            return
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not self.dry_run:
+            self.db.record_batch_control(payload)
+        self.counts["batch_controls"] += 1
+        self.mark_imported(path, "batch_control", 1)
+
+    def import_finding_review_state(self) -> None:
+        config_path = self.project / "llm_proxy" / "vulnerability_sources.yaml"
+        if not config_path.is_file():
+            return
+        try:
+            import yaml
+
+            config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            state_path = Path(config.get("state_file") or "")
+        except Exception:
+            return
+        if not state_path.is_file() or self.already_imported(state_path, "finding_review_state"):
+            return
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        keys = set().union(*(set((state.get(bucket) or {}).keys()) for bucket in (
+            "tags", "unread", "marks", "stars", "starred_at", "archived", "verified"
+        )))
+        if not self.dry_run:
+            self.db.sync_finding_review_state(state)
+        self.counts["finding_review_rows"] += len(keys)
+        self.mark_imported(state_path, "finding_review_state", len(keys))
+
     def import_run(self, run_dir: Path, root_id: str) -> None:
         events = run_dir / "events.jsonl"
         if not events.is_file() or self.already_imported(events, "run"):
@@ -237,33 +326,64 @@ class Migrator:
         self.mark_imported(events, "run", records)
 
     def run(self) -> dict[str, Any]:
-        for path in history_files(self.project):
-            try:
-                self.import_history(path)
-            except Exception as exc:
-                self.counts["errors"] += 1
-                self.mark_imported(path, "history", 0, str(exc))
-        for path in probe_files(self.project):
-            try:
-                self.import_probe(path)
-            except Exception as exc:
-                self.counts["errors"] += 1
-                self.mark_imported(path, "probe", 0, str(exc))
+        if not self.operational_only:
+            for path in history_files(self.project):
+                try:
+                    self.import_history(path)
+                except Exception as exc:
+                    self.counts["errors"] += 1
+                    self.mark_imported(path, "history", 0, str(exc))
+            for path in probe_files(self.project):
+                try:
+                    self.import_probe(path)
+                except Exception as exc:
+                    self.counts["errors"] += 1
+                    self.mark_imported(path, "probe", 0, str(exc))
         for path in state_files(self.project):
             try:
                 self.import_batch(path)
             except Exception as exc:
                 self.counts["errors"] += 1
                 self.mark_imported(path, "batch_state", 0, str(exc))
-        for root in KNOWN_RUN_ROOTS:
-            if not root.is_dir():
-                continue
-            for run_dir in root.iterdir():
-                if run_dir.is_dir():
-                    try:
-                        self.import_run(run_dir, root.name)
-                    except Exception:
-                        self.counts["errors"] += 1
+        for path in control_files(self.project):
+            try:
+                self.import_control(path)
+            except Exception as exc:
+                self.counts["errors"] += 1
+                self.mark_imported(path, "batch_control", 0, str(exc))
+        for path in request_log_files(self.project):
+            try:
+                self.import_request_log(path)
+            except Exception as exc:
+                self.counts["errors"] += 1
+                self.mark_imported(path, "llm_request_log", 0, str(exc))
+        for path in usage_files(self.project):
+            try:
+                self.import_usage(path)
+            except Exception as exc:
+                self.counts["errors"] += 1
+                self.mark_imported(path, "model_usage", 0, str(exc))
+        health_path = self.project / "llm_proxy" / "stats" / "health_state.json"
+        try:
+            self.import_health(health_path)
+        except Exception as exc:
+            self.counts["errors"] += 1
+            if health_path.exists():
+                self.mark_imported(health_path, "model_health", 0, str(exc))
+        try:
+            self.import_finding_review_state()
+        except Exception:
+            self.counts["errors"] += 1
+        if not self.operational_only:
+            for root in KNOWN_RUN_ROOTS:
+                if not root.is_dir():
+                    continue
+                for run_dir in root.iterdir():
+                    if run_dir.is_dir():
+                        try:
+                            self.import_run(run_dir, root.name)
+                        except Exception:
+                            self.counts["errors"] += 1
         result = {"generated_at": now_iso(), "dry_run": self.dry_run, "counts": self.counts}
         if not self.dry_run:
             result["database"] = self.db.summary()
@@ -275,10 +395,14 @@ def main() -> None:
     parser.add_argument("--db", type=Path)
     parser.add_argument("--project-root", type=Path, default=DEFAULT_PROJECT)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--operational-only", action="store_true")
     parser.add_argument("--report", type=Path)
     args = parser.parse_args()
     db = AssetDatabase(args.db)
-    result = Migrator(db, args.project_root, dry_run=args.dry_run).run()
+    result = Migrator(
+        db, args.project_root, dry_run=args.dry_run,
+        operational_only=args.operational_only,
+    ).run()
     text = json.dumps(result, ensure_ascii=False, indent=2)
     print(text)
     if args.report:

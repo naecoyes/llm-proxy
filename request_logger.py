@@ -90,6 +90,16 @@ class RequestLogger:
             handler.setFormatter(formatter)
             self.file_logger.addHandler(handler)
 
+    def _persist_entry(self, entry: dict) -> None:
+        """Keep JSONL as the raw audit trail and best-effort mirror metadata to SQLite."""
+        self.file_logger.info(json.dumps(entry, ensure_ascii=False))
+        try:
+            from asset_database import get_asset_database
+
+            get_asset_database().record_llm_event(entry)
+        except Exception as exc:
+            logger.warning("SQLite LLM event mirror failed: %s", exc)
+
     def log_request(
         self,
         request_id: str,
@@ -118,7 +128,7 @@ class RequestLogger:
             "first_message_preview": messages[0]["content"][:100] if messages else "",
         }
         entry.update(self._scan_context_fields(scan_context))
-        self.file_logger.info(json.dumps(entry, ensure_ascii=False))
+        self._persist_entry(entry)
 
     def log_response(
         self,
@@ -143,7 +153,7 @@ class RequestLogger:
             "error": error,
         }
         entry.update(self._scan_context_fields(scan_context))
-        self.file_logger.info(json.dumps(entry, ensure_ascii=False))
+        self._persist_entry(entry)
 
     def log_model_switch(
         self,
@@ -164,7 +174,7 @@ class RequestLogger:
             "reason": reason,
         }
         entry.update(self._scan_context_fields(scan_context))
-        self.file_logger.info(json.dumps(entry, ensure_ascii=False))
+        self._persist_entry(entry)
 
     def _scan_context_fields(self, scan_context: Optional[dict]) -> dict:
         """Flatten scan context into stable log fields."""
@@ -188,6 +198,27 @@ class RequestLogger:
             end_date=end_date,
             days=days,
         )
+        safe_limit = max(1, min(int(limit or 100), 10000))
+        try:
+            from asset_database import get_asset_database
+
+            db_logs = get_asset_database().read_llm_events(
+                start_date=log_files[0].stem.removeprefix("requests_") if log_files else datetime.now().date().isoformat(),
+                end_date=log_files[-1].stem.removeprefix("requests_") if log_files else datetime.now().date().isoformat(),
+                limit=safe_limit,
+                scan_id=scan_id or "",
+                proxy_slot=proxy_slot or "",
+            )
+            if db_logs:
+                return {
+                    "logs": db_logs,
+                    "total": len(db_logs),
+                    "total_matching": len(db_logs),
+                    "files": ["sqlite:nscan-assets.sqlite3"],
+                    "storage": "sqlite",
+                }
+        except Exception as exc:
+            logger.warning("SQLite LLM log read failed; using JSONL: %s", exc)
         logs = []
         for log_file in log_files:
             if not log_file.exists():
@@ -208,12 +239,12 @@ class RequestLogger:
                     logs.append(entry)
 
         total_matching = len(logs)
-        safe_limit = max(1, min(int(limit or 100), 10000))
         return {
             "logs": logs[-safe_limit:],
             "total": len(logs[-safe_limit:]),
             "total_matching": total_matching,
             "files": [str(path) for path in log_files if path.exists()],
+            "storage": "jsonl",
         }
 
     def join_logs(self, logs: list[dict]) -> dict:
