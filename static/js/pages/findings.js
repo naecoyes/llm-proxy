@@ -1,5 +1,5 @@
 import { api } from "../api.js";
-import { badge, confirmAction, emptyState, errorState, metric, openDrawer, panel, skeleton, toast } from "../components.js";
+import { badge, confirmAction, emptyState, errorState, openDrawer, panel, skeleton, toast } from "../components.js";
 import { debounce, escapeHtml, formatNumber } from "../utils.js";
 
 const severityTone = { CRITICAL: "danger", HIGH: "warning", MEDIUM: "warning", LOW: "success", INFO: "info", UNKNOWN: "info" };
@@ -84,15 +84,23 @@ function rowActions(item) {
   </div>`;
 }
 
+function metricFilterCard(kind, label, value, detail = "", tone = "") {
+  return `<button class="metric-card finding-metric-card ${tone}" type="button" data-finding-metric="${escapeHtml(kind)}">
+    <div class="metric-label">${escapeHtml(label)}</div>
+    <div class="metric-value">${escapeHtml(value)}</div>
+    <div class="metric-detail">${escapeHtml(detail)}</div>
+  </button>`;
+}
+
 function renderMetrics(summary) {
   const achieved = summary.achieved ?? summary.archived ?? 0;
   return `<div class="metrics-grid findings-metrics single-row">
-    ${metric("Total", fullNumber(summary.total), `${fullNumber(summary.targets)} targets`)}
-    ${metric("Critical", fullNumber(summary.critical), "Immediate review", summary.critical ? "critical" : "")}
-    ${metric("High", fullNumber(summary.high), "High-impact findings", summary.high ? "warning" : "")}
-    ${metric("Unread", fullNumber(summary.unread), `${fullNumber(summary.archived)} archived`)}
-    ${metric("Verified", fullNumber(summary.verified), "Confirmed findings")}
-    ${metric("Achieved", fullNumber(achieved), "Completed findings")}
+    ${metricFilterCard("total", "Total", fullNumber(summary.total), `${fullNumber(summary.targets)} targets`)}
+    ${metricFilterCard("critical", "Critical", fullNumber(summary.critical), "Immediate review", summary.critical ? "critical" : "")}
+    ${metricFilterCard("high", "High", fullNumber(summary.high), "High-impact findings", summary.high ? "warning" : "")}
+    ${metricFilterCard("unread", "Unread", fullNumber(summary.unread), `${fullNumber(summary.archived)} archived`)}
+    ${metricFilterCard("verified", "Verified", fullNumber(summary.verified), "Confirmed findings")}
+    ${metricFilterCard("achieved", "Achieved", fullNumber(achieved), "Completed findings")}
   </div>`;
 }
 
@@ -360,7 +368,52 @@ export function mountFindings({ root, setFreshness, setRefreshHandler, setTopbar
     } catch (error) { toast(error.message, "error"); }
   }
 
+  async function applyMetricFilter(kind) {
+    filters.page = 1;
+    selected.clear();
+    if (kind === "total") {
+      activeTab = "findings";
+      filters.status = "";
+      filters.severity = "";
+      filters.sort = "legacy";
+      filters.order = "asc";
+    } else if (kind === "critical") {
+      activeTab = "findings";
+      filters.status = "needs-review";
+      filters.severity = "CRITICAL";
+      filters.sort = "severity";
+      filters.order = "asc";
+    } else if (kind === "high") {
+      activeTab = "findings";
+      filters.status = "needs-review";
+      filters.severity = "HIGH";
+      filters.sort = "severity";
+      filters.order = "asc";
+    } else if (kind === "unread") {
+      activeTab = "findings";
+      filters.status = "unread";
+      filters.severity = "";
+      filters.sort = "legacy";
+      filters.order = "asc";
+    } else if (kind === "verified") {
+      activeTab = "verified";
+      filters.status = "verified";
+      filters.severity = "";
+      filters.sort = "verified_at";
+      filters.order = "desc";
+    } else if (kind === "achieved") {
+      activeTab = "findings";
+      filters.status = "archived";
+      filters.severity = "";
+      filters.sort = "legacy";
+      filters.order = "asc";
+    }
+    await loadList();
+    render();
+  }
+
   function bindEvents() {
+    root.querySelectorAll("[data-finding-metric]").forEach(button => button.addEventListener("click", () => applyMetricFilter(button.dataset.findingMetric)));
     root.querySelectorAll("[data-findings-tab]").forEach(button => button.addEventListener("click", async () => {
       activeTab = button.dataset.findingsTab;
       if (activeTab === "findings") {

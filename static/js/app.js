@@ -5,7 +5,7 @@ import { formatNumber, icon, relativeTime } from "./utils.js";
 import { mountOverview } from "./pages/overview.js";
 import { mountScans, mountScanHistory } from "./pages/scans.js?v=20260701-assets-history";
 import { mountAssets } from "./pages/assets.js?v=20260701-assets-history";
-import { mountFindings } from "./pages/findings.js?v=20260701-achieved-metric";
+import { mountFindings } from "./pages/findings.js?v=20260701-metric-filters";
 import { mountEgress } from "./pages/egress.js";
 import { mountModels } from "./pages/models.js?v=20260623-provider-ui";
 import { mountActivity } from "./pages/activity.js?v=20260701-compact-panels";
