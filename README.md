@@ -2,7 +2,7 @@
   <img src="images/ChatGPT Image May 27, 2026, 11_09_44 AM.png" width="180" />
 </p>
 
-<h1 align="center">LLM Proxy Hub</h1>
+<h1 align="center">Nscan Runtime Dashboard</h1>
 
 <p align="center">
   A Lightweight, High-Performance LLM API Proxy Server
@@ -23,6 +23,7 @@
 
 - **Multi-Model Management** - Configure multiple LLM providers behind a unified OpenAI-compatible interface.
 - **Anthropic API Support** - Native support for Anthropic Claude models with automatic conversion between OpenAI and Anthropic formats (including streaming).
+- **OpenCode Go Provider Support** - Add OpenCode Go models from the dashboard or YAML, including OpenAI-compatible `/chat/completions` models and Anthropic-style `/messages` models.
 - **Slot Routing (Session Affinity)** - Request specific "slots" (e.g., `auto1`, `auto2`) to consistently map to the same underlying model for better context caching and connection reuse. **Strictly respects `max_concurrent` limits**: if a high-priority model reaches its max concurrency, remaining slots automatically map to the next best priority models. Slots also automatically failover upon model quota exhaustion.
 - **Intelligent Load Balancing** - Automatically dispatch requests to healthy models with dynamic filtering (skips models with recent success rates < 70%).
 - **Off-Peak Scheduling** - Dynamically boost priority of specified models during off-peak hours (with timezone support) to optimize costs.
@@ -34,8 +35,14 @@
 - **Concurrency Control** - Fine-grained concurrency limits (`max_concurrent`) per model to prevent overloading upstream APIs.
 - **IP Whitelist** - Strict access control based on client IPs, supporting `X-Forwarded-For` and `X-Real-IP` headers.
 - **Usage & Request Logging** - Detailed tracking of API requests, response times, and token usage.
+- **Smart Batch Attribution** - Records Strix batch `scan_id`, target, PID, proxy slot, actual backend model, provider, model ID, token usage, failures, and model switches.
+- **Nscan Runtime Dashboard** - Shows Smart Batch progress, host resources, sing-box egress status, Docker bridge scope, masked SOCKS5 pool configuration, and read-only boundary checks.
+- **Asset Inventory Database** - Stores targets, aliases, resolved IPs, probe state, Smart Batch tasks, attempts, events, artifacts, and finding references in a local SQLite WAL database while keeping raw reports in their original directories.
+- **Integrated Findings** - Searches and reviews vulnerability records, target aggregates, and Markdown reports in their existing Strix run directories, with shared tags, archive, star, and verification state from the retained 8080 viewer.
+- **Egress Proxy Control** - Separately controls the current running state and boot startup state, plus restart, when the dashboard user has narrow `systemctl` permission.
+- **Access Control Status** - Shows whether the IP whitelist and dashboard PIN are configured. Sensitive reads and all `/proxy` write operations require `X-Nscan-Pin` when a PIN is set.
 - **Hot Configuration Reload** - Modify `proxy_config.yaml` on the fly without restarting the server.
-- **Web Dashboard** - Intuitive visual management panel for real-time monitoring and model health checks.
+- **Web Dashboard** - Intuitive visual management panel for Strix scan runtime, model health, and request logs.
 
 ## Quick Start
 
@@ -78,6 +85,33 @@ models:
       priority: 90
       enabled: true
 
+    # OpenCode Go OpenAI-compatible model
+    opencode-deepseek-flash:
+      api_base: https://opencode.ai/zen/go/v1
+      api_key: your-opencode-go-key
+      model: opencode-go/deepseek-v4-flash
+      provider: opencode-go
+      api_format: openai
+      strip_provider_prefix: true
+      routing_tier: reserve
+      allowed_scan_modes: [deep, redteam]
+      priority: 80
+      enabled: false
+
+    # OpenCode Go Anthropic-style messages model
+    opencode-qwen-plus:
+      api_base: https://opencode.ai/zen/go/v1/messages
+      api_key: your-opencode-go-key
+      model: opencode-go/qwen3.7-plus
+      provider: opencode-go
+      api_format: anthropic
+      is_exact_url: true
+      strip_provider_prefix: true
+      routing_tier: reserve
+      allowed_scan_modes: [deep, redteam]
+      priority: 90
+      enabled: false
+
 # Time-based scheduling strategy (optional)
 schedule:
   timezone: "Asia/Shanghai"
@@ -96,7 +130,63 @@ usage:
   per_model_limits:
     my-openai:
       max_concurrent: 3
+
+    # Optional local safety limits for a plan-limited model
+    my-reserve-model:
+      max_concurrent: 1
+      max_requests_per_minute: 4
+      max_requests_per_day: 500
+      max_tokens_per_day: 2000000
+
+    opencode-deepseek-flash:
+      max_concurrent: 1
+      max_requests_per_minute: 4
+      input_cost_per_1m: 0.14
+      output_cost_per_1m: 0.28
 ```
+
+The Models page includes an **OpenCode Go preset** selector that fills the provider, endpoint,
+API format, reserve routing tier, conservative rate limits, and cost metadata. The official
+JS/TS `@opencode-ai/sdk` is not used here because that SDK controls an `opencode serve`
+instance; Nscan consumes OpenCode Go as an upstream model provider through HTTP endpoints.
+
+Plan-limited models may opt into quota-aware automatic routing:
+
+```yaml
+models:
+  available:
+    my-reserve-model:
+      api_base: https://provider.example/v1
+      api_key: keep-this-in-the-untracked-runtime-config
+      model: coding-model
+      provider: example
+      routing_tier: reserve
+      allowed_scan_modes: [deep, redteam]
+      quota_policy:
+        limited: true
+        weekly_percent: 1
+        monthly_percent: 0
+        auto_disable_at_percent: 80
+        observed_at: "2026-06-18T09:54:02+08:00"
+```
+
+Reserve models are excluded from automatic routing when the scan mode is not allowed or the
+configured usage snapshot reaches the soft threshold. Explicit model selection still works.
+`GET /v1/models/available?scan_mode=redteam` returns the quota-aware recommended scan parallelism.
+
+### Model switches and usage mode
+
+Each model has a persistent independent switch on the Models page. Manual disable stays off
+until an operator enables it again; automatic health disable still uses a cooldown retry.
+
+Set `models.routing_mode` from the dashboard or YAML:
+
+- `balanced_all` (default): all enabled, healthy, eligible models participate in round-robin
+  requests and `autoN` slot distribution.
+- `priority`: only the highest-priority eligible group participates until fallback is needed.
+
+Quota, rate, health, time-window, and scan-mode filters apply in both modes. The Nscan Runtime
+page shows current model connectivity and provides a shortcut for testing or adding a model.
 
 ### 3. Start the Service
 
@@ -171,8 +261,135 @@ print(response.choices[0].message.content)
 | `/proxy/status` | GET | Proxy status overview |
 | `/proxy/health` | GET | Model health check results |
 | `/proxy/usage` | GET | Usage statistics |
-| `/proxy/logs` | GET | Request logs |
+| `/proxy/logs` | GET | Request logs; supports `limit`, `scan_id`, `proxy_slot`, `date`, `start_date`, `end_date`, `days`, and `joined` filters |
+| `/proxy/smart-batch/status` | GET | Smart Batch run snapshots and task progress |
+| `/proxy/smart-batch/status/{batch_id}` | GET | One Smart Batch run snapshot |
+| `/proxy/system/resources` | GET | Host CPU, memory, disk, network, proxy process, and Smart Batch PID status |
+| `/proxy/egress/usage` | GET | `br-strix` bridge counters, scan container traffic, target attribution, and SOCKS pool summary |
+| `/proxy/docker/containers` | GET | Cached Docker scan container state, attribution, and traffic counters |
+| `/proxy/dashboard/summary` | GET | Overview aggregate; use `include_telemetry=false` for the fast initial page payload |
+| `/proxy/dashboard/badges` | GET | Lightweight scan/model navigation counts without Docker sampling |
+| `/proxy/vulnerabilities/summary` | GET | Cached Findings counts, source inventory, and shared-state availability |
+| `/proxy/vulnerabilities` | GET | Server-side Findings search, filters, sorting, and pagination |
+| `/proxy/assets/summary` | GET | SQLite asset inventory totals by scan/probe state |
+| `/proxy/assets` | GET | Asset search, filters, sorting, and pagination |
+| `/proxy/assets/{asset_id}` | GET | One asset with aliases, addresses, probes, scans, findings, and artifacts |
+| `/proxy/assets/export` | GET | Filtered asset export as txt, csv, or json |
+| `/proxy/vulnerabilities/{record_id}` | GET | One finding and its shared review state |
+| `/proxy/vulnerabilities/{record_id}/content` | GET | Referenced Markdown evidence; add `download=true` for attachment mode |
+| `/proxy/vulnerabilities/{record_id}/state` | PATCH | Update tags, star, mark, archive, read, or verification state |
+| `/proxy/vulnerabilities/bulk-state` | POST | Apply one state change to multiple findings |
+| `/proxy/vulnerabilities/autoclean` | POST | Run the retained viewer's auto-clean rules |
+| `/proxy/vulnerability-reports` | GET | List configured consolidated Markdown reports |
+| `/proxy/security/status` | GET | IP whitelist and dashboard PIN configuration status |
+| `/proxy/security/verify` | POST | Verify the `X-Nscan-Pin` header |
+| `/proxy/security/logout` | POST | Clear the persistent dashboard administration session |
+| `/proxy/nscan-runtime/status` | GET | Nscan runtime, sing-box egress, Docker network, and masked SOCKS5 pool status |
+| `/proxy/nscan-runtime/proxy-enabled` | POST | Start or stop the current egress service with `{"enabled": true/false}` |
+| `/proxy/nscan-runtime/proxy-startup-enabled` | POST | Enable or disable service startup with `{"enabled": true/false}` |
+| `/proxy/nscan-runtime/proxy-restart` | POST | Restart the Nscan egress proxy service |
+| `/proxy/nscan-runtime/nodes/{node_tag}/enabled` | POST | Add or remove one SOCKS5 node from the automatic pool |
 | `/proxy/config` | GET/PUT | Read or update configuration |
+
+### Smart Batch Scan Context
+
+When Strix Smart Batch runs through this proxy, it can attach local-only attribution headers:
+
+```text
+X-Strix-Batch-Scan-Id
+X-Strix-Batch-Target
+X-Strix-Batch-Root-Domain
+X-Strix-Batch-Proxy-Slot
+X-Strix-Batch-Retry
+X-Strix-Process-Pid
+```
+
+The proxy stores these fields in request, response, and model-switch logs. They are used for local observability only and do not change model selection. The dashboard groups active processes by `scan_id` when present, and falls back to the older `autoN`/client IP grouping for ordinary requests.
+
+Examples:
+
+```bash
+curl "http://127.0.0.1:8888/proxy/logs?scan_id=<scan-id>&limit=500"
+curl "http://127.0.0.1:8888/proxy/logs?proxy_slot=auto1&limit=500"
+curl "http://127.0.0.1:8888/proxy/logs?scan_id=<scan-id>&days=2&joined=true"
+```
+
+`joined=true` returns a per-request view that joins request, response, and model-switch entries by `request_id`, plus model-switch reason counts for the selected logs.
+
+### Smart Batch Dashboard
+
+`scanScript/smart_batch_scan.py` writes state snapshots to `llm_proxy/runtime/smart_batch/` by default. Set `STRIX_BATCH_STATE_DIR` when the proxy and scanner need to share another directory.
+
+The Web Dashboard includes a **Smart Batch** section with active/stale/recent batches, task tables, failures, recent events, scan-level model attribution, and server resource cards.
+
+Docker and egress telemetry is sampled once and shared for 3 seconds across Overview, Scans, and
+Egress API calls. Blocking Docker CLI work runs outside the FastAPI event loop. Pages render their
+fast operational data first and fill container/bandwidth panels independently; a slow or failed
+telemetry refresh therefore does not block navigation. The navigation badges use
+`/proxy/dashboard/badges` and never invoke `docker stats`.
+
+### Nscan Runtime Dashboard
+
+The dashboard root is now oriented around Nscan runtime operations. The **Egress Proxy** page reads
+the local sing-box configuration, masks credentials, shows the `include_interface` boundary, checks
+the `strix-egress` Docker network, and can optionally test TCP reachability for each SOCKS5 node.
+It also reads `/proxy/egress/usage` for bridge-level bandwidth, Docker scan container traffic,
+target/domain/IP attribution, and `scan_id` mapping. These metrics cover Nscan Docker scan traffic
+only; LLM provider requests are routed by the model proxy configuration, not this SOCKS5 egress pool.
+
+By default it reads `/etc/sing-box/config.json` and controls the `sing-box` systemd service. Override
+with:
+
+```bash
+export STRIX_EGRESS_SING_BOX_CONFIG=/etc/sing-box/config.json
+export STRIX_EGRESS_SERVICE=sing-box
+export STRIX_DOCKER_NETWORK=strix-egress
+```
+
+Start/stop, enable/disable startup, and restart actions use `systemctl` directly first, then
+`sudo -n systemctl ...` if needed.
+For a production dashboard, grant only the specific commands required for `sing-box`; do not grant
+general sudo. This control only affects the Nscan Docker bridge egress path and does not modify LLM
+provider routing.
+
+Per-node switches update only the selector pool, keep at least one node enabled, restart sing-box,
+and roll the configuration back if restart fails. Install `nscan_egress_node_control.py` as the
+root-owned `/usr/local/sbin/nscan-egress-node-control` helper and allow only that helper via sudoers.
+The Egress page can also add, edit, and delete SOCKS5 nodes through this helper. Existing passwords
+remain write-only: reads return only a masked hint, and an empty password during edit preserves the
+current secret. Every configuration change is atomic and rolls back if `sing-box` cannot restart.
+
+`Scan History` includes a paginated scanned-target registry from `scanned_domains.txt`, Smart Batch
+history files under `reports/`, and legacy 0.8.3 history files when that directory is present. Set
+`NSCAN_SCANNED_HISTORY_PATHS` to an `os.pathsep`-separated list to override the indexed sources.
+
+### Asset Database
+
+The dashboard keeps a local SQLite WAL database at `llm_proxy/runtime/nscan-assets.sqlite3`.
+It is a metadata store only: Strix reports, CSV files, SDK databases, and Markdown evidence remain in
+their original directories and are referenced by path.
+
+```bash
+# Repeatable online import
+python llm_proxy/asset_migrate.py --report reports/asset_migration.json
+
+# Online backup with retention
+python llm_proxy/asset_maintenance.py backup
+
+# Dry-run cold archive preview for old completed runs
+python llm_proxy/asset_maintenance.py archive --days 30
+```
+
+Probe and Smart Batch write best-effort updates into the database. If the DB is temporarily locked or
+unavailable, events are spooled under `llm_proxy/runtime/asset_spool/` and can be replayed through
+`POST /proxy/assets/spool/replay`.
+
+Set the dashboard PIN with `NSCAN_DASHBOARD_PIN` or `admin.pin_code`. Existing deployments may use
+`admin.api_key` as a compatibility fallback. The first successful `X-Nscan-Pin` verification issues
+an HttpOnly, SameSite=Strict administration cookie, so later visits do not need the PIN again.
+The default lifetime is 30 days; set `NSCAN_DASHBOARD_SESSION_DAYS` or `admin.session_days` to 1-365.
+Changing the PIN invalidates existing sessions. The signing secret is persisted under `runtime/` and
+the raw PIN is never stored in browser storage.
 
 ## License
 

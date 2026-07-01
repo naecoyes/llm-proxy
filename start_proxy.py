@@ -74,6 +74,11 @@ def main():
     logger.info(f"监听地址: {host}:{port}")
     logger.info(f"日志级别: {log_level}")
 
+    # 设置环境变量跳过所有 LLM 的代理
+    import os
+    os.environ["NO_PROXY"] = "*"
+    os.environ["no_proxy"] = "*"
+
     # 创建应用
     from server import create_app
 

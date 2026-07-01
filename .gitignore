@@ -1,4 +1,5 @@
 __pycache__/
+._*
 *.pyc
 logs/*.log
 stats/*.json
@@ -10,4 +11,10 @@ build/
 venv/
 proxy_config.yaml
 llm_proxy.pid
+nscan_dashboard.pid
 proxy.log
+proxy_local.log
+runtime/
+backups/
+recordings/
+screenshots/

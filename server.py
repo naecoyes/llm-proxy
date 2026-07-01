@@ -13,11 +13,11 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncGenerator, Dict, List, Optional, Set
+from typing import Any, AsyncGenerator, Dict, List, Optional, Set
 
 import httpx
 import yaml
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -33,6 +33,7 @@ from smart_batch_monitor import (
     get_system_resources,
     read_smart_batch_detail,
     read_smart_batch_status,
+    set_smart_batch_parallel,
 )
 from strix_runtime_monitor import (
     get_strix_runtime_status,
@@ -42,11 +43,93 @@ from strix_runtime_monitor import (
     set_strix_egress_startup_enabled,
 )
 from egress_usage_monitor import get_egress_usage
+from asset_database import get_asset_database
 from findings import FindingsService, create_findings_router
+from smart_batch_jobs import SmartBatchJobManager
 
 logger = logging.getLogger(__name__)
 
 DASHBOARD_SESSION_COOKIE = "nscan_admin_session"
+
+
+def normalize_openai_sse_chunk(chunk: bytes | str) -> tuple[bytes | str, dict[str, Any]]:
+    """Normalize one OpenAI-compatible SSE chunk and collect stream diagnostics.
+
+    Some providers, notably DeepSeek-compatible streams, may omit final usage
+    accounting even when they emit valid assistant content. Health checks must
+    therefore be based on observed content / finish events, not only token usage.
+    """
+    was_bytes = isinstance(chunk, bytes)
+    try:
+        text = chunk.decode() if was_bytes else str(chunk)
+    except Exception:
+        return chunk, {}
+
+    diagnostics: dict[str, Any] = {
+        "has_content": False,
+        "usage": None,
+        "finish_reason": None,
+        "error": None,
+    }
+    output_lines: list[str] = []
+    changed = False
+
+    for line in text.splitlines(keepends=True):
+        line_body = line.rstrip("\r\n")
+        line_end = line[len(line_body):]
+        stripped = line_body.lstrip()
+        if not stripped.startswith("data:"):
+            output_lines.append(line)
+            continue
+
+        payload = stripped[5:].strip()
+        if not payload or payload == "[DONE]":
+            output_lines.append(line)
+            continue
+
+        try:
+            data = json.loads(payload)
+        except Exception:
+            output_lines.append(line)
+            continue
+
+        if data.get("error"):
+            diagnostics["error"] = json.dumps(data["error"], ensure_ascii=False)
+
+        usage = data.get("usage")
+        if usage:
+            diagnostics["usage"] = usage
+
+        choices = data.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                finish_reason = choice.get("finish_reason")
+                if finish_reason:
+                    diagnostics["finish_reason"] = finish_reason
+                delta = choice.get("delta") or {}
+                if isinstance(delta, dict):
+                    if "reasoning_content" in delta:
+                        delta.pop("reasoning_content", None)
+                        changed = True
+                    if str(delta.get("content") or "").strip():
+                        diagnostics["has_content"] = True
+                message = choice.get("message") or {}
+                if isinstance(message, dict):
+                    if "reasoning_content" in message:
+                        message.pop("reasoning_content", None)
+                        changed = True
+                    if str(message.get("content") or "").strip():
+                        diagnostics["has_content"] = True
+
+        output_lines.append(f"data: {json.dumps(data, ensure_ascii=False)}{line_end}")
+        changed = True
+
+    normalized = "".join(output_lines)
+    if not changed:
+        return chunk, diagnostics
+    return (normalized.encode() if was_bytes else normalized), diagnostics
 
 
 class IPWhitelist:
@@ -113,6 +196,7 @@ class LLMProxyServer:
         self._mimo_free_token: Optional[str] = None
         self._mimo_free_token_expiry: float = 0.0
         self._mimo_token_lock: asyncio.Lock = asyncio.Lock()
+        self.is_shutting_down = False
 
     def _load_config(self) -> dict:
         """加载配置文件"""
@@ -138,6 +222,7 @@ class LLMProxyServer:
 
     async def start(self):
         """启动服务"""
+        self.is_shutting_down = False
         # 启动配置监控
         self.config_watcher.start()
 
@@ -151,6 +236,7 @@ class LLMProxyServer:
 
     async def stop(self):
         """停止服务"""
+        self.is_shutting_down = True
         self.config_watcher.stop()
 
         # 停止健康检查
@@ -966,10 +1052,17 @@ def create_app(config_path: str) -> FastAPI:
     """创建 FastAPI 应用"""
     server = LLMProxyServer(config_path)
 
+    # FindingsService 单例 — 提前实例化以便在 lifespan 中预热
+    _findings_service = FindingsService()
+    # Smart Batch Job Manager 单例
+    _job_manager = SmartBatchJobManager()
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await server.start()
+        await _findings_service.start()   # 启动时预热 Findings 索引
         yield
+        await _findings_service.stop()
         await server.stop()
 
     app = FastAPI(
@@ -1332,6 +1425,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
                         finish_reason_stop = False
                         has_content_in_delta = False
                         stream_error: Optional[str] = None
+                        client_cancelled = False
                         final_usage: dict = {}
                         try:
                             async for chunk in response.body_iterator:
@@ -1355,62 +1449,46 @@ document.getElementById("f").addEventListener("submit",async e=>{
                                     yield f"data: {error_event}\n\n"
                                     break
 
-                                # Strip reasoning_content from delta before
-                                # forwarding to agent SDK so it never enters
-                                # conversation history and triggers rejection.
-                                try:
-                                    chunk_str_before = (
-                                        chunk.decode()
-                                        if isinstance(chunk, bytes)
-                                        else chunk
-                                    )
-                                    if (
-                                        chunk_str_before.startswith("data: ")
-                                        and chunk_str_before.strip() != "data: [DONE]"
-                                    ):
-                                        data = json.loads(chunk_str_before[6:])
-                                        choices = data.get("choices")
-                                        if isinstance(choices, list):
-                                            for c in choices:
-                                                if isinstance(c, dict):
-                                                    delta = c.get("delta") or {}
-                                                    if isinstance(delta, dict):
-                                                        delta.pop("reasoning_content", None)
-                                                        if str(delta.get("content") or "").strip():
-                                                            has_content_in_delta = True
-                                        chunk = f"data: {json.dumps(data)}\n\n".encode()
-                                except Exception:
-                                    pass
+                                # Strip reasoning_content before forwarding to
+                                # agent SDK and collect diagnostics from every
+                                # SSE data line. A single network chunk may
+                                # contain multiple data events, and some
+                                # providers omit usage while still streaming
+                                # valid assistant content.
+                                chunk, stream_diag = normalize_openai_sse_chunk(chunk)
+                                if stream_diag.get("has_content"):
+                                    has_content_in_delta = True
+                                usage = stream_diag.get("usage")
+                                if usage:
+                                    total_tokens = usage.get("total_tokens", 0)
+                                    input_tokens = usage.get("prompt_tokens", 0)
+                                    output_tokens = usage.get("completion_tokens", 0)
+                                    final_usage = usage
+                                if stream_diag.get("finish_reason") in ("stop", "length"):
+                                    finish_reason_stop = True
+                                if stream_diag.get("error"):
+                                    stream_error = stream_diag["error"]
 
                                 yield chunk
                                 try:
-                                    chunk_str = (
-                                        chunk.decode()
-                                        if isinstance(chunk, bytes)
-                                        else chunk
-                                    )
+                                    chunk_str = chunk.decode() if isinstance(chunk, bytes) else chunk
                                     if chunk_str.strip():
                                         valid_chunk_count += 1
-                                    if (
-                                        chunk_str.startswith("data: ")
-                                        and chunk_str.strip() != "data: [DONE]"
-                                    ):
-                                        data = json.loads(chunk_str[6:])
-                                        if "usage" in data and data["usage"]:
-                                            usage = data["usage"]
-                                            total_tokens = usage.get("total_tokens", 0)
-                                            input_tokens = usage.get("prompt_tokens", 0)
-                                            output_tokens = usage.get(
-                                                "completion_tokens", 0
-                                            )
-                                            final_usage = usage
-                                        if data.get("choices") and isinstance(data["choices"], list):
-                                            if data["choices"][0].get("finish_reason") in ("stop", "length"):
-                                                finish_reason_stop = True
-                                        if data.get("error"):
-                                            stream_error = json.dumps(data["error"], ensure_ascii=False)
                                 except Exception:
                                     pass
+                        except (asyncio.CancelledError, GeneratorExit):
+                            # Starlette closes the async generator when the
+                            # caller disconnects or abandons a stream. On
+                            # modern Python CancelledError is not an Exception,
+                            # so it previously skipped response logging and
+                            # appeared forever as stale_no_response.
+                            client_cancelled = True
+                            stream_error = (
+                                "Service shutting down"
+                                if server.is_shutting_down
+                                else "Client disconnected"
+                            )
+                            logger.info(f"[{request_id}] 流式响应中断: {stream_error}")
                         except Exception as e:
                             logger.warning(f"[{request_id}] 流式响应异常: {e}")
                             stream_error = str(e)
@@ -1439,16 +1517,24 @@ document.getElementById("f").addEventListener("submit",async e=>{
                                     model_name,
                                     {"total_tokens": 1, "prompt_tokens": 0, "completion_tokens": 0},
                                 )
-                        else:
-                            error_msg = stream_error or "Empty response or rate limited"
+                        elif not client_cancelled:
+                            error_msg = stream_error or "Empty upstream response"
                             server.model_manager.handle_error(model_name, RuntimeError(error_msg))
 
                         zero_usage_partial = is_success and total_tokens == 0
-                        if zero_usage_partial:
+                        if client_cancelled:
+                            status = (
+                                "interrupted"
+                                if server.is_shutting_down
+                                else "cancelled"
+                            )
+                        elif zero_usage_partial:
                             status = "partial"
                         else:
                             status = "success" if is_success else "failed"
-                        final_error = None if is_success else error_msg
+                        final_error = None if is_success else (
+                            stream_error or "Empty upstream response"
+                        )
 
                         # 记录请求完成
                         request_logger.log_response(
@@ -1656,9 +1742,17 @@ document.getElementById("f").addEventListener("submit",async e=>{
         return response
 
     @app.get("/proxy/smart-batch/status")
-    async def proxy_smart_batch_status(limit: int = 20, include_finished: bool = True):
+    async def proxy_smart_batch_status(
+        limit: int = Query(20, ge=1, le=200),
+        include_finished: bool = True,
+        include_tasks: bool = True,
+    ):
         """返回 Smart Batch 运行状态快照列表"""
-        return read_smart_batch_status(limit=limit, include_finished=include_finished)
+        return read_smart_batch_status(
+            limit=limit,
+            include_finished=include_finished,
+            include_tasks=include_tasks,
+        )
 
     @app.get("/proxy/smart-batch/status/{batch_id}")
     async def proxy_smart_batch_detail(batch_id: str):
@@ -2377,14 +2471,36 @@ document.getElementById("f").addEventListener("submit",async e=>{
             resources = get_system_resources()
         except Exception:
             resources = None
-        healthy_count = len(server.model_manager.health_checker.get_healthy_models())
-        total_models = len(server.model_manager.models)
+        try:
+            asset_summary = get_asset_database().summary()
+        except Exception:
+            asset_summary = {}
+        health = server.model_manager.health_checker.health_state
+        models = server.model_manager.models
+        healthy_count = sum(
+            1 for name in models if health.get(name) and health[name].healthy
+        )
+        total_models = len(models)
+        try:
+            batch_status = read_smart_batch_status(limit=20, include_finished=False)
+            active_scans = int(
+                (batch_status.get("summary") or {}).get("running_tasks") or 0
+            )
+        except Exception:
+            active_scans = 0
+        assets_total = int(asset_summary.get("total") or 0)
+        findings_total = int(asset_summary.get("findings") or 0)
         return {
-            "active_scans": 0,
-            "vulnerabilities_total": 0,
+            "active_scans": active_scans,
+            "vulnerabilities_total": findings_total,
             "vulnerabilities_new": 0,
             "models_healthy": healthy_count,
             "models_total": total_models,
+            "scans": active_scans,
+            "assets": assets_total,
+            "assets_total": assets_total,
+            "findings": findings_total,
+            "models": healthy_count,
             "resources": resources,
         }
 
@@ -2423,50 +2539,165 @@ document.getElementById("f").addEventListener("submit",async e=>{
         return {"configured": bool(pin), "source": source or None}
 
     @app.get("/proxy/smart-batch/jobs")
+    async def proxy_smart_batch_jobs_list(limit: int = Query(50, ge=1, le=200)):
+        return await asyncio.to_thread(_job_manager.list_jobs, limit)
+
     @app.post("/proxy/smart-batch/jobs")
-    async def proxy_smart_batch_jobs():
-        return {"jobs": []}
+    async def proxy_smart_batch_jobs_submit(request: Request):
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+        try:
+            return await asyncio.to_thread(_job_manager.submit, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except Exception as exc:
+            logger.exception("smart batch submit error")
+            raise HTTPException(status_code=500, detail=str(exc))
 
     @app.post("/proxy/smart-batch/jobs/preview")
     async def proxy_smart_batch_jobs_preview(request: Request):
-        return {"tasks": []}
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+        try:
+            return await asyncio.to_thread(_job_manager.preview, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except Exception as exc:
+            logger.exception("smart batch preview error")
+            raise HTTPException(status_code=500, detail=str(exc))
 
     @app.post("/proxy/smart-batch/status/{batch_id}/parallel")
-    async def proxy_smart_batch_parallel(batch_id: str):
-        return {"status": "ok"}
+    async def proxy_smart_batch_parallel(batch_id: str, request: Request):
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+        try:
+            requested = int(body.get("parallel"))
+        except (AttributeError, TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="parallel must be an integer")
+
+        if requested < 1 or requested > 32:
+            raise HTTPException(status_code=422, detail="parallel must be between 1 and 32")
+
+        try:
+            updated = await asyncio.to_thread(
+                set_smart_batch_parallel,
+                batch_id,
+                requested,
+                "dashboard",
+            )
+        except ValueError as exc:
+            message = str(exc)
+            if "not found" in message:
+                raise HTTPException(status_code=404, detail=message)
+            if "finished" in message:
+                raise HTTPException(status_code=409, detail=message)
+            raise HTTPException(status_code=422, detail=message)
+
+        control = updated.get("parallel_control") or {}
+        return {
+            "status": "accepted",
+            "batch_id": batch_id,
+            "requested_parallel": requested,
+            "current_parallel": int(updated.get("parallel") or 0),
+            "effective_parallel": int(updated.get("effective_parallel") or 0),
+            "requested_at": control.get("requested_at"),
+        }
 
     @app.get("/proxy/scanned-targets")
-    async def proxy_scanned_targets(page: int = 1, page_size: int = 50):
-        return {"items": [], "total": 0, "page": page, "page_size": page_size}
+    async def proxy_scanned_targets(
+        page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=200),
+        query: str = "",
+        source: str = "",
+    ):
+        db = get_asset_database()
+        return await asyncio.to_thread(
+            db.scanned_targets_page,
+            query=query,
+            source=source,
+            page=page,
+            page_size=page_size,
+        )
 
     @app.post("/proxy/docker/orphan-containers/cleanup")
     async def proxy_docker_orphan_cleanup():
         return {"cleaned": 0}
 
-    @app.get("/proxy/assets")
-    async def proxy_assets(page: int = 1, page_size: int = 50):
-        return {"items": [], "total": 0, "page": page, "page_size": page_size}
-
     @app.get("/proxy/assets/summary")
     async def proxy_assets_summary():
-        return {"total": 0, "scanned": 0, "unscanned": 0, "with_findings": 0}
+        db = get_asset_database()
+        return await asyncio.to_thread(db.summary)
 
     @app.get("/proxy/assets/export")
-    async def proxy_assets_export(format: str = "csv"):
-        from fastapi.responses import PlainTextResponse
-        return PlainTextResponse("")
+    async def proxy_assets_export(
+        format: str = "csv",
+        query: str = "",
+        scan_status: str = "",
+        probe_status: str = "",
+    ):
+        from fastapi.responses import Response as FastAPIResponse
+        db = get_asset_database()
+        filters = {k: v for k, v in {
+            "query": query,
+            "scan_status": scan_status,
+            "probe_status": probe_status,
+        }.items() if v}
+        data, media_type = await asyncio.to_thread(db.export_assets, format, **filters)
+        ext = {"json": "json", "csv": "csv"}.get(format, "txt")
+        return FastAPIResponse(
+            content=data,
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename=assets.{ext}"},
+        )
+
+    @app.get("/proxy/assets")
+    async def proxy_assets(
+        page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=200),
+        query: str = "",
+        scan_status: str = "",
+        probe_status: str = "",
+        source: str = "",
+        sort: str = "last_seen",
+    ):
+        if sort not in {"last_seen", "last_scanned", "findings", "target"}:
+            raise HTTPException(status_code=422, detail="sort must be one of last_seen, last_scanned, findings, target")
+        db = get_asset_database()
+        return await asyncio.to_thread(
+            db.list_assets,
+            query=query,
+            scan_status=scan_status,
+            probe_status=probe_status,
+            source=source,
+            sort=sort,
+            page=page,
+            page_size=page_size,
+        )
 
     @app.get("/proxy/assets/{asset_id}")
-    async def proxy_asset_detail(asset_id: str):
-        raise HTTPException(status_code=404, detail="Asset not found")
+    async def proxy_asset_detail(asset_id: int):
+        db = get_asset_database()
+        detail = await asyncio.to_thread(db.asset_detail, asset_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        return detail
 
     @app.post("/proxy/assets/spool/replay")
-    async def proxy_assets_spool_replay(request: Request):
-        return {"status": "ok"}
+    async def proxy_assets_spool_replay():
+        db = get_asset_database()
+        return await asyncio.to_thread(db.replay_spool)
 
     # Use the proper FindingsService router for all /proxy/vulnerabilities/*
     # and /proxy/vulnerability-reports/* routes.
-    findings_router = create_findings_router(FindingsService())
+    # NOTE: _findings_service is the singleton created before lifespan above.
+    findings_router = create_findings_router(_findings_service)
     app.include_router(findings_router)
 
     return app
