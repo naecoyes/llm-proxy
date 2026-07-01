@@ -3,8 +3,28 @@ import { Poller } from "../poller.js";
 import { badge, closeDrawer, confirmAction, emptyState, errorState, openDrawer, panel, proxyNodeIdentity, skeleton, toast } from "../components.js";
 import { escapeHtml, formatBytes, formatDate, formatRate } from "../utils.js";
 
+const NODE_CHECK_STORAGE_KEY = "nscan.egress.lastNodeCheckAt";
+const NODE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
 function switchControl(id, checked, label, disabled = false, attributes = "") {
   return `<label class="switch" title="${escapeHtml(label)}"><input id="${id}" type="checkbox" ${checked ? "checked" : ""} ${disabled ? "disabled" : ""} ${attributes}><span class="switch-track"></span><span class="visually-hidden">${escapeHtml(label)}</span></label>`;
+}
+
+function shouldRunScheduledNodeCheck() {
+  try {
+    const last = Number(window.localStorage?.getItem(NODE_CHECK_STORAGE_KEY) || 0);
+    return !last || Date.now() - last >= NODE_CHECK_INTERVAL_MS;
+  } catch (_error) {
+    return false;
+  }
+}
+
+function rememberScheduledNodeCheck() {
+  try {
+    window.localStorage?.setItem(NODE_CHECK_STORAGE_KEY, String(Date.now()));
+  } catch (_error) {
+    // Ignore storage failures; backend also enforces the daily check interval after restart.
+  }
 }
 
 function renderNodes(runtime) {
@@ -268,7 +288,9 @@ export function mountEgress(context) {
       (value) => ({ value }),
       (error) => ({ error }),
     );
-    runtime = await api.runtime(signal, true);
+    const scheduledNodeCheck = shouldRunScheduledNodeCheck();
+    runtime = await api.runtime(signal, scheduledNodeCheck);
+    if (scheduledNodeCheck) rememberScheduledNodeCheck();
     usage = null;
     usageError = null;
     render();
