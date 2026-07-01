@@ -24,6 +24,7 @@ DEFAULT_BRIDGE_INTERFACE = "br-strix"
 DEFAULT_NODE_CONTROL_HELPER = "/usr/local/sbin/nscan-egress-node-control"
 DEFAULT_NODE_METADATA = "/var/lib/nscan/nscan-node-metadata.json"
 COMMAND_TIMEOUT_SECONDS = 8
+NODE_CHECK_INTERVAL_SECONDS = int(os.environ.get("STRIX_EGRESS_NODE_CHECK_INTERVAL_SECONDS", "86400"))
 PROXY_REGION_NETWORKS = (
     (ipaddress.ip_network("85.237.211.0/24"), "UAE"),
     (ipaddress.ip_network("212.115.103.0/24"), "Turkey"),
@@ -70,7 +71,7 @@ def get_strix_runtime_status(check_nodes: bool = False) -> dict[str, Any]:
         "egress": egress,
         "docker": docker,
         "boundary": boundary,
-        "warnings": warnings + service.get("warnings", []) + docker.get("warnings", []),
+        "warnings": warnings + service.get("warnings", []) + docker.get("warnings", []) + egress.get("warnings", []),
     }
 
 
@@ -388,24 +389,47 @@ def parse_sing_box_config(config: dict[str, Any], check_nodes: bool = False, met
     )
     proxy_pool = list(selector.get("outbounds") or [])
     display_name_by_tag = {str(node.get("tag") or ""): str(node.get("display_name") or "") for node in socks_nodes}
+    auto_actions: list[dict[str, Any]] = []
+    warnings: list[str] = []
     for node in socks_nodes:
         node["in_auto_pool"] = node.get("tag") in proxy_pool
         if node.get("server") and node.get("server_port"):
             cache_key = node_check_cache_key(node)
+            with _NODE_CHECK_CACHE_LOCK:
+                cached_check = _NODE_CHECK_CACHE.get(cache_key)
             if check_nodes:
-                tcp_check = check_tcp(str(node["server"]), int(node["server_port"]))
-                tcp_check["checked_at"] = now_iso()
-                with _NODE_CHECK_CACHE_LOCK:
-                    _NODE_CHECK_CACHE[cache_key] = dict(tcp_check)
+                if cached_check and not node_check_is_due(cached_check):
+                    tcp_check = dict(cached_check)
+                else:
+                    tcp_check = check_tcp(str(node["server"]), int(node["server_port"]))
+                    tcp_check["checked_at"] = now_iso()
+                    with _NODE_CHECK_CACHE_LOCK:
+                        _NODE_CHECK_CACHE[cache_key] = dict(tcp_check)
+                enrich_node_check_schedule(tcp_check)
                 node["tcp_check"] = tcp_check
+                if node["in_auto_pool"] and not tcp_check.get("reachable", False):
+                    action = auto_disable_unreachable_node(str(node.get("tag") or ""), tcp_check)
+                    auto_actions.append(action)
+                    if action.get("ok"):
+                        node["in_auto_pool"] = False
+                        if node.get("tag") in proxy_pool:
+                            proxy_pool.remove(node.get("tag"))
+                    else:
+                        warnings.append(
+                            f"failed to auto-disable unavailable SOCKS node {node.get('tag')}: "
+                            f"{trim_output(action.get('stderr') or action.get('stdout') or action.get('error') or '')}"
+                        )
             else:
-                with _NODE_CHECK_CACHE_LOCK:
-                    cached_check = _NODE_CHECK_CACHE.get(cache_key)
                 if cached_check:
-                    node["tcp_check"] = dict(cached_check)
+                    tcp_check = dict(cached_check)
+                    enrich_node_check_schedule(tcp_check)
+                    node["tcp_check"] = tcp_check
 
     return {
         "enabled": False,
+        "node_check_interval_seconds": NODE_CHECK_INTERVAL_SECONDS,
+        "auto_actions": auto_actions,
+        "warnings": warnings,
         "mode": "sing-box tun",
         "tun": {
             "tag": tun_inbound.get("tag") or "",
@@ -453,6 +477,62 @@ def clear_node_check_cache(node_tag: str) -> None:
         stale_keys = [key for key in _NODE_CHECK_CACHE if key.startswith(prefix)]
         for key in stale_keys:
             _NODE_CHECK_CACHE.pop(key, None)
+
+
+def node_check_is_due(cached_check: dict[str, Any], now: float | None = None) -> bool:
+    """Return true when a cached node connectivity result is older than the daily check interval."""
+    checked_at = cached_check.get("checked_at")
+    if not checked_at:
+        return True
+    try:
+        checked = datetime.fromisoformat(str(checked_at).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return True
+    return (time.time() if now is None else now) - checked >= NODE_CHECK_INTERVAL_SECONDS
+
+
+def enrich_node_check_schedule(tcp_check: dict[str, Any]) -> None:
+    """Attach check cadence metadata used by the dashboard."""
+    tcp_check["check_interval_seconds"] = NODE_CHECK_INTERVAL_SECONDS
+    checked_at = tcp_check.get("checked_at")
+    if not checked_at:
+        return
+    try:
+        checked = datetime.fromisoformat(str(checked_at).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return
+    tcp_check["next_check_at"] = datetime.fromtimestamp(
+        checked.timestamp() + NODE_CHECK_INTERVAL_SECONDS,
+        timezone.utc,
+    ).isoformat()
+
+
+def auto_disable_unreachable_node(node_tag: str, tcp_check: dict[str, Any]) -> dict[str, Any]:
+    """Remove an unavailable SOCKS node from the automatic selector pool."""
+    helper_path = os.environ.get("STRIX_EGRESS_NODE_HELPER", DEFAULT_NODE_CONTROL_HELPER)
+    action = {
+        "action": "auto-disable-node",
+        "node": node_tag,
+        "reason": tcp_check.get("error") or "unreachable",
+        "latency_ms": tcp_check.get("latency_ms"),
+        "ok": False,
+        "returncode": None,
+        "stdout": "",
+        "stderr": "",
+    }
+    if not Path(helper_path).is_file():
+        action["error"] = f"proxy node control helper not installed: {helper_path}"
+        return action
+    result = run_command([helper_path, node_tag, "disable"], allow_sudo=True)
+    action.update(
+        {
+            "ok": result["ok"],
+            "returncode": result["returncode"],
+            "stdout": trim_output(result["stdout"]),
+            "stderr": trim_output(result["stderr"]),
+        }
+    )
+    return action
 
 
 def empty_egress_config() -> dict[str, Any]:

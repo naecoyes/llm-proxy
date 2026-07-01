@@ -268,7 +268,7 @@ export function mountEgress(context) {
       (value) => ({ value }),
       (error) => ({ error }),
     );
-    runtime = await api.runtime(signal, false);
+    runtime = await api.runtime(signal, true);
     usage = null;
     usageError = null;
     render();
