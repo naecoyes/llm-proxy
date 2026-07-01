@@ -1021,6 +1021,16 @@ label.field { display: grid; gap: 6px; color: var(--text-muted); font-size: 12px
   padding: 4px 7px;
 }
 .stale-request-meta { margin-top: 3px; color: var(--text-muted); overflow-wrap: anywhere; }
+.activity-summary-grid { align-items: start; }
+.activity-summary-grid .panel-header { padding: 11px 14px; }
+.activity-summary-grid .panel-body {
+  max-height: 238px;
+  padding: 10px 12px;
+  overflow-y: auto;
+}
+.activity-summary-grid .process-list { gap: 6px; }
+.activity-summary-grid .process-row { padding: 7px 9px; }
+.activity-summary-grid .stale-request-row { padding: 7px 0; }
 .resource-meter { display: grid; gap: 7px; padding: 12px; border: 1px solid var(--border); border-radius: 6px; }
 .resource-meter header { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .resource-meter strong { font-size: 18px; }

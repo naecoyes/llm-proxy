@@ -8,7 +8,7 @@ import { mountAssets } from "./pages/assets.js?v=20260701-assets-history";
 import { mountFindings } from "./pages/findings.js?v=20260701-assets-history";
 import { mountEgress } from "./pages/egress.js";
 import { mountModels } from "./pages/models.js?v=20260623-provider-ui";
-import { mountActivity } from "./pages/activity.js?v=20260630-stability";
+import { mountActivity } from "./pages/activity.js?v=20260701-compact-panels";
 import { mountSettings } from "./pages/settings.js";
 
 const routes = {
