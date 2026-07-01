@@ -85,12 +85,14 @@ function rowActions(item) {
 }
 
 function renderMetrics(summary) {
+  const achieved = summary.achieved ?? summary.archived ?? 0;
   return `<div class="metrics-grid findings-metrics single-row">
     ${metric("Total", fullNumber(summary.total), `${fullNumber(summary.targets)} targets`)}
     ${metric("Critical", fullNumber(summary.critical), "Immediate review", summary.critical ? "critical" : "")}
     ${metric("High", fullNumber(summary.high), "High-impact findings", summary.high ? "warning" : "")}
     ${metric("Unread", fullNumber(summary.unread), `${fullNumber(summary.archived)} archived`)}
     ${metric("Verified", fullNumber(summary.verified), "Confirmed findings")}
+    ${metric("Achieved", fullNumber(achieved), "Completed findings")}
   </div>`;
 }
 
