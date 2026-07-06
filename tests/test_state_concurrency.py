@@ -119,8 +119,8 @@ class RequestLifecycleTests(unittest.TestCase):
     def test_pending_request_from_previous_process_is_interrupted(self):
         with tempfile.TemporaryDirectory() as tmp:
             logger = RequestLogger(tmp)
-            logger.process_started_at = datetime.now()
-            old_timestamp = (datetime.now() - timedelta(minutes=5)).isoformat()
+            logger.process_started_at = datetime.now().astimezone()
+            old_timestamp = (datetime.now().astimezone() - timedelta(minutes=5)).isoformat()
 
             joined = logger.join_logs(
                 [

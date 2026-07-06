@@ -103,7 +103,7 @@ def main() -> int:
     controller = UsageController(config, stats_dir=args.stats_dir)
     files = sorted(Path(args.stats_dir).glob("usage_????-??-??.json"), key=usage_file_sort_key)
     if args.exclude_today:
-        today_name = f"usage_{datetime.now().strftime('%Y-%m-%d')}.json"
+        today_name = f"usage_{datetime.now().astimezone().strftime('%Y-%m-%d')}.json"
         files = [path for path in files if path.name != today_name]
 
     changed_count = 0

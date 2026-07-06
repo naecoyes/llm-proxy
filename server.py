@@ -11,7 +11,7 @@ import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Set
 
@@ -337,7 +337,7 @@ class LLMProxyServer:
                 "provider": "deepseek",
                 "available": False,
                 "error": "",
-                "updated_at": datetime.now().isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
             }
             try:
                 client = self.http_client or httpx.AsyncClient(timeout=10.0)
@@ -1108,7 +1108,7 @@ class LLMProxyServer:
         return {
             "id": anthropic_resp.get("id", ""),
             "object": "chat.completion",
-            "created": int(datetime.now().timestamp()),
+            "created": int(datetime.now(timezone.utc).timestamp()),
             "model": model_id,
             "choices": [
                 {
@@ -1138,9 +1138,9 @@ class LLMProxyServer:
             usage = message.get("usage", {})
             if usage:
                 return {
-                    "id": f"chatcmpl-{int(datetime.now().timestamp())}",
+                    "id": f"chatcmpl-{int(datetime.now(timezone.utc).timestamp())}",
                     "object": "chat.completion.chunk",
-                    "created": int(datetime.now().timestamp()),
+                    "created": int(datetime.now(timezone.utc).timestamp()),
                     "model": model_id,
                     "choices": [
                         {
@@ -1161,9 +1161,9 @@ class LLMProxyServer:
             delta = event.get("delta", {})
             if delta.get("type") == "text_delta":
                 return {
-                    "id": f"chatcmpl-{int(datetime.now().timestamp())}",
+                    "id": f"chatcmpl-{int(datetime.now(timezone.utc).timestamp())}",
                     "object": "chat.completion.chunk",
-                    "created": int(datetime.now().timestamp()),
+                    "created": int(datetime.now(timezone.utc).timestamp()),
                     "model": model_id,
                     "choices": [
                         {
@@ -1179,9 +1179,9 @@ class LLMProxyServer:
             delta = event.get("delta", {})
             usage = event.get("usage", {})
             return {
-                "id": f"chatcmpl-{int(datetime.now().timestamp())}",
+                "id": f"chatcmpl-{int(datetime.now(timezone.utc).timestamp())}",
                 "object": "chat.completion.chunk",
-                "created": int(datetime.now().timestamp()),
+                "created": int(datetime.now(timezone.utc).timestamp()),
                 "model": model_id,
                 "choices": [
                     {
@@ -2206,7 +2206,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
         """检查所有模型连接状态"""
         results = await server.check_all_models()
         return {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "results": results,
             "summary": {
                 "total": len(results),
@@ -2305,7 +2305,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
 
             from datetime import datetime
 
-            re_enable_time = datetime.fromtimestamp(re_enable_timestamp).strftime(
+            re_enable_time = datetime.fromtimestamp(re_enable_timestamp, timezone.utc).astimezone().strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
 
@@ -2618,7 +2618,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
             "health": "normal",
             "scans": scans,
             "resources": resources,
-            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
         }
 
     @app.get("/proxy/dashboard/badges")

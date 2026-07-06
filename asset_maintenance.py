@@ -114,10 +114,12 @@ def rotate_backups(root: Path, keep_daily: int = 14, keep_weekly: int = 8) -> di
     weeks: set[tuple[int, int]] = set()
     for path in files:
         try:
-            date = datetime.strptime(path.stem.removeprefix("nscan-assets-"), "%Y%m%d").date()
+            backup_date = datetime.strptime(
+                path.stem.removeprefix("nscan-assets-"), "%Y%m%d"
+            ).replace(tzinfo=timezone.utc).date()
         except ValueError:
             continue
-        week = date.isocalendar()[:2]
+        week = backup_date.isocalendar()[:2]
         if week not in weeks and len(weeks) < keep_weekly:
             keep.add(path)
             weeks.add(week)
