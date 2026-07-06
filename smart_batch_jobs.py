@@ -181,7 +181,8 @@ class SmartBatchJobManager:
         stdout_handle = stdout_file.open("a", encoding="utf-8")
         stderr_handle = stderr_file.open("a", encoding="utf-8")
         try:
-            process = subprocess.Popen(
+            # `args` is assembled from validated job options and a fixed interpreter.
+            process = subprocess.Popen(  # noqa: S603
                 args,
                 cwd=str(self.paths.project_root),
                 env=env,

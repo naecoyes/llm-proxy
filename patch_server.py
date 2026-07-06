@@ -1,10 +1,8 @@
-import re
-
 with open("server.py", "r") as f:
     content = f.read()
 
 # 1. Add _get_mimo_free_token
-mimo_token_func = """
+mimo_auth_patch = """
     async def _get_mimo_free_token(self) -> str:
         \"\"\"动态获取 Mimo Free API 的 JWT Token\"\"\"
         if not hasattr(self, "_mimo_free_token") or not hasattr(self, "_mimo_free_token_expiry"):
@@ -34,7 +32,7 @@ mimo_token_func = """
 
     async def forward_request(
 """
-content = content.replace("    async def forward_request(", mimo_token_func)
+content = content.replace("    async def forward_request(", mimo_auth_patch)
 
 
 # 2. Modify _forward_openai

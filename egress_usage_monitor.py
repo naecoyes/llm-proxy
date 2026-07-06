@@ -576,7 +576,8 @@ def parse_time(value: Any) -> float | None:
 
 def run_command(args: list[str], timeout: int) -> dict[str, Any]:
     try:
-        completed = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+        # Callers provide fixed Docker/host inspection commands, never request data.
+        completed = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)  # noqa: S603
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"returncode": 124, "stdout": "", "stderr": str(exc)}
     return {"returncode": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr}

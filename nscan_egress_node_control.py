@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -48,8 +49,11 @@ def write_atomic(config: dict, mode: int) -> None:
 
 
 def restart_service() -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["systemctl", "restart", SERVICE_NAME],
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        fail("systemctl command not found")
+    return subprocess.run(  # noqa: S603
+        [systemctl, "restart", SERVICE_NAME],
         capture_output=True,
         text=True,
         timeout=15,

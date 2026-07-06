@@ -691,7 +691,8 @@ def run_command(
             }
         command = ["sudo", "-n", *command]
     try:
-        completed = subprocess.run(
+        # Commands are selected internally from the runtime inspection allowlist.
+        completed = subprocess.run(  # noqa: S603
             command,
             capture_output=True,
             text=True,

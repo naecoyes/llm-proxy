@@ -1,3 +1,4 @@
+# ruff: noqa: S608
 """SQLite WAL asset inventory for Nscan.
 
 The database stores structured metadata only. Raw Strix reports, SDK databases,
@@ -13,7 +14,6 @@ import json
 import os
 import sqlite3
 import threading
-import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -697,8 +697,10 @@ class AssetDatabase:
             params.append(str(reason))
         clause = " WHERE " + " AND ".join(where) if where else ""
         with self.connect() as connection:
-            total = int(connection.execute(f"SELECT COUNT(*) FROM target_quarantine{clause}", params).fetchone()[0])
-            rows = connection.execute(
+            # `clause` is assembled only from fixed column predicates above;
+            # all user-provided values remain bound parameters.
+            total = int(connection.execute(f"SELECT COUNT(*) FROM target_quarantine{clause}", params).fetchone()[0])  # noqa: S608
+            rows = connection.execute(  # noqa: S608
                 f"""
                 SELECT *
                 FROM target_quarantine{clause}
@@ -1075,7 +1077,8 @@ class AssetDatabase:
         safe_limit = max(1, min(int(limit), 10000))
         with self.connect() as connection:
             requests = connection.execute(
-                f"SELECT * FROM llm_requests WHERE {' AND '.join(where)} ORDER BY requested_at DESC LIMIT ?",
+                # `where` contains only fixed predicates selected by this method.
+                f"SELECT * FROM llm_requests WHERE {' AND '.join(where)} ORDER BY requested_at DESC LIMIT ?",  # noqa: S608
                 [*params, safe_limit],
             ).fetchall()
             request_ids = [str(row["request_id"]) for row in requests]
@@ -1083,11 +1086,11 @@ class AssetDatabase:
                 return []
             placeholders = ",".join("?" for _ in request_ids)
             responses = {str(row["request_id"]): row for row in connection.execute(
-                f"SELECT * FROM llm_responses WHERE request_id IN ({placeholders})", request_ids
+                f"SELECT * FROM llm_responses WHERE request_id IN ({placeholders})", request_ids  # noqa: S608
             )}
             switches: dict[str, list[sqlite3.Row]] = {}
             for row in connection.execute(
-                f"SELECT * FROM model_switches WHERE request_id IN ({placeholders}) ORDER BY switched_at", request_ids
+                f"SELECT * FROM model_switches WHERE request_id IN ({placeholders}) ORDER BY switched_at", request_ids  # noqa: S608
             ):
                 switches.setdefault(str(row["request_id"]), []).append(row)
         events: list[dict[str, Any]] = []
@@ -1327,8 +1330,9 @@ class AssetDatabase:
             params.append(str(group))
         clause = " WHERE " + " AND ".join(where)
         with self.connect() as connection:
-            total = int(connection.execute(f"SELECT COUNT(*) FROM assets a{clause}", params).fetchone()[0])
-            rows = connection.execute(
+            # `clause` is composed from fixed predicates; values are parameterized.
+            total = int(connection.execute(f"SELECT COUNT(*) FROM assets a{clause}", params).fetchone()[0])  # noqa: S608
+            rows = connection.execute(  # noqa: S608
                 f"""
                 SELECT
                   a.id,
@@ -1453,8 +1457,9 @@ class AssetDatabase:
             "findings": "a.finding_count DESC, a.target ASC",
         }.get(sort, "a.last_seen DESC, a.target ASC")
         with self.connect() as connection:
-            total = int(connection.execute(f"SELECT COUNT(*) FROM assets a{clause}", params).fetchone()[0])
-            rows = connection.execute(
+            # Both `clause` and `order` come from fixed allowlists above.
+            total = int(connection.execute(f"SELECT COUNT(*) FROM assets a{clause}", params).fetchone()[0])  # noqa: S608
+            rows = connection.execute(  # noqa: S608
                 f"""SELECT a.*,
                 (SELECT GROUP_CONCAT(ip, ', ') FROM (SELECT ip FROM asset_addresses x WHERE x.asset_id=a.id ORDER BY x.last_seen DESC LIMIT 4)) AS addresses,
                 (SELECT GROUP_CONCAT(platform, ', ') FROM (

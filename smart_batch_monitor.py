@@ -251,14 +251,17 @@ def terminate_smart_batch(batch_id: str, source: str = "dashboard") -> dict[str,
 
     removed_containers: list[str] = []
     try:
-        listed = subprocess.run(
-            ["docker", "ps", "-aq", "--filter", f"label=nscan.batch_id={batch_id}"],
+        docker = shutil.which("docker")
+        if not docker:
+            raise OSError("docker command not found")
+        listed = subprocess.run(  # noqa: S603
+            [docker, "ps", "-aq", "--filter", f"label=nscan.batch_id={batch_id}"],
             capture_output=True, text=True, timeout=10, check=False,
         )
         container_ids = [item for item in listed.stdout.splitlines() if item.strip()]
         if container_ids:
-            removed = subprocess.run(
-                ["docker", "rm", "-f", *container_ids], capture_output=True, text=True, timeout=30, check=False,
+            removed = subprocess.run(  # noqa: S603
+                [docker, "rm", "-f", *container_ids], capture_output=True, text=True, timeout=30, check=False,
             )
             if removed.returncode == 0:
                 removed_containers = container_ids

@@ -14,7 +14,7 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from asset_database import AssetDatabase, normalize_target, now_iso
+from asset_database import AssetDatabase, now_iso
 
 
 DEFAULT_PROJECT = Path(__file__).resolve().parent.parent
