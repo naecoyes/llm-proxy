@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -12,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+
+logger = logging.getLogger(__name__)
 
 try:
     import psutil  # type: ignore[import-untyped]
@@ -136,9 +139,9 @@ def set_smart_batch_parallel(batch_id: str, parallel: int, source: str = "dashbo
         from asset_database import get_asset_database
 
         get_asset_database().record_batch_control(payload)
-    except Exception:
+    except Exception as exc:
         # The control file is authoritative for the running scanner.
-        pass
+        logger.warning("Batch control SQLite mirror failed for %s: %s", batch_id, exc)
 
     updated = dict(batch)
     updated["parallel_control"] = payload

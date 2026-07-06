@@ -12,6 +12,7 @@ import csv
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -24,6 +25,8 @@ import yaml
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response
 
+
+logger = logging.getLogger(__name__)
 
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4, "UNKNOWN": 5}
 VALID_SEVERITIES = set(SEVERITY_ORDER)
@@ -168,10 +171,10 @@ class FindingsService:
                     from asset_database import get_asset_database
 
                     await asyncio.to_thread(get_asset_database().sync_finding_catalog, snapshot.records)
-                except Exception:
+                except Exception as exc:
                     # The file index remains authoritative if the SQLite mirror
                     # cannot be refreshed.
-                    pass
+                    logger.warning("Finding catalog SQLite mirror failed: %s", exc)
                 self._last_signature = signature
                 self._snapshot, self._last_error = snapshot, None
             except Exception as exc:
@@ -435,9 +438,9 @@ class FindingsService:
             from asset_database import get_asset_database
 
             get_asset_database().sync_finding_review_state(state)
-        except Exception:
+        except Exception as exc:
             # The legacy state file remains authoritative if SQLite is unavailable.
-            pass
+            logger.warning("Finding review-state SQLite mirror failed: %s", exc)
 
     @staticmethod
     def _public(record: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:

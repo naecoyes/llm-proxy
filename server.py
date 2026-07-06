@@ -1626,8 +1626,8 @@ document.getElementById("f").addEventListener("submit",async e=>{
                                     chunk_str = chunk.decode() if isinstance(chunk, bytes) else chunk
                                     if chunk_str.strip():
                                         valid_chunk_count += 1
-                                except Exception:
-                                    pass
+                                except (UnicodeDecodeError, AttributeError) as exc:
+                                    logger.debug("Unable to inspect streaming chunk: %s", exc)
                         except (asyncio.CancelledError, GeneratorExit):
                             # Starlette closes the async generator when the
                             # caller disconnects or abandons a stream. On
@@ -1946,8 +1946,8 @@ document.getElementById("f").addEventListener("submit",async e=>{
                     continue
                 try:
                     all_containers.append(_json.loads(line))
-                except Exception:
-                    pass
+                except (TypeError, ValueError, _json.JSONDecodeError) as exc:
+                    logger.debug("Ignoring malformed Docker status row: %s", exc)
 
             strix = [c for c in all_containers if "strix-scan" in c.get("name", "") or "strix-sandbox" in c.get("image", "")]
             other = [c for c in all_containers if "strix-scan" not in c.get("name", "")]
@@ -1971,8 +1971,8 @@ document.getElementById("f").addEventListener("submit",async e=>{
                             if ev.startswith("TARGET=") or ev.startswith("STRIX_TARGET="):
                                 entry["target"] = ev.split("=", 1)[1]
                                 break
-                except Exception:
-                    pass
+                except (OSError, _sp.SubprocessError, KeyError, ValueError) as exc:
+                    logger.debug("Unable to enrich Docker container %s: %s", c.get("id", "unknown"), exc)
                 enriched.append(entry)
 
             running_count = sum(1 for c in strix if c.get("state", "").lower() == "running")
