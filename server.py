@@ -1521,7 +1521,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
         try:
             body = await request.json()
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid request body: {e}") from e
 
         stream = body.get("stream", False)
         requested_model = body.get("model", None)
@@ -1535,7 +1535,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
                     requested_model, scan_context
                 )
             except NoAvailableModelError as e:
-                raise HTTPException(status_code=503, detail=str(e))
+                raise HTTPException(status_code=503, detail=str(e)) from e
 
             # 检查模型是否被禁用（禁用后自动切换）
             if model_name in server.model_manager.disabled_models:
@@ -2006,7 +2006,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
         try:
             body = await request.json()
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Invalid request body: {exc}")
+            raise HTTPException(status_code=400, detail=f"Invalid request body: {exc}") from exc
         return set_strix_egress_enabled(read_enabled_flag(body))
 
     @app.post("/proxy/nscan-runtime/proxy-startup-enabled")
@@ -2016,7 +2016,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
         try:
             body = await request.json()
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Invalid request body: {exc}")
+            raise HTTPException(status_code=400, detail=f"Invalid request body: {exc}") from exc
         return set_strix_egress_startup_enabled(read_enabled_flag(body))
 
     @app.post("/proxy/nscan-runtime/nodes/{node_tag}/enabled")
@@ -2026,9 +2026,9 @@ document.getElementById("f").addEventListener("submit",async e=>{
             body = await request.json()
             return set_strix_egress_node_enabled(node_tag, read_enabled_flag(body))
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
-            raise HTTPException(status_code=503, detail=str(exc))
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @app.post("/proxy/nscan-runtime/proxy-restart")
     @app.post("/proxy/strix-runtime/proxy-restart")
@@ -2254,7 +2254,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
             server._save_config()
             return {"message": "Config updated"}
         except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
     @app.post("/proxy/models/{model_name}/schedule-re-enable")
     async def schedule_model_re_enable(model_name: str, request: Request):
@@ -2318,7 +2318,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
     @app.get("/proxy/ip-whitelist")
     async def get_ip_whitelist():
@@ -2349,7 +2349,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
     @app.post("/proxy/ip-whitelist/remove")
     async def remove_ip_whitelist(request: Request):
@@ -2372,7 +2372,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
     @app.post("/proxy/models/{model_name:path}/enable")
     async def enable_model(model_name: str):
@@ -2406,12 +2406,12 @@ document.getElementById("f").addEventListener("submit",async e=>{
         try:
             body = await request.json()
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Invalid request body: {exc}")
+            raise HTTPException(status_code=400, detail=f"Invalid request body: {exc}") from exc
         mode = str(body.get("mode", ""))
         try:
             server.model_manager.set_routing_mode(mode)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         server.model_manager.save_config(str(server.config_path))
         return {
             "message": f"Model routing mode set to {mode}",
@@ -2467,7 +2467,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
     @app.put("/proxy/models/{model_name}")
     async def update_model(model_name: str, request: Request):
@@ -2518,7 +2518,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
         except HTTPException:
             raise
         except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
     @app.delete("/proxy/models/{model_name}")
     async def delete_model(model_name: str):
@@ -2686,9 +2686,9 @@ document.getElementById("f").addEventListener("submit",async e=>{
                 raise ValueError("tag is required")
             return await asyncio.to_thread(upsert_strix_egress_node, node_tag, body)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
-            raise HTTPException(status_code=503, detail=str(exc))
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @app.put("/proxy/nscan-runtime/nodes/{node_tag}")
     async def proxy_nscan_runtime_node_update(node_tag: str, request: Request):
@@ -2696,18 +2696,18 @@ document.getElementById("f").addEventListener("submit",async e=>{
             body = await request.json()
             return await asyncio.to_thread(upsert_strix_egress_node, node_tag, body)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
-            raise HTTPException(status_code=503, detail=str(exc))
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @app.delete("/proxy/nscan-runtime/nodes/{node_tag}")
     async def proxy_nscan_runtime_node_delete(node_tag: str):
         try:
             return await asyncio.to_thread(delete_strix_egress_node, node_tag)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
-            raise HTTPException(status_code=503, detail=str(exc))
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @app.post("/proxy/nscan-runtime/nodes/test")
     async def proxy_nscan_runtime_nodes_test(request: Request):
@@ -2715,7 +2715,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
             body = await request.json()
             return await asyncio.to_thread(test_strix_egress_node, body)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/proxy/security/pin")
     @app.put("/proxy/security/pin")
@@ -2759,49 +2759,49 @@ document.getElementById("f").addEventListener("submit",async e=>{
         try:
             return await asyncio.to_thread(_job_manager.job_report, job_id)
         except KeyError:
-            raise HTTPException(status_code=404, detail="Smart Batch job not found")
+            raise HTTPException(status_code=404, detail="Smart Batch job not found") from None
 
     @app.get("/proxy/smart-batch/jobs/{job_id}/logs")
     async def proxy_smart_batch_job_logs(job_id: str, tail: int = Query(200, ge=1, le=1000)):
         try:
             return await asyncio.to_thread(_job_manager.job_logs, job_id, tail)
         except KeyError:
-            raise HTTPException(status_code=404, detail="Smart Batch job not found")
+            raise HTTPException(status_code=404, detail="Smart Batch job not found") from None
 
     @app.post("/proxy/smart-batch/jobs")
     async def proxy_smart_batch_jobs_submit(request: Request):
         try:
             payload = await request.json()
         except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON body")
+            raise HTTPException(status_code=400, detail="Invalid JSON body") from None
         try:
             return await asyncio.to_thread(_job_manager.submit, payload)
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
             logger.exception("smart batch submit error")
-            raise HTTPException(status_code=500, detail=str(exc))
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/proxy/smart-batch/jobs/preview")
     async def proxy_smart_batch_jobs_preview(request: Request):
         try:
             payload = await request.json()
         except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON body")
+            raise HTTPException(status_code=400, detail="Invalid JSON body") from None
         try:
             return await asyncio.to_thread(_job_manager.preview, payload)
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
             logger.exception("smart batch preview error")
-            raise HTTPException(status_code=500, detail=str(exc))
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/proxy/target-ingest")
     async def proxy_target_ingest(request: Request):
         try:
             payload = await request.json()
         except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON body")
+            raise HTTPException(status_code=400, detail="Invalid JSON body") from None
         if not isinstance(payload, dict):
             raise HTTPException(status_code=422, detail="JSON body must be an object")
         platform = str(payload.get("platform") or "").strip()
@@ -2823,10 +2823,10 @@ document.getElementById("f").addEventListener("submit",async e=>{
         try:
             preview = await asyncio.to_thread(_job_manager.preview, ingest_payload)
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
             logger.exception("target ingest preview error")
-            raise HTTPException(status_code=500, detail=str(exc))
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         accepted_targets = list(preview.get("accepted_targets") or [])
         rejected_targets = list(preview.get("rejected_targets") or [])
@@ -2851,10 +2851,10 @@ document.getElementById("f").addEventListener("submit",async e=>{
             try:
                 job = await asyncio.to_thread(_job_manager.submit, submit_payload)
             except ValueError as exc:
-                raise HTTPException(status_code=422, detail=str(exc))
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
             except Exception as exc:
                 logger.exception("target ingest submit error")
-                raise HTTPException(status_code=500, detail=str(exc))
+                raise HTTPException(status_code=500, detail=str(exc)) from exc
 
         db = get_asset_database()
         ingest_record = await asyncio.to_thread(
@@ -2906,12 +2906,12 @@ document.getElementById("f").addEventListener("submit",async e=>{
         try:
             body = await request.json()
         except (json.JSONDecodeError, ValueError):
-            raise HTTPException(status_code=400, detail="Invalid JSON body")
+            raise HTTPException(status_code=400, detail="Invalid JSON body") from None
 
         try:
             requested = int(body.get("parallel"))
         except (AttributeError, TypeError, ValueError):
-            raise HTTPException(status_code=422, detail="parallel must be an integer")
+            raise HTTPException(status_code=422, detail="parallel must be an integer") from None
 
         if requested < 1 or requested > 32:
             raise HTTPException(status_code=422, detail="parallel must be between 1 and 32")
@@ -2926,10 +2926,10 @@ document.getElementById("f").addEventListener("submit",async e=>{
         except ValueError as exc:
             message = str(exc)
             if "not found" in message:
-                raise HTTPException(status_code=404, detail=message)
+                raise HTTPException(status_code=404, detail=message) from exc
             if "finished" in message:
-                raise HTTPException(status_code=409, detail=message)
-            raise HTTPException(status_code=422, detail=message)
+                raise HTTPException(status_code=409, detail=message) from exc
+            raise HTTPException(status_code=422, detail=message) from exc
 
         control = updated.get("parallel_control") or {}
         return {
@@ -2951,16 +2951,16 @@ document.getElementById("f").addEventListener("submit",async e=>{
             updated = await asyncio.to_thread(set_smart_batch_paused, batch_id, paused, "dashboard")
             return {"status": "paused" if paused else "running", "batch_id": batch_id, "paused": paused, "requested_at": (updated.get("pause_control") or {}).get("requested_at")}
         except ValueError as exc:
-            raise HTTPException(status_code=409 if "finished" in str(exc) else 404, detail=str(exc))
+            raise HTTPException(status_code=409 if "finished" in str(exc) else 404, detail=str(exc)) from exc
 
     @app.post("/proxy/smart-batch/status/{batch_id}/terminate")
     async def proxy_smart_batch_terminate(batch_id: str):
         try:
             return await asyncio.to_thread(terminate_smart_batch, batch_id, "dashboard")
         except ValueError as exc:
-            raise HTTPException(status_code=409 if "finished" in str(exc) else 404, detail=str(exc))
+            raise HTTPException(status_code=409 if "finished" in str(exc) else 404, detail=str(exc)) from exc
         except RuntimeError as exc:
-            raise HTTPException(status_code=503, detail=str(exc))
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @app.delete("/proxy/smart-batch/status/{batch_id}")
     async def proxy_smart_batch_delete(batch_id: str):
@@ -2968,7 +2968,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
             return await asyncio.to_thread(delete_smart_batch, batch_id, "dashboard")
         except ValueError as exc:
             message = str(exc)
-            raise HTTPException(status_code=409 if "terminate" in message else 404, detail=message)
+            raise HTTPException(status_code=409 if "terminate" in message else 404, detail=message) from exc
 
     @app.get("/proxy/scanned-targets")
     async def proxy_scanned_targets(

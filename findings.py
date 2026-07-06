@@ -766,16 +766,16 @@ def create_findings_router(service: FindingsService) -> APIRouter:
         try:
             return await service.record(record_id)
         except KeyError:
-            raise HTTPException(status_code=404, detail="Finding not found")
+            raise HTTPException(status_code=404, detail="Finding not found") from None
 
     @router.get("/proxy/vulnerabilities/{record_id}/content")
     async def content(record_id: str, download: bool = False):
         try:
             filename, markdown = await service.record_content(record_id)
         except FileNotFoundError:
-            raise HTTPException(status_code=404, detail="Finding report is not available")
+            raise HTTPException(status_code=404, detail="Finding report is not available") from None
         except ValueError as exc:
-            raise HTTPException(status_code=413, detail=str(exc))
+            raise HTTPException(status_code=413, detail=str(exc)) from exc
         if download:
             return Response(content=markdown.encode(), media_type="text/markdown", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
         return {"filename": filename, "content": markdown}
@@ -785,7 +785,7 @@ def create_findings_router(service: FindingsService) -> APIRouter:
         try:
             return await service.update_state([record_id], await request.json())
         except KeyError:
-            raise HTTPException(status_code=404, detail="Finding not found")
+            raise HTTPException(status_code=404, detail="Finding not found") from None
 
     @router.post("/proxy/vulnerabilities/bulk-state")
     async def bulk_state(request: Request):
@@ -793,7 +793,7 @@ def create_findings_router(service: FindingsService) -> APIRouter:
         try:
             return await service.update_state(payload.get("record_ids") or [], payload.get("actions") or {})
         except KeyError:
-            raise HTTPException(status_code=404, detail="No matching findings")
+            raise HTTPException(status_code=404, detail="No matching findings") from None
 
     @router.post("/proxy/vulnerabilities/autoclean")
     async def autoclean(request: Request):
@@ -808,7 +808,7 @@ def create_findings_router(service: FindingsService) -> APIRouter:
         try:
             filename, markdown = await service.report_content(report_id)
         except FileNotFoundError:
-            raise HTTPException(status_code=404, detail="Report not found")
+            raise HTTPException(status_code=404, detail="Report not found") from None
         if download:
             return Response(content=markdown.encode(), media_type="text/markdown", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
         return {"filename": filename, "content": markdown}
