@@ -6,7 +6,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict
 from functools import wraps
@@ -80,7 +80,7 @@ class UsageController:
         self._update_config(config)
 
         # 加载今日统计
-        self.current_date = datetime.now().strftime("%Y-%m-%d")
+        self.current_date = datetime.now().astimezone().strftime("%Y-%m-%d")
         self._load_daily_stats()
 
     def _update_config(self, config: dict):
@@ -111,7 +111,7 @@ class UsageController:
 
     def _get_monthly_stats_file(self) -> Path:
         """获取本月统计文件路径"""
-        month = datetime.now().strftime("%Y-%m")
+        month = datetime.now().astimezone().strftime("%Y-%m")
         return self.stats_dir / f"usage_monthly_{month}.json"
 
     def _get_hour_slot(self, hour: int = None) -> str:
@@ -124,7 +124,7 @@ class UsageController:
             时段标签，如 "0", "1", "2", ..., "23"
         """
         if hour is None:
-            hour = datetime.now().hour
+            hour = datetime.now().astimezone().hour
         return str(hour)
 
     def _load_daily_stats(self):
@@ -149,7 +149,7 @@ class UsageController:
                 self.daily_stats["total"] = UsageStats(**data.get("total", {}))
 
                 # 加载每小时数据（只加载当前小时之前的）
-                current_hour = datetime.now().hour
+                current_hour = datetime.now().astimezone().hour
                 for slot, slot_data in data.get("hourly", {}).items():
                     slot_hour = int(slot)
                     if slot_hour < current_hour:
@@ -194,7 +194,7 @@ class UsageController:
 
     def _ensure_current_day(self):
         """Roll in-memory daily limits and counters at local midnight."""
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
         if today == self.current_date:
             return
 
@@ -489,7 +489,7 @@ class UsageController:
             if len(date_part) != 10:
                 continue
             try:
-                datetime.strptime(date_part, "%Y-%m-%d")
+                date.fromisoformat(date_part)
                 with open(stats_file, "r") as f:
                     historical[date_part] = json.load(f)
             except Exception as e:
@@ -630,7 +630,7 @@ class UsageController:
             日期 -> 数据 的字典
         """
         result = {}
-        today = datetime.now()
+        today = datetime.now().astimezone()
 
         for i in range(days):
             date = today - timedelta(days=i)
@@ -793,8 +793,8 @@ class UsageController:
                     "requests": [0] * len(dates),
                 }
 
-            for i, date in enumerate(dates):
-                model_stats = historical[date].get("models", {}).get(model_name, {})
+            for i, day_key in enumerate(dates):
+                model_stats = historical[day_key].get("models", {}).get(model_name, {})
                 provider_data[provider]["tokens"][i] += model_stats.get("tokens", 0)
                 provider_data[provider]["input_tokens"][i] += model_stats.get(
                     "input_tokens", 0

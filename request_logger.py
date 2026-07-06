@@ -3,7 +3,7 @@
 import json
 import logging
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -50,9 +50,9 @@ class RequestLogger:
             log_dir = Path(__file__).parent / "logs"
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.process_started_at = datetime.now()
+        self.process_started_at = datetime.now().astimezone()
         self._setup_file_logger()
-        self._current_date = datetime.now().strftime("%Y-%m-%d")
+        self._current_date = datetime.now().astimezone().strftime("%Y-%m-%d")
 
     def _setup_file_logger(self):
         """设置文件日志记录器"""
@@ -62,7 +62,7 @@ class RequestLogger:
         # 避免重复添加 handler
         if not self.file_logger.handlers:
             # 按日期命名日志文件
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = datetime.now().astimezone().strftime("%Y-%m-%d")
             log_file = self.log_dir / f"requests_{today}.log"
 
             handler = logging.FileHandler(log_file, encoding="utf-8")
@@ -75,7 +75,7 @@ class RequestLogger:
 
     def _rotate_if_needed(self):
         """按日期轮转日志文件"""
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
         if today != self._current_date:
             self._current_date = today
             # 移除旧的 handler
@@ -116,7 +116,7 @@ class RequestLogger:
         self._rotate_if_needed()
         entry = {
             "type": "request",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now().astimezone().isoformat(),
             "request_id": request_id,
             "client_ip": client_ip,
             "requested_model": requested_model,
@@ -144,7 +144,7 @@ class RequestLogger:
         self._rotate_if_needed()
         entry = {
             "type": "response",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now().astimezone().isoformat(),
             "request_id": request_id,
             "model_name": model_name,
             "duration_seconds": round(duration, 3),
@@ -167,7 +167,7 @@ class RequestLogger:
         self._rotate_if_needed()
         entry = {
             "type": "model_switch",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now().astimezone().isoformat(),
             "request_id": request_id,
             "from_model": from_model,
             "to_model": to_model,
@@ -203,8 +203,8 @@ class RequestLogger:
             from asset_database import get_asset_database
 
             db_logs = get_asset_database().read_llm_events(
-                start_date=log_files[0].stem.removeprefix("requests_") if log_files else datetime.now().date().isoformat(),
-                end_date=log_files[-1].stem.removeprefix("requests_") if log_files else datetime.now().date().isoformat(),
+                start_date=log_files[0].stem.removeprefix("requests_") if log_files else datetime.now().astimezone().date().isoformat(),
+                end_date=log_files[-1].stem.removeprefix("requests_") if log_files else datetime.now().astimezone().date().isoformat(),
                 limit=safe_limit,
                 scan_id=scan_id or "",
                 proxy_slot=proxy_slot or "",
@@ -373,15 +373,15 @@ class RequestLogger:
             dates = [start + timedelta(days=offset) for offset in range(span)]
         else:
             safe_days = max(1, min(int(days or 1), 31))
-            today = datetime.now().date()
+            today = datetime.now().astimezone().date()
             dates = [today - timedelta(days=offset) for offset in range(safe_days)]
             dates.reverse()
         return [self.log_dir / f"requests_{day.isoformat()}.log" for day in dates]
 
     def _parse_date(self, value: str | None):
         if not value:
-            return datetime.now().date()
-        return datetime.strptime(value, "%Y-%m-%d").date()
+            return datetime.now().astimezone().date()
+        return date.fromisoformat(value)
 
 
 # 全局请求日志记录器实例

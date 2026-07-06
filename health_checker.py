@@ -5,7 +5,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -390,7 +390,7 @@ class HealthChecker:
         self.health_state[model_name] = state
         self._save_health_state()
 
-        re_enable_time = datetime.fromtimestamp(re_enable_at).strftime(
+        re_enable_time = datetime.fromtimestamp(re_enable_at, timezone.utc).astimezone().strftime(
             "%Y-%m-%d %H:%M:%S"
         )
         logger.info(
@@ -571,7 +571,8 @@ class HealthChecker:
                     if "T" in time_str:
                         dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
                     else:
-                        dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+                        local_tz = datetime.now().astimezone().tzinfo
+                        dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=local_tz)
                     return dt.timestamp()
                 except Exception as e:
                     logger.warning(f"解析时间失败: {time_str} - {e}")
@@ -597,7 +598,7 @@ class HealthChecker:
 
             from datetime import datetime
 
-            reset_time_str = datetime.fromtimestamp(reset_time).strftime(
+            reset_time_str = datetime.fromtimestamp(reset_time, timezone.utc).astimezone().strftime(
                 "%Y-%m-%d %H:%M:%S"
             )
             logger.info(f"⏰ 模型 {model_name} 将在 {reset_time_str} 自动重新启用")
@@ -677,7 +678,7 @@ class HealthChecker:
         """格式化时间戳"""
         if timestamp <= 0:
             return "N/A"
-        return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.fromtimestamp(timestamp, timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
     @synchronized_state
     def get_health_report(self) -> dict:

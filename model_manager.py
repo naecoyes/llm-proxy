@@ -4,6 +4,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass, field
+from datetime import timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from health_checker import HealthChecker
@@ -937,7 +938,7 @@ class ModelManager:
                 # 有重置时间，设置定时重新启用
                 from datetime import datetime
 
-                reset_time_str = datetime.fromtimestamp(reset_time).strftime(
+                reset_time_str = datetime.fromtimestamp(reset_time, timezone.utc).astimezone().strftime(
                     "%Y-%m-%d %H:%M:%S"
                 )
                 logger.warning(
