@@ -11,3 +11,9 @@ venv/
 proxy_config.yaml
 llm_proxy.pid
 proxy.log
+proxy_local.log
+runtime/
+backups/
+._*
+*.bak
+*.bak-*

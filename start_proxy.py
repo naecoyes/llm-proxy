@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LLM Proxy 启动脚本"""
+"""Nscan Proxy 启动脚本"""
 
 import argparse
 import logging
@@ -19,7 +19,7 @@ def setup_logging(level: str = "info"):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="LLM Proxy Server")
+    parser = argparse.ArgumentParser(description="Nscan Proxy Server")
     parser.add_argument(
         "--config",
         "-c",
@@ -69,10 +69,15 @@ def main():
     setup_logging(log_level)
 
     logger = logging.getLogger(__name__)
-    logger.info("启动 LLM Proxy Server")
+    logger.info("启动 Nscan Proxy Server")
     logger.info(f"配置文件: {config_path.absolute()}")
     logger.info(f"监听地址: {host}:{port}")
     logger.info(f"日志级别: {log_level}")
+
+    # 设置环境变量跳过所有 LLM 的代理
+    import os
+    os.environ["NO_PROXY"] = "*"
+    os.environ["no_proxy"] = "*"
 
     # 创建应用
     from server import create_app

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="OpenCode Go">
+  <rect width="64" height="64" rx="14" fill="#101828"/>
+  <path d="M18 32 30 20l4 4-8 8 8 8-4 4L18 32Z" fill="#38bdf8"/>
+  <path d="M46 32 34 20l-4 4 8 8-8 8 4 4 12-12Z" fill="#a7f3d0"/>
+  <circle cx="32" cy="32" r="4" fill="#ffffff"/>
+</svg>

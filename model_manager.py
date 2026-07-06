@@ -2,8 +2,9 @@
 
 import logging
 import random
+import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from health_checker import HealthChecker
 from time_controller import TimeController
@@ -31,6 +32,10 @@ class ModelConfig:
     custom_headers: dict = field(default_factory=dict)
     strip_provider_prefix: bool = True
     no_auto_disable: bool = False
+    routing_tier: str = "standard"
+    allowed_scan_modes: list = field(default_factory=list)
+    quota_policy: dict = field(default_factory=dict)
+    max_context_tokens: int = 0
 
 
 class NoAvailableModelError(Exception):
@@ -43,9 +48,11 @@ class ModelManager:
     """模型选择和路由"""
 
     AUTO_REENABLE_SECONDS = 1800  # 30 分钟后自动重新启用
+    ROUTING_MODES = {"balanced_all", "priority"}
 
     def __init__(self, config: dict, stats_dir: str = "stats"):
         self.config = config
+        self.config_path: Optional[str] = None
         self.models: Dict[str, ModelConfig] = {}
         self.disabled_models: set = set()
         self.disabled_until: Dict[str, float] = {}  # model_name -> re-enable timestamp
@@ -105,6 +112,14 @@ class ModelManager:
                 custom_headers=model_conf.get("custom_headers", {}),
                 strip_provider_prefix=model_conf.get("strip_provider_prefix", True),
                 no_auto_disable=model_conf.get("no_auto_disable", False),
+                routing_tier=model_conf.get("routing_tier", "standard"),
+                allowed_scan_modes=model_conf.get("allowed_scan_modes", []),
+                quota_policy=model_conf.get("quota_policy", {}),
+                max_context_tokens=int(
+                    model_conf.get("max_context_tokens")
+                    or model_conf.get("context_window")
+                    or 0
+                ),
             )
 
             self.models[name] = model
@@ -121,6 +136,8 @@ class ModelManager:
     def update_config(self, config: dict):
         """热更新配置"""
         self.config = config
+        self._available_cache = None
+        self._available_cache_ts = 0
         self._load_providers(config)
         self._load_models(config)
         self.time_controller.update_config(config)
@@ -173,6 +190,120 @@ class ModelManager:
         self._available_cache = result
         self._available_cache_ts = now
         return result
+
+    def get_model_routing_status(
+        self, model_name: str, routing_context: Optional[dict] = None
+    ) -> dict[str, Any]:
+        """Return whether a model may participate in automatic routing."""
+        model = self.models.get(model_name)
+        if not model:
+            return {"eligible": False, "reason": "model_not_found"}
+
+        health_state = self.health_checker.health_state.get(model_name)
+        health_reason = health_state.reason if health_state else ""
+        health_next_probe_at = health_state.next_probe_at if health_state else 0.0
+        if not model.enabled or model_name in self.disabled_models:
+            return {
+                "eligible": False,
+                "reason": "disabled",
+                "health_reason": health_reason,
+                "health_next_probe_at": health_next_probe_at,
+            }
+        if not self.health_checker.is_healthy(model_name):
+            return {
+                "eligible": False,
+                "reason": "unhealthy",
+                "health_reason": health_reason,
+                "health_next_probe_at": health_next_probe_at,
+            }
+        if not self.usage_controller.check_budget(model_name):
+            return {
+                "eligible": False,
+                "reason": "budget_limit_reached",
+                "health_reason": health_reason,
+            }
+        if self.usage_controller.check_rate_limit(model_name, log=False):
+            return {
+                "eligible": False,
+                "reason": "rate_or_concurrency_limited",
+                "health_reason": health_reason,
+            }
+
+        scan_mode = str((routing_context or {}).get("scan_mode") or "").lower()
+        allowed_modes = [str(mode).lower() for mode in model.allowed_scan_modes]
+        if model.routing_tier == "reserve" and not scan_mode:
+            return {
+                "eligible": False,
+                "reason": "scan_mode_required",
+                "scan_mode": scan_mode,
+                "allowed_scan_modes": allowed_modes,
+            }
+        if allowed_modes and scan_mode not in allowed_modes:
+            reason = "scan_mode_not_allowed" if scan_mode else "scan_mode_required"
+            return {
+                "eligible": False,
+                "reason": reason,
+                "scan_mode": scan_mode,
+                "allowed_scan_modes": allowed_modes,
+            }
+
+        required_context = int(
+            (routing_context or {}).get("required_context_tokens")
+            or (32768 if scan_mode == "redteam" else 0)
+            or 0
+        )
+        if model.max_context_tokens and required_context and model.max_context_tokens < required_context:
+            return {
+                "eligible": False,
+                "reason": "context_window_too_small",
+                "scan_mode": scan_mode,
+                "allowed_scan_modes": allowed_modes,
+                "required_context_tokens": required_context,
+                "max_context_tokens": model.max_context_tokens,
+            }
+
+        quota_policy = model.quota_policy or {}
+        auto_disable_at = float(quota_policy.get("auto_disable_at_percent", 100))
+        usage_values = [
+            float(quota_policy.get(key, 0) or 0)
+            for key in (
+                "current_period_percent",
+                "weekly_percent",
+                "monthly_percent",
+            )
+        ]
+        highest_usage = max(usage_values, default=0.0)
+        if quota_policy.get("limited", False) and highest_usage >= auto_disable_at:
+            return {
+                "eligible": False,
+                "reason": "quota_soft_limit_reached",
+                "usage_percent": highest_usage,
+                "auto_disable_at_percent": auto_disable_at,
+                "allowed_scan_modes": allowed_modes,
+            }
+
+        return {
+            "eligible": True,
+            "reason": "",
+            "scan_mode": scan_mode,
+            "allowed_scan_modes": allowed_modes,
+            "health_reason": health_reason,
+            "health_next_probe_at": health_next_probe_at,
+            "usage_percent": highest_usage,
+            "auto_disable_at_percent": auto_disable_at,
+            "max_context_tokens": model.max_context_tokens,
+            "required_context_tokens": required_context,
+        }
+
+    def _filter_by_routing_policy(
+        self, model_names: List[str], routing_context: Optional[dict]
+    ) -> List[str]:
+        """Filter automatic candidates by scan mode and plan quota policy."""
+        return [
+            name
+            for name in model_names
+            if self.get_model_routing_status(name, routing_context)["eligible"]
+        ]
 
     def _get_provider_models(self, provider: str) -> List[str]:
         """获取指定 provider 的所有模型名称"""
@@ -295,7 +426,23 @@ class ModelManager:
 
         return sorted(model_names, key=get_priority)
 
-    def select_model(self, requested_model: str = None) -> Tuple[str, ModelConfig]:
+    def get_routing_mode(self) -> str:
+        """Return the configured automatic routing mode."""
+        mode = str(self.config.get("models", {}).get("routing_mode", "balanced_all"))
+        return mode if mode in self.ROUTING_MODES else "balanced_all"
+
+    def set_routing_mode(self, mode: str):
+        """Update automatic routing without changing individual model switches."""
+        if mode not in self.ROUTING_MODES:
+            raise ValueError(f"Unsupported routing mode: {mode}")
+        self.config.setdefault("models", {})["routing_mode"] = mode
+        with self._select_lock:
+            self._slot_model_map.clear()
+        logger.info("模型路由模式已更新: %s", mode)
+
+    def select_model(
+        self, requested_model: str = None, routing_context: Optional[dict] = None
+    ) -> Tuple[str, ModelConfig]:
         """选择最优模型
 
         Args:
@@ -311,9 +458,11 @@ class ModelManager:
             NoAvailableModelError: 没有可用的模型
         """
         with self._select_lock:
-            return self._do_select_model(requested_model)
+            return self._do_select_model(requested_model, routing_context)
 
-    def _do_select_model(self, requested_model: str = None) -> Tuple[str, ModelConfig]:
+    def _do_select_model(
+        self, requested_model: str = None, routing_context: Optional[dict] = None
+    ) -> Tuple[str, ModelConfig]:
         """内部模型选择逻辑（需在 _select_lock 下调用）"""
         # 支持 auto1, auto2, auto3 等固定分配
         if (
@@ -323,8 +472,10 @@ class ModelManager:
         ):
             try:
                 slot = int(requested_model[4:])  # 提取 auto 后面的数字
-                name, config = self._select_by_slot(slot)
-                self.usage_controller.acquire_model(name, force=True)
+                name, config = self._select_by_slot(slot, routing_context)
+                if not self.usage_controller.acquire_model(name):
+                    self._slot_model_map.pop(slot, None)
+                    raise NoAvailableModelError(f"模型 {name} 并发已满，请稍后重试")
                 return name, config
             except (ValueError, IndexError):
                 pass
@@ -338,7 +489,8 @@ class ModelManager:
             ):
                 model = self.models[requested_model]
                 if model.enabled:
-                    self.usage_controller.acquire_model(requested_model)
+                    if not self.usage_controller.acquire_model(requested_model):
+                        raise NoAvailableModelError(f"模型 {requested_model} 并发已满，请稍后重试")
                     return requested_model, model
 
             # 尝试匹配模型ID
@@ -348,15 +500,17 @@ class ModelManager:
                     and name not in self.disabled_models
                     and model.enabled
                 ):
-                    self.usage_controller.acquire_model(name)
+                    if not self.usage_controller.acquire_model(name):
+                        raise NoAvailableModelError(f"模型 {name} 并发已满，请稍后重试")
                     return name, model
 
             logger.warning(f"指定的模型 {requested_model} 不可用，使用自动选择")
 
         # 1. 获取所有可用模型
         available = self._get_available_models()
+        available = self._filter_by_routing_policy(available, routing_context)
         if not available:
-            raise NoAvailableModelError("没有可用的模型")
+            raise NoAvailableModelError("没有符合当前扫描模式和额度策略的可用模型")
 
         # 2. 根据时间策略过滤
         time_filtered = self._filter_by_time(available)
@@ -369,18 +523,20 @@ class ModelManager:
         # 如果有需要探测的模型，随机选择一个进行探测
         if probe_ready and random.random() < 0.3:  # 30% 概率进行探测
             probe_model = random.choice(probe_ready)
-            self.health_checker.start_probe(probe_model)
-            self.usage_controller.acquire_model(probe_model)
-            logger.info(f"选择探测模型: {probe_model}")
-            return probe_model, self.models[probe_model]
+            if self.usage_controller.acquire_model(probe_model):
+                self.health_checker.start_probe(probe_model)
+                logger.info(f"选择探测模型: {probe_model}")
+                return probe_model, self.models[probe_model]
+            logger.info(f"探测模型并发已满，跳过: {probe_model}")
 
         # 如果没有健康模型，尝试使用需要探测的模型
         if not healthy:
             if probe_ready:
                 probe_model = random.choice(probe_ready)
-                self.health_checker.start_probe(probe_model)
-                self.usage_controller.acquire_model(probe_model)
-                return probe_model, self.models[probe_model]
+                if self.usage_controller.acquire_model(probe_model):
+                    self.health_checker.start_probe(probe_model)
+                    return probe_model, self.models[probe_model]
+                logger.info(f"探测模型并发已满，跳过: {probe_model}")
 
             # 尝试免费模型
             free_models = self._get_free_models()
@@ -388,9 +544,10 @@ class ModelManager:
                 free_healthy, _ = self._filter_by_health(free_models)
                 if free_healthy:
                     selected = random.choice(free_healthy)
-                    self.usage_controller.acquire_model(selected)
-                    logger.warning(f"所有付费模型不可用，使用免费模型: {selected}")
-                    return selected, self.models[selected]
+                    if self.usage_controller.acquire_model(selected):
+                        logger.warning(f"所有付费模型不可用，使用免费模型: {selected}")
+                        return selected, self.models[selected]
+                    logger.info(f"免费模型并发已满，跳过: {selected}")
 
             raise NoAvailableModelError("没有健康可用的模型")
 
@@ -412,30 +569,31 @@ class ModelManager:
         # 5. 按优先级排序
         prioritized = self._sort_by_priority(rate_ok)
 
-        # 6. 获取最高优先级（使用动态优先级）
+        # 6. Priority mode only routes within the highest-priority group.
+        # balanced_all keeps every eligible enabled model in the rotation.
         def get_dynamic_priority(name: str) -> int:
             model = self.models.get(name)
             if not model:
                 return 999
             return self.time_controller.get_model_priority(name, model.priority)
 
-        highest_priority = get_dynamic_priority(prioritized[0])
-
-        # 7. 筛选同优先级的模型
-        same_priority = [
-            name
-            for name in prioritized
-            if get_dynamic_priority(name) == highest_priority
-        ]
+        candidates = prioritized
+        if self.get_routing_mode() == "priority":
+            highest_priority = get_dynamic_priority(prioritized[0])
+            candidates = [
+                name
+                for name in prioritized
+                if get_dynamic_priority(name) == highest_priority
+            ]
 
         # 8. 轮询分发（优先未触发速率限制的模型）
-        rate_ok = self._filter_by_rate_limit(same_priority)
+        rate_ok = self._filter_by_rate_limit(candidates)
         if not rate_ok:
             # 所有模型都触发速率限制，使用全部（排队等待）
-            rate_ok = same_priority
+            rate_ok = candidates
             logger.warning(f"所有模型触发速率限制，排队等待: {rate_ok}")
-        elif len(rate_ok) < len(same_priority):
-            skipped = [n for n in same_priority if n not in rate_ok]
+        elif len(rate_ok) < len(candidates):
+            skipped = [n for n in candidates if n not in rate_ok]
             logger.debug(f"跳过速率限制模型: {skipped}")
 
         # 尝试获取并发锁，失败则尝试下一个
@@ -452,12 +610,11 @@ class ModelManager:
             logger.debug(f"模型 {candidate} 并发已满，尝试下一个")
 
         # 所有候选模型都满了，强制获取第一个
-        selected = rate_ok[start_idx]
-        self.usage_controller.rate_limit_states[selected].active_requests += 1
-        logger.warning(f"所有模型并发已满，强制使用: {selected}")
-        return selected, self.models[selected]
+        raise NoAvailableModelError("所有候选模型并发已满，请稍后重试")
 
-    def _select_by_slot(self, slot: int) -> Tuple[str, ModelConfig]:
+    def _select_by_slot(
+        self, slot: int, routing_context: Optional[dict] = None
+    ) -> Tuple[str, ModelConfig]:
         """根据固定序号选择模型（auto1, auto2, auto3...）
 
         每个序号固定映射到一个模型，失败时自动切换到下一个可用模型。
@@ -477,29 +634,34 @@ class ModelManager:
                 assigned in self.models
                 and assigned not in self.disabled_models
                 and self.health_checker.is_healthy(assigned)
+                and self.get_model_routing_status(assigned, routing_context)["eligible"]
+                and self.usage_controller.check_budget(assigned)
+                and not self.usage_controller.check_rate_limit(assigned)
             ):
-                    # 检查近期成功率
-                    success_rate = self.health_checker.get_success_rate(assigned)
-                    if success_rate >= 0.7:
-                        logger.debug(f"固定分配模型: auto{slot} -> {assigned} (复用)")
-                        return assigned, self.models[assigned]
-                    else:
-                        logger.info(
-                            f"模型 {assigned} 近期成功率过低 ({success_rate:.1%})，重新分配"
+                # 检查近期成功率
+                success_rate = self.health_checker.get_success_rate(assigned)
+                if success_rate >= 0.7:
+                    logger.debug(f"固定分配模型: auto{slot} -> {assigned} (复用)")
+                    return assigned, self.models[assigned]
+                else:
+                    logger.info(
+                        f"模型 {assigned} 近期成功率过低 ({success_rate:.1%})，重新分配"
+                    )
+                    # 成功率过低，自动禁用
+                    if self.health_checker.should_auto_disable(
+                        assigned, min_requests=20, min_rate=0.5
+                    ):
+                        logger.warning(
+                            f"模型 {assigned} 成功率过低 ({success_rate:.1%})，自动禁用"
                         )
-                        # 成功率过低，自动禁用
-                        if self.health_checker.should_auto_disable(
-                            assigned, min_requests=20, min_rate=0.5
-                        ):
-                            logger.warning(
-                                f"模型 {assigned} 成功率过低 ({success_rate:.1%})，自动禁用"
-                            )
-                            self.disable_model(assigned)
+                        self.disable_model(assigned)
 
         # 需要重新分配
         available = self._get_available_models()
+        available = self._filter_by_routing_policy(available, routing_context)
+        available = self._filter_by_budget(available)
         if not available:
-            raise NoAvailableModelError("没有可用的模型")
+            raise NoAvailableModelError("没有符合当前扫描模式和额度策略的可用模型")
 
         # 按优先级排序
         prioritized = self._sort_by_priority(available)
@@ -528,13 +690,31 @@ class ModelManager:
         sorted_priorities = sorted(priority_groups.keys())
 
         selected = None
-        for p in sorted_priorities:
-            group = priority_groups[p]
-            # 同优先级按服务 slot 数量排序（少的优先）
-            candidates = sorted(group, key=lambda m: (model_slot_count[m], m))
+        if self.get_routing_mode() == "balanced_all":
+            candidate_groups = [
+                sorted(
+                    prioritized,
+                    key=lambda m: (
+                        model_slot_count[m],
+                        get_dynamic_priority(m),
+                        m,
+                    ),
+                )
+            ]
+        else:
+            candidate_groups = [priority_groups[p] for p in sorted_priorities]
+
+        for group in candidate_groups:
+            # Balanced mode distributes slots across all eligible models first.
+            candidates = sorted(
+                group,
+                key=lambda m: (model_slot_count[m], get_dynamic_priority(m), m),
+            )
 
             for candidate in candidates:
                 if not self.health_checker.is_healthy(candidate):
+                    continue
+                if self.usage_controller.check_rate_limit(candidate):
                     continue
 
                 # 检查是否达到并发限制
@@ -556,25 +736,18 @@ class ModelManager:
                 break
 
         if not selected:
-            # 所有健康模型都达到并发限制，强行选一个并发超出最少的
+            # 所有健康模型都达到并发限制时，不再强制路由到不健康模型。
+            # Smart Batch 会看到暂无容量并按退避/重试处理，避免 provider 500/429 被反复放大。
             healthy_models = [
-                m for m in prioritized if self.health_checker.is_healthy(m)
+                m
+                for m in prioritized
+                if self.health_checker.is_healthy(m)
+                and self.get_model_routing_status(m, routing_context)["eligible"]
             ]
             if healthy_models:
-                selected = sorted(
-                    healthy_models,
-                    key=lambda m: (
-                        get_dynamic_priority(m),
-                        model_slot_count[m]
-                        - self.usage_controller.per_model_limits.get(m, {}).get(
-                            "max_concurrent", 0
-                        ),
-                    ),
-                )[0]
-                logger.warning(f"所有健康模型槽位并发已满，强制分配给 {selected}")
+                raise NoAvailableModelError("所有健康模型槽位并发已满，请稍后重试")
             else:
-                selected = prioritized[0]
-                logger.warning(f"所有模型都不健康，强制分配给 {selected}")
+                raise NoAvailableModelError("没有健康且可自动路由的模型")
 
         # 记录分配并更新活跃状态
         self._slot_model_map[slot] = selected
@@ -584,7 +757,7 @@ class ModelManager:
         return selected, self.models[selected]
 
     def select_fallback_model(
-        self, failed_model: str
+        self, failed_model: str, routing_context: Optional[dict] = None
     ) -> Optional[Tuple[str, ModelConfig]]:
         """选择备用模型（同 provider 优先，排除正在使用的模型）
 
@@ -595,16 +768,21 @@ class ModelManager:
             (模型名称, 模型配置) 或 None
         """
         with self._select_lock:
-            return self._do_select_fallback_model(failed_model)
+            return self._do_select_fallback_model(failed_model, routing_context)
 
     def _do_select_fallback_model(
-        self, failed_model: str
+        self, failed_model: str, routing_context: Optional[dict] = None
     ) -> Optional[Tuple[str, ModelConfig]]:
         """内部备用模型选择逻辑（需在 _select_lock 下调用）"""
         active_models = self._get_active_models()
 
         # 1. 先尝试同 provider 的备用模型
         same_provider = self._get_same_provider_fallbacks(failed_model)
+        same_provider = self._filter_by_routing_policy(
+            same_provider, routing_context
+        )
+        same_provider = self._filter_by_budget(same_provider)
+        same_provider = self._filter_by_rate_limit(same_provider)
         # 排除失败的模型和正在使用的模型
         same_provider = [m for m in same_provider if m not in active_models]
         if same_provider:
@@ -616,13 +794,7 @@ class ModelManager:
                             f"切换到同 provider 备用模型: {failed_model} -> {candidate}"
                         )
                         return candidate, self.models[candidate]
-                # 所有候选都满了，强制使用第一个
-                selected = healthy[0]
-                self.usage_controller.rate_limit_states[selected].active_requests += 1
-                logger.info(
-                    f"同 provider 备用模型都满，强制使用: {failed_model} -> {selected}"
-                )
-                return selected, self.models[selected]
+                logger.info(f"同 provider 备用模型都满，暂不强制切换: {failed_model}")
 
         # 2. 尝试其他 provider 的模型
         available = self._get_available_models()
@@ -633,6 +805,9 @@ class ModelManager:
             and name not in same_provider
             and name not in active_models
         ]
+        other_models = self._filter_by_routing_policy(other_models, routing_context)
+        other_models = self._filter_by_budget(other_models)
+        other_models = self._filter_by_rate_limit(other_models)
 
         if other_models:
             healthy, _ = self._filter_by_health(other_models)
@@ -645,12 +820,7 @@ class ModelManager:
                             f"切换到其他 provider 模型: {failed_model} -> {candidate}"
                         )
                         return candidate, self.models[candidate]
-                selected = prioritized[0]
-                self.usage_controller.rate_limit_states[selected].active_requests += 1
-                logger.info(
-                    f"其他 provider 模型都满，强制使用: {failed_model} -> {selected}"
-                )
-                return selected, self.models[selected]
+                logger.info(f"其他 provider 模型都满，暂不强制切换: {failed_model}")
 
         # 3. 尝试免费模型（也排除正在使用的）
         failover_config = self.config.get("failover", {})
@@ -659,13 +829,19 @@ class ModelManager:
             free_models = [
                 m for m in free_models if m != failed_model and m not in active_models
             ]
+            free_models = self._filter_by_routing_policy(
+                free_models, routing_context
+            )
+            free_models = self._filter_by_budget(free_models)
+            free_models = self._filter_by_rate_limit(free_models)
             if free_models:
                 healthy_free, _ = self._filter_by_health(free_models)
                 if healthy_free:
                     selected = random.choice(healthy_free)
-                    self.usage_controller.acquire_model(selected)
-                    logger.warning(f"切换到免费模型: {failed_model} -> {selected}")
-                    return selected, self.models[selected]
+                    if self.usage_controller.acquire_model(selected):
+                        logger.warning(f"切换到免费模型: {failed_model} -> {selected}")
+                        return selected, self.models[selected]
+                    logger.info(f"免费备用模型也已满，暂不强制切换: {failed_model}")
 
         return None
 
@@ -697,6 +873,15 @@ class ModelManager:
             logger.info(f"💡 模型 {model_name} (mimo-free) 遇到 403 错误，系统已准备好重新获取 Token，不影响健康度")
             return True
 
+        # An occasional HTTP 200 with an empty SSE body is an upstream
+        # transient, not proof of a 429 or a dead credential.
+        if any(
+            marker in error_str.lower()
+            for marker in ("empty response", "empty upstream response")
+        ):
+            self.health_checker.record_transient_failure(model_name, error_str)
+            return True
+
         # 分类错误
         error_type = self.health_checker.classify_error(error_str)
 
@@ -710,7 +895,9 @@ class ModelManager:
             if state:
                 state.healthy = False
                 state.reason = "rate_limit"
-                state.next_probe_at = time.time() + 60  # 60秒后探测恢复
+                quota_policy = (cfg.quota_policy or {}) if cfg else {}
+                cooldown = int(quota_policy.get("rate_limit_cooldown_seconds") or 60)
+                state.next_probe_at = time.time() + max(60, cooldown)
                 self.health_checker.health_state[model_name] = state
                 self.health_checker._save_health_state()
             # 清除使用该模型的 slot 缓存
@@ -725,6 +912,25 @@ class ModelManager:
             return True
 
         if error_type == "quota_error":
+            quota_policy = (cfg.quota_policy or {}) if cfg else {}
+            delete_markers = (
+                "insufficient_quota",
+                "quota exceeded",
+                "resource_exhausted",
+                "usage limit exceeded",
+                "invalid_api_key",
+                "authentication",
+                "unauthorized",
+                "401",
+                "403",
+            )
+            if quota_policy.get("delete_on_quota_exhausted", False) and any(
+                marker in error_str.lower() for marker in delete_markers
+            ):
+                logger.warning(f"🗑️ 模型 {model_name} 额度耗尽，按策略直接删除")
+                self.delete_model(model_name)
+                return True
+
             # 检查是否有重置时间（如 minimax 的 5 小时限制）
             reset_time = self.health_checker.parse_reset_time_from_error(error_str)
             if reset_time:
@@ -783,24 +989,32 @@ class ModelManager:
         """记录使用量"""
         self.usage_controller.record_usage(model_name, usage)
 
-    def disable_model(self, model_name: str):
-        """禁用模型（自动重试，minimax 也不豁免）"""
+    def disable_model(self, model_name: str, cooldown: bool = True):
+        """Disable a model temporarily after faults or persistently by operator action."""
         import time as _time
 
         self.disabled_models.add(model_name)
-        self.disabled_until[model_name] = _time.time() + self.AUTO_REENABLE_SECONDS
+        model = self.models.get(model_name)
+        if model:
+            model.enabled = False
+        if cooldown:
+            self.disabled_until[model_name] = _time.time() + self.AUTO_REENABLE_SECONDS
+        else:
+            self.disabled_until.pop(model_name, None)
         # 持久化到配置文件
         if "models" in self.config and "available" in self.config["models"]:
             if model_name in self.config["models"]["available"]:
                 self.config["models"]["available"][model_name]["enabled"] = False
-        logger.info(
-            f"模型已禁用: {model_name}（{self.AUTO_REENABLE_SECONDS // 60}分钟后自动重试）"
-        )
+        suffix = f"（{self.AUTO_REENABLE_SECONDS // 60}分钟后自动重试）" if cooldown else "（手动关闭）"
+        logger.info(f"模型已禁用: {model_name}{suffix}")
 
     def enable_model(self, model_name: str):
         """启用模型"""
         self.disabled_models.discard(model_name)
         self.disabled_until.pop(model_name, None)
+        model = self.models.get(model_name)
+        if model:
+            model.enabled = True
         # 重置健康状态
         self.health_checker.mark_healthy(model_name)
         # 持久化到配置文件
@@ -808,6 +1022,29 @@ class ModelManager:
             if model_name in self.config["models"]["available"]:
                 self.config["models"]["available"][model_name]["enabled"] = True
         logger.info(f"模型已启用: {model_name}")
+
+    def delete_model(self, model_name: str):
+        """Remove a model from runtime and persistent config."""
+        available = self.config.get("models", {}).get("available", {})
+        available.pop(model_name, None)
+        for provider_config in self.config.get("providers", {}).values():
+            fallbacks = provider_config.get("fallback_models")
+            if isinstance(fallbacks, list) and model_name in fallbacks:
+                provider_config["fallback_models"] = [name for name in fallbacks if name != model_name]
+        self.config.get("usage", {}).get("per_model_limits", {}).pop(model_name, None)
+        self.models.pop(model_name, None)
+        self.disabled_models.discard(model_name)
+        self.disabled_until.pop(model_name, None)
+        with self._select_lock:
+            self._slot_model_map = {
+                slot: name for slot, name in self._slot_model_map.items() if name != model_name
+            }
+        self._available_cache = None
+        self.health_checker.health_state.pop(model_name, None)
+        self.health_checker._save_health_state()
+        if self.config_path:
+            self.save_config(self.config_path)
+        logger.info(f"模型已删除: {model_name}")
 
     def save_config(self, config_path: str):
         """保存配置到文件"""
@@ -829,7 +1066,9 @@ class ModelManager:
         """获取模型配置"""
         return self.models.get(model_name)
 
-    def get_all_models_status(self) -> dict:
+    def get_all_models_status(
+        self, routing_context: Optional[dict] = None
+    ) -> dict:
         """返回所有模型状态"""
         health_report = self.health_checker.get_health_report()
 
@@ -843,6 +1082,19 @@ class ModelManager:
                 "peak_only": model.peak_only,
                 "free": model.free,
                 "label": model.label,
+                "api_format": model.api_format,
+                "is_exact_url": model.is_exact_url,
+                "custom_headers": model.custom_headers,
+                "strip_provider_prefix": model.strip_provider_prefix,
+                "routing_tier": model.routing_tier,
+                "allowed_scan_modes": model.allowed_scan_modes,
+                "quota_policy": model.quota_policy,
+                "max_context_tokens": model.max_context_tokens,
+                "request_overrides": self.config.get("models", {})
+                .get("available", {})
+                .get(name, {})
+                .get("request_overrides", {}),
+                "auto_routing": self.get_model_routing_status(name, routing_context),
                 "api_key_hint": model.api_key[-5:] if model.api_key else "",
                 "health": health_report.get(name, {}),
             }
@@ -856,6 +1108,7 @@ class ModelManager:
             "enabled_models": len(self._get_available_models()),
             "disabled_models": len(self.disabled_models),
             "current_strategy": self.time_controller.get_current_strategy(),
+            "routing_mode": self.get_routing_mode(),
             "providers": list(self.providers.keys()),
             "time_controller": self.time_controller.get_status(),
             "usage_controller": self.usage_controller.get_status(),

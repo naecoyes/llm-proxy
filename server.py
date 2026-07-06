@@ -1,4 +1,4 @@
-"""LLM Proxy Server - FastAPI HTTP 服务器"""
+"""Nscan Proxy Server - FastAPI HTTP 服务器"""
 
 import asyncio
 import base64
@@ -13,11 +13,11 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncGenerator, Dict, List, Optional, Set
+from typing import Any, AsyncGenerator, Dict, List, Optional, Set
 
 import httpx
 import yaml
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -30,23 +30,167 @@ from request_logger import (
     sanitize_scan_context_value,
 )
 from smart_batch_monitor import (
+    delete_smart_batch,
     get_system_resources,
     read_smart_batch_detail,
     read_smart_batch_status,
+    set_smart_batch_paused,
+    set_smart_batch_parallel,
+    terminate_smart_batch,
 )
 from strix_runtime_monitor import (
+    delete_strix_egress_node,
     get_strix_runtime_status,
     restart_strix_egress,
     set_strix_egress_enabled,
     set_strix_egress_node_enabled,
     set_strix_egress_startup_enabled,
+    test_strix_egress_node,
+    upsert_strix_egress_node,
 )
 from egress_usage_monitor import get_egress_usage
+from asset_database import get_asset_database
 from findings import FindingsService, create_findings_router
+from smart_batch_jobs import SmartBatchJobManager
 
 logger = logging.getLogger(__name__)
 
 DASHBOARD_SESSION_COOKIE = "nscan_admin_session"
+
+
+def _asset_change_key(item: dict[str, Any]) -> tuple[str, int]:
+    return (str(item.get("last_seen") or item.get("first_seen") or ""), int(item.get("id") or 0))
+
+
+def _encode_asset_cursor(key: tuple[str, int]) -> str:
+    return f"{key[0]}|{key[1]}" if key[0] else ""
+
+
+def _decode_asset_cursor(value: str) -> tuple[str, int]:
+    if not value or "|" not in value:
+        return ("", 0)
+    timestamp, asset_id = value.rsplit("|", 1)
+    try:
+        return (timestamp, int(asset_id))
+    except ValueError:
+        return ("", 0)
+
+
+def list_asset_changes(cursor: str = "", limit: int = 500) -> dict[str, Any]:
+    db = get_asset_database()
+    after = _decode_asset_cursor(cursor)
+    collected: list[dict[str, Any]] = []
+    page = 1
+    pages = 1
+    high_watermark = after
+    while page <= pages:
+        payload = db.list_assets(sort="last_seen", page=page, page_size=200)
+        pages = max(1, int(payload.get("pages") or 1))
+        items = payload.get("items") or []
+        if not items:
+            break
+        reached_cursor = False
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key = _asset_change_key(item)
+            if key > high_watermark:
+                high_watermark = key
+            if key > after:
+                collected.append(item)
+            elif after != ("", 0):
+                reached_cursor = True
+        if reached_cursor:
+            break
+        page += 1
+    collected.sort(key=_asset_change_key)
+    selected = collected[: max(1, min(int(limit or 500), 1000))]
+    next_key = _asset_change_key(selected[-1]) if selected else after
+    return {
+        "cursor": cursor, "next_cursor": _encode_asset_cursor(next_key),
+        "high_watermark": _encode_asset_cursor(high_watermark),
+        "has_more": len(collected) > len(selected), "items": selected,
+    }
+
+
+def normalize_openai_sse_chunk(chunk: bytes | str) -> tuple[bytes | str, dict[str, Any]]:
+    """Normalize one OpenAI-compatible SSE chunk and collect stream diagnostics.
+
+    Some providers, notably DeepSeek-compatible streams, may omit final usage
+    accounting even when they emit valid assistant content. Health checks must
+    therefore be based on observed content / finish events, not only token usage.
+    """
+    was_bytes = isinstance(chunk, bytes)
+    try:
+        text = chunk.decode() if was_bytes else str(chunk)
+    except Exception:
+        return chunk, {}
+
+    diagnostics: dict[str, Any] = {
+        "has_content": False,
+        "usage": None,
+        "finish_reason": None,
+        "error": None,
+    }
+    output_lines: list[str] = []
+    changed = False
+
+    for line in text.splitlines(keepends=True):
+        line_body = line.rstrip("\r\n")
+        line_end = line[len(line_body):]
+        stripped = line_body.lstrip()
+        if not stripped.startswith("data:"):
+            output_lines.append(line)
+            continue
+
+        payload = stripped[5:].strip()
+        if not payload or payload == "[DONE]":
+            output_lines.append(line)
+            continue
+
+        try:
+            data = json.loads(payload)
+        except Exception:
+            output_lines.append(line)
+            continue
+
+        if data.get("error"):
+            diagnostics["error"] = json.dumps(data["error"], ensure_ascii=False)
+
+        usage = data.get("usage")
+        if usage:
+            diagnostics["usage"] = usage
+
+        choices = data.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                finish_reason = choice.get("finish_reason")
+                if finish_reason:
+                    diagnostics["finish_reason"] = finish_reason
+                delta = choice.get("delta") or {}
+                if isinstance(delta, dict):
+                    if "reasoning_content" in delta:
+                        delta.pop("reasoning_content", None)
+                        changed = True
+                    if str(delta.get("content") or "").strip():
+                        diagnostics["has_content"] = True
+                message = choice.get("message") or {}
+                if isinstance(message, dict):
+                    if "reasoning_content" in message:
+                        message.pop("reasoning_content", None)
+                        changed = True
+                    if str(message.get("content") or "").strip():
+                        diagnostics["has_content"] = True
+
+        output_lines.append(f"data: {json.dumps(data, ensure_ascii=False)}{line_end}")
+        changed = True
+
+    normalized = "".join(output_lines)
+    if not changed:
+        return chunk, diagnostics
+    return (normalized.encode() if was_bytes else normalized), diagnostics
 
 
 class IPWhitelist:
@@ -83,7 +227,7 @@ class IPWhitelist:
 
 
 class LLMProxyServer:
-    """LLM Proxy Server"""
+    """Nscan Proxy Server"""
 
     def __init__(self, config_path: str):
         self.config_path = Path(config_path)
@@ -113,6 +257,9 @@ class LLMProxyServer:
         self._mimo_free_token: Optional[str] = None
         self._mimo_free_token_expiry: float = 0.0
         self._mimo_token_lock: asyncio.Lock = asyncio.Lock()
+        self._provider_balance_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._provider_balance_lock: asyncio.Lock = asyncio.Lock()
+        self.is_shutting_down = False
 
     def _load_config(self) -> dict:
         """加载配置文件"""
@@ -128,6 +275,7 @@ class LLMProxyServer:
         """配置变化回调"""
         self.config = new_config
         self.model_manager.update_config(new_config)
+        self._provider_balance_cache.clear()
 
         # 更新 IP 白名单
         server_config = new_config.get("server", {})
@@ -136,8 +284,97 @@ class LLMProxyServer:
 
         logger.info("配置已热更新")
 
+    def _official_deepseek_model(self):
+        fallback_order = (
+            self.config.get("providers", {})
+            .get("deepseek", {})
+            .get("fallback_models", [])
+        )
+        for name in fallback_order:
+            model = self.model_manager.models.get(name)
+            if (
+                model
+                and model.provider == "deepseek"
+                and model.api_key
+                and model.api_base.rstrip("/") == "https://api.deepseek.com"
+            ):
+                return model
+        for model in self.model_manager.models.values():
+            if (
+                model.provider == "deepseek"
+                and model.api_key
+                and model.api_base.rstrip("/") == "https://api.deepseek.com"
+            ):
+                return model
+        return None
+
+    async def get_provider_balances(self) -> dict[str, dict[str, Any]]:
+        """Return provider account balances without exposing credentials."""
+        balances: dict[str, dict[str, Any]] = {}
+        deepseek = await self._get_deepseek_balance()
+        if deepseek:
+            balances["deepseek"] = deepseek
+        return balances
+
+    async def _get_deepseek_balance(self) -> dict[str, Any] | None:
+        cache_key = "deepseek"
+        now = time.time()
+        cached = self._provider_balance_cache.get(cache_key)
+        if cached and now - cached[0] < 300:
+            return cached[1]
+
+        model = self._official_deepseek_model()
+        if not model:
+            return None
+
+        async with self._provider_balance_lock:
+            cached = self._provider_balance_cache.get(cache_key)
+            now = time.time()
+            if cached and now - cached[0] < 300:
+                return cached[1]
+
+            payload: dict[str, Any] = {
+                "provider": "deepseek",
+                "available": False,
+                "error": "",
+                "updated_at": datetime.now().isoformat(),
+            }
+            try:
+                client = self.http_client or httpx.AsyncClient(timeout=10.0)
+                close_client = self.http_client is None
+                try:
+                    response = await client.get(
+                        "https://api.deepseek.com/user/balance",
+                        headers={"Authorization": f"Bearer {model.api_key}"},
+                        timeout=10,
+                    )
+                finally:
+                    if close_client:
+                        await client.aclose()
+                if response.status_code != 200:
+                    payload["error"] = f"HTTP {response.status_code}"
+                else:
+                    data = response.json()
+                    balance_infos = data.get("balance_infos") or []
+                    primary = balance_infos[0] if balance_infos else {}
+                    payload.update(
+                        {
+                            "available": bool(data.get("is_available")),
+                            "currency": primary.get("currency") or "",
+                            "total_balance": primary.get("total_balance") or "0",
+                            "granted_balance": primary.get("granted_balance") or "0",
+                            "topped_up_balance": primary.get("topped_up_balance") or "0",
+                        }
+                    )
+            except Exception as exc:
+                payload["error"] = str(exc)[:120]
+
+            self._provider_balance_cache[cache_key] = (time.time(), payload)
+            return payload
+
     async def start(self):
         """启动服务"""
+        self.is_shutting_down = False
         # 启动配置监控
         self.config_watcher.start()
 
@@ -147,10 +384,11 @@ class LLMProxyServer:
         # 启动定时健康检查
         self.health_check_task = asyncio.create_task(self._health_check_loop())
 
-        logger.info("LLM Proxy Server 已启动")
+        logger.info("Nscan Proxy Server 已启动")
 
     async def stop(self):
         """停止服务"""
+        self.is_shutting_down = True
         self.config_watcher.stop()
 
         # 停止健康检查
@@ -164,7 +402,7 @@ class LLMProxyServer:
         if self.http_client:
             await self.http_client.aclose()
 
-        logger.info("LLM Proxy Server 已停止")
+        logger.info("Nscan Proxy Server 已停止")
 
     async def _health_check_loop(self):
         """定时健康检查循环"""
@@ -233,7 +471,7 @@ class LLMProxyServer:
                 test_body = {
                     "model": model_id,
                     "messages": [{"role": "user", "content": "ping"}],
-                    "max_tokens": 1,
+                    "max_completion_tokens": 1,
                 }
                 headers = {
                     "Content-Type": "application/json",
@@ -322,7 +560,7 @@ class LLMProxyServer:
                 test_body = {
                     "model": model_id,
                     "messages": [{"role": "user", "content": "Hi"}],
-                    "max_tokens": 5,
+                    "max_completion_tokens": 5,
                 }
 
                 url = (
@@ -417,7 +655,7 @@ class LLMProxyServer:
                     "messages": [
                         {"role": "user", "content": "Hello, respond with one word."}
                     ],
-                    "max_tokens": 10,
+                    "max_completion_tokens": 10,
                 }
 
                 response = await self.http_client.post(
@@ -478,7 +716,7 @@ class LLMProxyServer:
                     "messages": [
                         {"role": "user", "content": "Hello, respond with one word."}
                     ],
-                    "max_tokens": 10,
+                    "max_completion_tokens": 10,
                 }
 
                 url = (
@@ -966,10 +1204,17 @@ def create_app(config_path: str) -> FastAPI:
     """创建 FastAPI 应用"""
     server = LLMProxyServer(config_path)
 
+    # FindingsService 单例 — 提前实例化以便在 lifespan 中预热
+    _findings_service = FindingsService()
+    # Smart Batch Job Manager 单例
+    _job_manager = SmartBatchJobManager()
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await server.start()
+        await _findings_service.start()   # 启动时预热 Findings 索引
         yield
+        await _findings_service.stop()
         await server.stop()
 
     app = FastAPI(
@@ -1332,6 +1577,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
                         finish_reason_stop = False
                         has_content_in_delta = False
                         stream_error: Optional[str] = None
+                        client_cancelled = False
                         final_usage: dict = {}
                         try:
                             async for chunk in response.body_iterator:
@@ -1355,62 +1601,46 @@ document.getElementById("f").addEventListener("submit",async e=>{
                                     yield f"data: {error_event}\n\n"
                                     break
 
-                                # Strip reasoning_content from delta before
-                                # forwarding to agent SDK so it never enters
-                                # conversation history and triggers rejection.
-                                try:
-                                    chunk_str_before = (
-                                        chunk.decode()
-                                        if isinstance(chunk, bytes)
-                                        else chunk
-                                    )
-                                    if (
-                                        chunk_str_before.startswith("data: ")
-                                        and chunk_str_before.strip() != "data: [DONE]"
-                                    ):
-                                        data = json.loads(chunk_str_before[6:])
-                                        choices = data.get("choices")
-                                        if isinstance(choices, list):
-                                            for c in choices:
-                                                if isinstance(c, dict):
-                                                    delta = c.get("delta") or {}
-                                                    if isinstance(delta, dict):
-                                                        delta.pop("reasoning_content", None)
-                                                        if str(delta.get("content") or "").strip():
-                                                            has_content_in_delta = True
-                                        chunk = f"data: {json.dumps(data)}\n\n".encode()
-                                except Exception:
-                                    pass
+                                # Strip reasoning_content before forwarding to
+                                # agent SDK and collect diagnostics from every
+                                # SSE data line. A single network chunk may
+                                # contain multiple data events, and some
+                                # providers omit usage while still streaming
+                                # valid assistant content.
+                                chunk, stream_diag = normalize_openai_sse_chunk(chunk)
+                                if stream_diag.get("has_content"):
+                                    has_content_in_delta = True
+                                usage = stream_diag.get("usage")
+                                if usage:
+                                    total_tokens = usage.get("total_tokens", 0)
+                                    input_tokens = usage.get("prompt_tokens", 0)
+                                    output_tokens = usage.get("completion_tokens", 0)
+                                    final_usage = usage
+                                if stream_diag.get("finish_reason") in ("stop", "length"):
+                                    finish_reason_stop = True
+                                if stream_diag.get("error"):
+                                    stream_error = stream_diag["error"]
 
                                 yield chunk
                                 try:
-                                    chunk_str = (
-                                        chunk.decode()
-                                        if isinstance(chunk, bytes)
-                                        else chunk
-                                    )
+                                    chunk_str = chunk.decode() if isinstance(chunk, bytes) else chunk
                                     if chunk_str.strip():
                                         valid_chunk_count += 1
-                                    if (
-                                        chunk_str.startswith("data: ")
-                                        and chunk_str.strip() != "data: [DONE]"
-                                    ):
-                                        data = json.loads(chunk_str[6:])
-                                        if "usage" in data and data["usage"]:
-                                            usage = data["usage"]
-                                            total_tokens = usage.get("total_tokens", 0)
-                                            input_tokens = usage.get("prompt_tokens", 0)
-                                            output_tokens = usage.get(
-                                                "completion_tokens", 0
-                                            )
-                                            final_usage = usage
-                                        if data.get("choices") and isinstance(data["choices"], list):
-                                            if data["choices"][0].get("finish_reason") in ("stop", "length"):
-                                                finish_reason_stop = True
-                                        if data.get("error"):
-                                            stream_error = json.dumps(data["error"], ensure_ascii=False)
                                 except Exception:
                                     pass
+                        except (asyncio.CancelledError, GeneratorExit):
+                            # Starlette closes the async generator when the
+                            # caller disconnects or abandons a stream. On
+                            # modern Python CancelledError is not an Exception,
+                            # so it previously skipped response logging and
+                            # appeared forever as stale_no_response.
+                            client_cancelled = True
+                            stream_error = (
+                                "Service shutting down"
+                                if server.is_shutting_down
+                                else "Client disconnected"
+                            )
+                            logger.info(f"[{request_id}] 流式响应中断: {stream_error}")
                         except Exception as e:
                             logger.warning(f"[{request_id}] 流式响应异常: {e}")
                             stream_error = str(e)
@@ -1439,16 +1669,24 @@ document.getElementById("f").addEventListener("submit",async e=>{
                                     model_name,
                                     {"total_tokens": 1, "prompt_tokens": 0, "completion_tokens": 0},
                                 )
-                        else:
-                            error_msg = stream_error or "Empty response or rate limited"
+                        elif not client_cancelled:
+                            error_msg = stream_error or "Empty upstream response"
                             server.model_manager.handle_error(model_name, RuntimeError(error_msg))
 
                         zero_usage_partial = is_success and total_tokens == 0
-                        if zero_usage_partial:
+                        if client_cancelled:
+                            status = (
+                                "interrupted"
+                                if server.is_shutting_down
+                                else "cancelled"
+                            )
+                        elif zero_usage_partial:
                             status = "partial"
                         else:
                             status = "success" if is_success else "failed"
-                        final_error = None if is_success else error_msg
+                        final_error = None if is_success else (
+                            stream_error or "Empty upstream response"
+                        )
 
                         # 记录请求完成
                         request_logger.log_response(
@@ -1574,12 +1812,14 @@ document.getElementById("f").addEventListener("submit",async e=>{
     # ==================== 管理 API 路由 ====================
 
     @app.get("/proxy/status")
-    async def proxy_status():
+    async def proxy_status(scan_mode: str = "redteam"):
         """返回代理状态"""
+        routing_context = {"scan_mode": str(scan_mode or "").strip().lower()}
         return {
             "status": "running",
-            "models": server.model_manager.get_all_models_status(),
+            "models": server.model_manager.get_all_models_status(routing_context),
             "usage": server.model_manager.usage_controller.get_usage_report(),
+            "provider_balances": await server.get_provider_balances(),
             "health": server.model_manager.health_checker.get_health_report(),
             "schedule": server.model_manager.time_controller.get_status(),
             "config": server.config_watcher.get_status(),
@@ -1656,9 +1896,17 @@ document.getElementById("f").addEventListener("submit",async e=>{
         return response
 
     @app.get("/proxy/smart-batch/status")
-    async def proxy_smart_batch_status(limit: int = 20, include_finished: bool = True):
+    async def proxy_smart_batch_status(
+        limit: int = Query(20, ge=1, le=200),
+        include_finished: bool = True,
+        include_tasks: bool = True,
+    ):
         """返回 Smart Batch 运行状态快照列表"""
-        return read_smart_batch_status(limit=limit, include_finished=include_finished)
+        return read_smart_batch_status(
+            limit=limit,
+            include_finished=include_finished,
+            include_tasks=include_tasks,
+        )
 
     @app.get("/proxy/smart-batch/status/{batch_id}")
     async def proxy_smart_batch_detail(batch_id: str):
@@ -1679,15 +1927,16 @@ document.getElementById("f").addEventListener("submit",async e=>{
         """返回正在运行的 strix 扫描 Docker 容器实时状态。"""
         import subprocess as _sp, json as _json, shutil as _shutil
         import datetime as _dt
-        if not _shutil.which("docker"):
+        docker_bin = _shutil.which("docker")
+        if not docker_bin:
             return {"available": False, "strix_containers": [], "error": "docker not found"}
         try:
             fmt = (
                 '{"id":"{{.ID}}","name":"{{.Names}}","image":"{{.Image}}",'
                 '"status":"{{.Status}}","state":"{{.State}}","created":"{{.CreatedAt}}"}' 
             )
-            result = _sp.run(
-                ["docker", "ps", "-a", "--format", fmt],
+            result = _sp.run(  # noqa: S603 - fixed docker argv, no shell, local read-only status command
+                [docker_bin, "ps", "-a", "--format", fmt],
                 capture_output=True, text=True, timeout=8, check=False,
             )
             all_containers = []
@@ -1707,8 +1956,8 @@ document.getElementById("f").addEventListener("submit",async e=>{
             for c in strix:
                 entry = dict(c)
                 try:
-                    insp = _sp.run(
-                        ["docker", "inspect", c["id"],
+                    insp = _sp.run(  # noqa: S603 - fixed docker argv, container id comes from docker ps
+                        [docker_bin, "inspect", c["id"],
                          "--format",
                          "{{.HostConfig.NetworkMode}}|{{.State.Pid}}|{{.State.StartedAt}}|{{range .Config.Env}}{{.}} {{end}}"],
                         capture_output=True, text=True, timeout=5, check=False,
@@ -2325,7 +2574,8 @@ document.getElementById("f").addEventListener("submit",async e=>{
             "name": model_name,
             "model": config.model,
             "api_base": config.api_base,
-            "api_key": config.api_key,
+            "api_key_configured": bool(config.api_key),
+            "api_key_hint": config.api_key[-5:] if config.api_key else "",
             "provider": config.provider,
             "priority": config.priority,
             "enabled": config.enabled
@@ -2357,7 +2607,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
         except Exception:
             resources = {"available": False}
         try:
-            batch_status = read_smart_batch_status(limit=20, include_finished=True)
+            batch_status = read_smart_batch_status(limit=20, include_finished=True, include_tasks=False)
             scans = {
                 "summary": batch_status.get("summary", {}) if isinstance(batch_status, dict) else {},
                 "batches": batch_status.get("batches", []) if isinstance(batch_status, dict) else [],
@@ -2377,14 +2627,36 @@ document.getElementById("f").addEventListener("submit",async e=>{
             resources = get_system_resources()
         except Exception:
             resources = None
-        healthy_count = len(server.model_manager.health_checker.get_healthy_models())
-        total_models = len(server.model_manager.models)
+        try:
+            asset_summary = get_asset_database().summary()
+        except Exception:
+            asset_summary = {}
+        health = server.model_manager.health_checker.health_state
+        models = server.model_manager.models
+        healthy_count = sum(
+            1 for name in models if health.get(name) and health[name].healthy
+        )
+        total_models = len(models)
+        try:
+            batch_status = read_smart_batch_status(limit=20, include_finished=False)
+            active_scans = int(
+                (batch_status.get("summary") or {}).get("running_tasks") or 0
+            )
+        except Exception:
+            active_scans = 0
+        assets_total = int(asset_summary.get("total") or 0)
+        findings_total = int(asset_summary.get("findings") or 0)
         return {
-            "active_scans": 0,
-            "vulnerabilities_total": 0,
+            "active_scans": active_scans,
+            "vulnerabilities_total": findings_total,
             "vulnerabilities_new": 0,
             "models_healthy": healthy_count,
             "models_total": total_models,
+            "scans": active_scans,
+            "assets": assets_total,
+            "assets_total": assets_total,
+            "findings": findings_total,
+            "models": healthy_count,
             "resources": resources,
         }
 
@@ -2402,19 +2674,48 @@ document.getElementById("f").addEventListener("submit",async e=>{
     @app.get("/proxy/nscan-runtime/nodes")
     @app.post("/proxy/nscan-runtime/nodes")
     async def proxy_nscan_runtime_nodes(request: Request = None):
-        return {"nodes": []}
+        if request is None or request.method == "GET":
+            runtime = await asyncio.to_thread(get_strix_runtime_status, False)
+            return {
+                "nodes": runtime.get("egress", {}).get("outbounds", {}).get("socks_nodes", []),
+            }
+        try:
+            body = await request.json()
+            node_tag = str(body.pop("tag", "")).strip()
+            if not node_tag:
+                raise ValueError("tag is required")
+            return await asyncio.to_thread(upsert_strix_egress_node, node_tag, body)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
 
     @app.put("/proxy/nscan-runtime/nodes/{node_tag}")
-    async def proxy_nscan_runtime_node_update(node_tag: str):
-        return {"status": "ok"}
+    async def proxy_nscan_runtime_node_update(node_tag: str, request: Request):
+        try:
+            body = await request.json()
+            return await asyncio.to_thread(upsert_strix_egress_node, node_tag, body)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
 
     @app.delete("/proxy/nscan-runtime/nodes/{node_tag}")
     async def proxy_nscan_runtime_node_delete(node_tag: str):
-        return {"status": "ok"}
+        try:
+            return await asyncio.to_thread(delete_strix_egress_node, node_tag)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
 
     @app.post("/proxy/nscan-runtime/nodes/test")
     async def proxy_nscan_runtime_nodes_test(request: Request):
-        return {"status": "ok"}
+        try:
+            body = await request.json()
+            return await asyncio.to_thread(test_strix_egress_node, body)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
 
     @app.get("/proxy/security/pin")
     @app.put("/proxy/security/pin")
@@ -2423,50 +2724,361 @@ document.getElementById("f").addEventListener("submit",async e=>{
         return {"configured": bool(pin), "source": source or None}
 
     @app.get("/proxy/smart-batch/jobs")
+    async def proxy_smart_batch_jobs_list(limit: int = Query(50, ge=1, le=200)):
+        return await asyncio.to_thread(_job_manager.list_jobs, limit)
+
+    @app.get("/proxy/smart-batch/jobs/health-summary")
+    async def proxy_smart_batch_jobs_health_summary():
+        modes = {}
+        enabled_total = 0
+        eligible_total = 0
+        for mode in ("quick", "standard", "deep", "redteam", "getshell"):
+            model_status = server.model_manager.get_all_models_status({"scan_mode": mode})
+            mode_enabled = 0
+            mode_eligible = 0
+            names = []
+            for name, item in model_status.items():
+                if item.get("enabled"):
+                    mode_enabled += 1
+                auto = item.get("auto_routing") if isinstance(item.get("auto_routing"), dict) else {}
+                if auto.get("eligible"):
+                    mode_eligible += 1
+                    names.append(name)
+            modes[mode] = {"enabled": mode_enabled, "eligible": mode_eligible, "models": names}
+            enabled_total = max(enabled_total, mode_enabled)
+            eligible_total = max(eligible_total, mode_eligible)
+        return {
+            "status": "running",
+            "enabledModels": enabled_total,
+            "eligibleModels": eligible_total,
+            "modes": modes,
+        }
+
+    @app.get("/proxy/smart-batch/jobs/{job_id}/report")
+    async def proxy_smart_batch_job_report(job_id: str):
+        try:
+            return await asyncio.to_thread(_job_manager.job_report, job_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Smart Batch job not found")
+
+    @app.get("/proxy/smart-batch/jobs/{job_id}/logs")
+    async def proxy_smart_batch_job_logs(job_id: str, tail: int = Query(200, ge=1, le=1000)):
+        try:
+            return await asyncio.to_thread(_job_manager.job_logs, job_id, tail)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Smart Batch job not found")
+
     @app.post("/proxy/smart-batch/jobs")
-    async def proxy_smart_batch_jobs():
-        return {"jobs": []}
+    async def proxy_smart_batch_jobs_submit(request: Request):
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+        try:
+            return await asyncio.to_thread(_job_manager.submit, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except Exception as exc:
+            logger.exception("smart batch submit error")
+            raise HTTPException(status_code=500, detail=str(exc))
 
     @app.post("/proxy/smart-batch/jobs/preview")
     async def proxy_smart_batch_jobs_preview(request: Request):
-        return {"tasks": []}
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+        try:
+            return await asyncio.to_thread(_job_manager.preview, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except Exception as exc:
+            logger.exception("smart batch preview error")
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @app.post("/proxy/target-ingest")
+    async def proxy_target_ingest(request: Request):
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="JSON body must be an object")
+        platform = str(payload.get("platform") or "").strip()
+        if not platform:
+            raise HTTPException(status_code=422, detail="platform is required")
+        targets = payload.get("targets")
+        if targets is None or (isinstance(targets, str) and not targets.strip()) or (isinstance(targets, list) and not targets):
+            raise HTTPException(status_code=422, detail="targets is required")
+
+        dry_run = bool(payload.get("dry_run", False))
+        source_ref = str(payload.get("source_ref") or "").strip()
+        ingest_payload = {
+            **payload,
+            "source": "target_ingest",
+            "platform": platform,
+            "source_ref": source_ref,
+            "allow_non_uae": False,
+        }
+        try:
+            preview = await asyncio.to_thread(_job_manager.preview, ingest_payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except Exception as exc:
+            logger.exception("target ingest preview error")
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        accepted_targets = list(preview.get("accepted_targets") or [])
+        rejected_targets = list(preview.get("rejected_targets") or [])
+        if dry_run:
+            return {
+                "status": "dry_run",
+                "platform": platform,
+                "source_ref": source_ref,
+                "accepted_count": len(accepted_targets),
+                "rejected_count": len(rejected_targets),
+                "preview": preview,
+            }
+
+        job = None
+        if accepted_targets:
+            submit_payload = {
+                **ingest_payload,
+                "targets": accepted_targets,
+                "dry_run": False,
+                "label": str(payload.get("label") or f"{platform}-ingest"),
+            }
+            try:
+                job = await asyncio.to_thread(_job_manager.submit, submit_payload)
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc))
+            except Exception as exc:
+                logger.exception("target ingest submit error")
+                raise HTTPException(status_code=500, detail=str(exc))
+
+        db = get_asset_database()
+        ingest_record = await asyncio.to_thread(
+            db.record_target_ingest,
+            platform=platform,
+            source_ref=source_ref,
+            accepted_targets=accepted_targets,
+            rejected_targets=rejected_targets,
+            job_id=str((job or {}).get("job_id") or ""),
+            dry_run=False,
+            metadata={
+                "source_type": "target_ingest",
+                "country": str(payload.get("country") or ""),
+                "region": str(payload.get("region") or ""),
+                "submitted_count": len(targets) if isinstance(targets, list) else len(str(targets).splitlines()),
+            },
+        )
+        return {
+            "status": "accepted" if accepted_targets else "quarantined",
+            **ingest_record,
+            "job": job,
+            "accepted_targets": accepted_targets[:50],
+            "rejected_targets": rejected_targets,
+        }
+
+    @app.get("/proxy/target-ingest/quarantine")
+    async def proxy_target_ingest_quarantine(
+        platform: str = "",
+        reason: str = "",
+        page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=200),
+    ):
+        db = get_asset_database()
+        return await asyncio.to_thread(
+            db.target_quarantine_page,
+            platform=platform,
+            reason=reason,
+            page=page,
+            page_size=page_size,
+        )
+
+    @app.get("/proxy/asset-groups")
+    async def proxy_asset_groups():
+        db = get_asset_database()
+        return await asyncio.to_thread(db.asset_groups)
 
     @app.post("/proxy/smart-batch/status/{batch_id}/parallel")
-    async def proxy_smart_batch_parallel(batch_id: str):
-        return {"status": "ok"}
+    async def proxy_smart_batch_parallel(batch_id: str, request: Request):
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+        try:
+            requested = int(body.get("parallel"))
+        except (AttributeError, TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="parallel must be an integer")
+
+        if requested < 1 or requested > 32:
+            raise HTTPException(status_code=422, detail="parallel must be between 1 and 32")
+
+        try:
+            updated = await asyncio.to_thread(
+                set_smart_batch_parallel,
+                batch_id,
+                requested,
+                "dashboard",
+            )
+        except ValueError as exc:
+            message = str(exc)
+            if "not found" in message:
+                raise HTTPException(status_code=404, detail=message)
+            if "finished" in message:
+                raise HTTPException(status_code=409, detail=message)
+            raise HTTPException(status_code=422, detail=message)
+
+        control = updated.get("parallel_control") or {}
+        return {
+            "status": "accepted",
+            "batch_id": batch_id,
+            "requested_parallel": requested,
+            "current_parallel": int(updated.get("parallel") or 0),
+            "effective_parallel": int(updated.get("effective_parallel") or 0),
+            "requested_at": control.get("requested_at"),
+        }
+
+    @app.post("/proxy/smart-batch/status/{batch_id}/pause")
+    async def proxy_smart_batch_pause(batch_id: str, request: Request):
+        try:
+            body = await request.json()
+            paused = body.get("paused")
+            if not isinstance(paused, bool):
+                raise HTTPException(status_code=422, detail="paused must be a boolean")
+            updated = await asyncio.to_thread(set_smart_batch_paused, batch_id, paused, "dashboard")
+            return {"status": "paused" if paused else "running", "batch_id": batch_id, "paused": paused, "requested_at": (updated.get("pause_control") or {}).get("requested_at")}
+        except ValueError as exc:
+            raise HTTPException(status_code=409 if "finished" in str(exc) else 404, detail=str(exc))
+
+    @app.post("/proxy/smart-batch/status/{batch_id}/terminate")
+    async def proxy_smart_batch_terminate(batch_id: str):
+        try:
+            return await asyncio.to_thread(terminate_smart_batch, batch_id, "dashboard")
+        except ValueError as exc:
+            raise HTTPException(status_code=409 if "finished" in str(exc) else 404, detail=str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+
+    @app.delete("/proxy/smart-batch/status/{batch_id}")
+    async def proxy_smart_batch_delete(batch_id: str):
+        try:
+            return await asyncio.to_thread(delete_smart_batch, batch_id, "dashboard")
+        except ValueError as exc:
+            message = str(exc)
+            raise HTTPException(status_code=409 if "terminate" in message else 404, detail=message)
 
     @app.get("/proxy/scanned-targets")
-    async def proxy_scanned_targets(page: int = 1, page_size: int = 50):
-        return {"items": [], "total": 0, "page": page, "page_size": page_size}
+    async def proxy_scanned_targets(
+        page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=200),
+        query: str = "",
+        source: str = "",
+        platform: str = "",
+        group: str = "",
+    ):
+        db = get_asset_database()
+        return await asyncio.to_thread(
+            db.scanned_targets_page,
+            query=query,
+            source=source,
+            platform=platform,
+            group=group,
+            page=page,
+            page_size=page_size,
+        )
 
     @app.post("/proxy/docker/orphan-containers/cleanup")
     async def proxy_docker_orphan_cleanup():
         return {"cleaned": 0}
 
-    @app.get("/proxy/assets")
-    async def proxy_assets(page: int = 1, page_size: int = 50):
-        return {"items": [], "total": 0, "page": page, "page_size": page_size}
-
     @app.get("/proxy/assets/summary")
     async def proxy_assets_summary():
-        return {"total": 0, "scanned": 0, "unscanned": 0, "with_findings": 0}
+        db = get_asset_database()
+        return await asyncio.to_thread(db.summary)
 
     @app.get("/proxy/assets/export")
-    async def proxy_assets_export(format: str = "csv"):
-        from fastapi.responses import PlainTextResponse
-        return PlainTextResponse("")
+    async def proxy_assets_export(
+        format: str = "csv",
+        query: str = "",
+        scan_status: str = "",
+        probe_status: str = "",
+        source: str = "",
+        platform: str = "",
+        group: str = "",
+    ):
+        from fastapi.responses import Response as FastAPIResponse
+        db = get_asset_database()
+        filters = {k: v for k, v in {
+            "query": query,
+            "scan_status": scan_status,
+            "probe_status": probe_status,
+            "source": source,
+            "platform": platform,
+            "group": group,
+        }.items() if v}
+        data, media_type = await asyncio.to_thread(db.export_assets, format, **filters)
+        ext = {"json": "json", "csv": "csv"}.get(format, "txt")
+        return FastAPIResponse(
+            content=data,
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename=assets.{ext}"},
+        )
+
+    @app.get("/proxy/assets")
+    async def proxy_assets(
+        page: int = Query(1, ge=1),
+        page_size: int = Query(50, ge=1, le=200),
+        query: str = "",
+        scan_status: str = "",
+        probe_status: str = "",
+        source: str = "",
+        platform: str = "",
+        group: str = "",
+        sort: str = "last_seen",
+    ):
+        if sort not in {"last_seen", "last_scanned", "findings", "target"}:
+            raise HTTPException(status_code=422, detail="sort must be one of last_seen, last_scanned, findings, target")
+        db = get_asset_database()
+        return await asyncio.to_thread(
+            db.list_assets,
+            query=query,
+            scan_status=scan_status,
+            probe_status=probe_status,
+            source=source,
+            platform=platform,
+            group=group,
+            sort=sort,
+            page=page,
+            page_size=page_size,
+        )
+
+    @app.get("/proxy/integrations/assets/changes")
+    async def proxy_integration_asset_changes(
+        cursor: str = "",
+        limit: int = Query(500, ge=1, le=1000),
+    ):
+        return await asyncio.to_thread(list_asset_changes, cursor, limit)
 
     @app.get("/proxy/assets/{asset_id}")
-    async def proxy_asset_detail(asset_id: str):
-        raise HTTPException(status_code=404, detail="Asset not found")
+    async def proxy_asset_detail(asset_id: int):
+        db = get_asset_database()
+        detail = await asyncio.to_thread(db.asset_detail, asset_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        return detail
 
     @app.post("/proxy/assets/spool/replay")
-    async def proxy_assets_spool_replay(request: Request):
-        return {"status": "ok"}
+    async def proxy_assets_spool_replay():
+        db = get_asset_database()
+        return await asyncio.to_thread(db.replay_spool)
 
     # Use the proper FindingsService router for all /proxy/vulnerabilities/*
     # and /proxy/vulnerability-reports/* routes.
-    findings_router = create_findings_router(FindingsService())
+    # NOTE: _findings_service is the singleton created before lifespan above.
+    findings_router = create_findings_router(_findings_service)
     app.include_router(findings_router)
 
     return app

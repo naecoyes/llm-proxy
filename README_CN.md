@@ -2,7 +2,7 @@
   <img src="images/ChatGPT Image May 27, 2026, 11_09_44 AM.png" width="180" />
 </p>
 
-<h1 align="center">LLM Proxy Hub</h1>
+<h1 align="center">Nscan Proxy</h1>
 
 <p align="center">
   一个轻量级、高性能的 LLM API 代理服务器
@@ -34,8 +34,12 @@
 - **并发控制** - 细粒度支持对每个模型配置最大并发数（如 `max_concurrent`）。
 - **IP 白名单** - 精细化访问控制，支持 `X-Forwarded-For` 和 `X-Real-IP`。
 - **请求日志与统计** - 完整记录所有 API 请求响应耗时及 Token 消耗。
+- **Smart Batch 归因** - 记录 Strix 批扫 `scan_id`、目标、PID、proxy slot、实际模型、provider/model_id、token、失败和模型切换。
+- **Nscan 运行看板** - 展示 Smart Batch 进度、服务器资源、sing-box egress 状态、Docker bridge 作用域、脱敏后的 SOCKS5 节点池配置。
+- **Egress 代理控制** - 当前运行状态和开机自启状态可独立设置，并支持重启。
+- **访问控制检查** - 显示 IP 白名单和看板 PIN 是否已配置；设置 PIN 后，敏感读取和全部 `/proxy` 写操作要求 `X-Nscan-Pin`。
 - **热重载配置** - 修改 `proxy_config.yaml` 无需重启服务，配置立即生效。
-- **Web 管理面板** - 直观的可视化管理界面，支持在线查看模型健康状态和监控。
+- **Web 管理面板** - 直观展示 Strix 扫描运行、模型健康和请求日志。
 
 ## 界面预览
 
@@ -106,7 +110,37 @@ usage:
   per_model_limits:
     my-openai:
       max_concurrent: 3
+
+    # 套餐受限模型的本地保护阈值
+    my-reserve-model:
+      max_concurrent: 1
+      max_requests_per_minute: 4
+      max_requests_per_day: 500
+      max_tokens_per_day: 2000000
 ```
+
+套餐受限模型可配置为只参与指定扫描模式的自动路由：
+
+```yaml
+models:
+  available:
+    my-reserve-model:
+      api_base: https://provider.example/v1
+      api_key: 仅保存在未跟踪的运行配置中
+      model: coding-model
+      provider: example
+      routing_tier: reserve
+      allowed_scan_modes: [deep, redteam]
+      quota_policy:
+        limited: true
+        weekly_percent: 1
+        monthly_percent: 0
+        auto_disable_at_percent: 80
+        observed_at: "2026-06-18T09:54:02+08:00"
+```
+
+扫描模式不匹配或用量达到软阈值时，Reserve 模型会退出 `autoN` 路由；显式指定模型仍可使用。
+`GET /v1/models/available?scan_mode=redteam` 会返回套餐感知的推荐扫描并发。
 
 ### 3. 启动服务
 
@@ -182,7 +216,64 @@ print(response.choices[0].message.content)
 | `/proxy/health` | GET | 模型健康检查结果 |
 | `/proxy/usage` | GET | 用量统计 |
 | `/proxy/logs` | GET | 请求日志 |
+| `/proxy/smart-batch/status` | GET | Smart Batch 状态快照和任务进度 |
+| `/proxy/smart-batch/status/{batch_id}` | GET | 单个 Smart Batch 状态快照 |
+| `/proxy/system/resources` | GET | 宿主机 CPU、内存、磁盘、网络、proxy 进程和批扫 PID 状态 |
+| `/proxy/egress/usage` | GET | `br-strix` 网桥计数、扫描容器流量、目标归因和 SOCKS 节点池摘要 |
+| `/proxy/security/status` | GET | 检查 IP 白名单和看板 PIN 是否配置 |
+| `/proxy/security/verify` | POST | 校验 `X-Nscan-Pin` |
+| `/proxy/security/logout` | POST | 清除浏览器持久管理会话 |
+| `/proxy/nscan-runtime/status` | GET | Nscan 运行、sing-box egress、Docker 网络和脱敏 SOCKS5 节点池状态 |
+| `/proxy/nscan-runtime/proxy-enabled` | POST | 使用 `{"enabled": true/false}` 单独设置当前运行状态 |
+| `/proxy/nscan-runtime/proxy-startup-enabled` | POST | 使用 `{"enabled": true/false}` 单独设置开机自启状态 |
+| `/proxy/nscan-runtime/proxy-restart` | POST | 重启 Nscan egress 代理服务 |
+| `/proxy/nscan-runtime/nodes/{node_tag}/enabled` | POST | 将单个 SOCKS5 节点加入或移出自动代理池 |
 | `/proxy/config` | GET/PUT | 读取或更新配置 |
+
+## Nscan 运行看板
+
+Web 首页已改为 Nscan Runtime Dashboard。进入 **Egress Proxy** 页面可以查看当前
+`sing-box` 配置、`include_interface` 边界、`strix-egress` Docker 网络、SOCKS5 节点池和
+节点 TCP 可达性。密码只显示脱敏结果。
+看板也会通过 `/proxy/egress/usage` 展示 `br-strix` 网桥带宽、Docker 扫描容器流量、
+目标域名/IP 和 `scan_id` 归因。这些指标只覆盖 Nscan Docker 扫描出站链路，不统计
+LLM provider 请求流量。
+
+默认读取 `/etc/sing-box/config.json` 并控制 `sing-box` systemd 服务，可通过环境变量覆盖：
+
+```bash
+export STRIX_EGRESS_SING_BOX_CONFIG=/etc/sing-box/config.json
+export STRIX_EGRESS_SERVICE=sing-box
+export STRIX_DOCKER_NETWORK=strix-egress
+```
+
+运行态 start/stop、开机自启 enable/disable 和 restart 会先尝试直接执行 `systemctl`，再尝试
+`sudo -n systemctl ...`。生产环境建议只给
+运行看板的用户授予 sing-box 相关的窄 sudo 权限，不要授予通用 sudo。该控制只影响 Nscan
+Docker bridge 出站链路，不改变 LLM provider 路由，也不让 Nscan Proxy 自身走 SOCKS5。
+
+节点卡片的独立开关只修改 `proxy-auto` 节点池，并强制至少保留一个出口。配置采用原子写入，
+重启失败时自动回滚。`nscan_egress_node_control.py` 应以 root 所有、不可由面板用户修改的方式
+安装到 `/usr/local/sbin/nscan-egress-node-control`，sudoers 只放行这个固定 helper。
+
+看板 PIN 优先读取 `NSCAN_DASHBOARD_PIN`，其次读取 `admin.pin_code`，并兼容旧配置
+`admin.api_key`。浏览器首次通过 `X-Nscan-Pin` 验证后会获得 HttpOnly、SameSite=Strict
+管理 Cookie，后续访问无需重复输入 PIN。默认有效期 30 天，可通过
+`NSCAN_DASHBOARD_SESSION_DAYS` 或 `admin.session_days` 设置为 1-365 天。修改 PIN 会使旧会话
+自动失效；签名密钥保存在 `runtime/`，浏览器不会持久保存明文 PIN。
+
+## 模型独立开关与使用方式
+
+Models 页面为每个模型提供持久化独立开关。手动关闭后不会在 30 分钟后自动恢复；
+健康检查触发的临时关闭仍保留冷却重试。Nscan Runtime 页面同时显示模型连接状态，
+可以直接测试连接或进入新增模型表单。
+
+`models.routing_mode` 支持两种自动路由方式：
+
+- `balanced_all`（默认）：所有已开启、健康且满足额度与扫描模式约束的模型都会参与轮询和 `autoN` 槽位分配。
+- `priority`：仅使用最高优先级的合格模型组，失败时再执行 fallback。
+
+两种模式都会继续执行健康度、并发、速率、套餐额度和 scan mode 过滤。
 
 ## 项目结构
 

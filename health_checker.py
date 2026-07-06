@@ -2,13 +2,24 @@
 
 import json
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def synchronized_state(method):
+    """Serialize access to mutable health state."""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._state_lock:
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 @dataclass
@@ -20,6 +31,7 @@ class ModelHealth:
     failed_at: float = 0.0
     next_probe_at: float = 0.0
     probe_in_flight: bool = False
+    probe_attempts: int = 0
     consecutive_failures: int = 0
     total_failures: int = 0
     total_successes: int = 0
@@ -51,7 +63,6 @@ class HealthChecker:
         "connection error",
         "connection reset",
         "connection refused",
-        "empty response",
     ]
 
     # 额度/key 错误检测关键词（立即禁用）
@@ -89,6 +100,7 @@ class HealthChecker:
         self.stats_dir = Path(stats_dir)
         self.stats_dir.mkdir(parents=True, exist_ok=True)
         self.health_state: Dict[str, ModelHealth] = {}
+        self._state_lock = threading.RLock()
         self.model_manager = model_manager
         self._update_config(config)
         self._load_health_state()
@@ -134,17 +146,21 @@ class HealthChecker:
                     failed_at=state.get("failed_at", 0.0),
                     next_probe_at=state.get("next_probe_at", 0.0),
                     probe_in_flight=state.get("probe_in_flight", False),
+                    probe_attempts=state.get("probe_attempts", 0),
                     consecutive_failures=state.get("consecutive_failures", 0),
                     total_failures=state.get("total_failures", 0),
                     total_successes=state.get("total_successes", 0),
                     last_success_at=state.get("last_success_at", 0.0),
                     last_failure_at=state.get("last_failure_at", 0.0),
+                    recent_results=list(state.get("recent_results") or []),
+                    re_enable_at=state.get("re_enable_at", 0.0),
                 )
 
             logger.info(f"已加载健康状态: {len(self.health_state)} 个模型")
         except Exception as e:
             logger.warning(f"加载健康状态失败: {e}")
 
+    @synchronized_state
     def _save_health_state(self):
         """保存健康状态到磁盘"""
         health_file = self._get_health_file()
@@ -157,23 +173,38 @@ class HealthChecker:
                     "failed_at": state.failed_at,
                     "next_probe_at": state.next_probe_at,
                     "probe_in_flight": state.probe_in_flight,
+                    "probe_attempts": state.probe_attempts,
                     "consecutive_failures": state.consecutive_failures,
                     "total_failures": state.total_failures,
                     "total_successes": state.total_successes,
                     "last_success_at": state.last_success_at,
                     "last_failure_at": state.last_failure_at,
+                    "recent_results": list(state.recent_results[-100:]),
+                    "re_enable_at": state.re_enable_at,
                 }
 
-            with open(health_file, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
+            tmp_file = health_file.with_suffix(".json.tmp")
+            tmp_file.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            tmp_file.replace(health_file)
+            try:
+                from asset_database import get_asset_database
+
+                get_asset_database().sync_health_snapshot(data)
+            except Exception as exc:
+                logger.warning("SQLite health mirror failed: %s", exc)
         except Exception as e:
             logger.warning(f"保存健康状态失败: {e}")
 
+    @synchronized_state
     def initialize_model(self, model_name: str):
         """初始化模型健康状态"""
         if model_name not in self.health_state:
             self.health_state[model_name] = ModelHealth()
 
+    @synchronized_state
     def mark_unhealthy(self, model_name: str, reason: str):
         """标记模型不健康
 
@@ -239,12 +270,13 @@ class HealthChecker:
             state.total_failures += 1
             state.last_failure_at = time.time()
         else:
-            # 首次标记为不健康
+            # 首次标记为不健康: 5分钟后重检
             state.healthy = False
             state.reason = reason
             state.failed_at = time.time()
-            state.next_probe_at = time.time() + self.recovery_time
+            state.next_probe_at = time.time() + 300  # 5分钟
             state.probe_in_flight = False
+            state.probe_attempts = 1
             state.consecutive_failures = 1
             state.total_failures += 1
             state.last_failure_at = time.time()
@@ -266,6 +298,22 @@ class HealthChecker:
                 )
                 self.model_manager.disable_model(model_name)
 
+    @synchronized_state
+    def record_transient_failure(self, model_name: str, reason: str):
+        """Record a retryable failure without changing model health."""
+        state = self.health_state.get(model_name, ModelHealth())
+        state.total_failures += 1
+        state.last_failure_at = time.time()
+        state.recent_results.append(False)
+        if len(state.recent_results) > 100:
+            state.recent_results = state.recent_results[-100:]
+        self.health_state[model_name] = state
+        self._save_health_state()
+        logger.info(
+            f"↻ 模型 {model_name} 瞬时失败，保持健康并由请求方重试: {reason}"
+        )
+
+    @synchronized_state
     def mark_healthy(self, model_name: str):
         """标记模型恢复健康
 
@@ -294,6 +342,7 @@ class HealthChecker:
         if was_unhealthy:
             logger.info(f"🟢 模型 {model_name} 已恢复正常")
 
+    @synchronized_state
     def is_healthy(self, model_name: str) -> bool:
         """检查模型是否健康
 
@@ -303,6 +352,7 @@ class HealthChecker:
         state = self.health_state.get(model_name, ModelHealth())
         return state.healthy
 
+    @synchronized_state
     def should_probe(self, model_name: str) -> bool:
         """检查是否应该探测不健康模型
 
@@ -322,6 +372,7 @@ class HealthChecker:
         # 检查是否到达探测时间
         return time.time() >= state.next_probe_at
 
+    @synchronized_state
     def set_re_enable_time(
         self, model_name: str, re_enable_at: float, reason: str = ""
     ):
@@ -346,6 +397,7 @@ class HealthChecker:
             f"⏰ 模型 {model_name} 将在 {re_enable_time} 自动重新启用: {reason}"
         )
 
+    @synchronized_state
     def check_and_re_enable_models(self, model_manager) -> List[str]:
         """检查并重新启用已到期的模型
 
@@ -377,6 +429,7 @@ class HealthChecker:
 
         return re_enabled
 
+    @synchronized_state
     def start_probe(self, model_name: str):
         """开始探测模型"""
         state = self.health_state.get(model_name, ModelHealth())
@@ -384,6 +437,7 @@ class HealthChecker:
         self.health_state[model_name] = state
         logger.info(f"🧪 开始探测模型: {model_name}")
 
+    @synchronized_state
     def end_probe(self, model_name: str, success: bool):
         """结束探测
 
@@ -396,7 +450,11 @@ class HealthChecker:
         else:
             state = self.health_state.get(model_name, ModelHealth())
             state.probe_in_flight = False
-            state.next_probe_at = time.time() + self.recovery_time
+            # 分级重检: 第1次5分钟, 后续5小时
+            probe_attempts = getattr(state, 'probe_attempts', 0) + 1
+            state.probe_attempts = probe_attempts
+            delay = 300 if probe_attempts <= 1 else 18000  # 5分钟 / 5小时
+            state.next_probe_at = time.time() + delay
             self.health_state[model_name] = state
             logger.warning(
                 f"❌ 模型 {model_name} 探测失败，下次探测: {self._format_time(state.next_probe_at)}"
@@ -417,6 +475,7 @@ class HealthChecker:
             if self.is_healthy(name) or self.should_probe(name)
         ]
 
+    @synchronized_state
     def get_success_rate(self, model_name: str) -> float:
         """获取模型近期成功率（基于最近 100 次请求）
 
@@ -432,6 +491,7 @@ class HealthChecker:
         success_count = sum(state.recent_results)
         return success_count / len(state.recent_results)
 
+    @synchronized_state
     def get_recent_request_count(self, model_name: str) -> int:
         """获取模型近期请求次数"""
         state = self.health_state.get(model_name)
@@ -619,6 +679,7 @@ class HealthChecker:
             return "N/A"
         return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
 
+    @synchronized_state
     def get_health_report(self) -> dict:
         """返回健康状态报告"""
         return {

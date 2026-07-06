@@ -2,14 +2,29 @@
 
 import json
 import logging
+import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict
+from functools import wraps
 
 logger = logging.getLogger(__name__)
+
+
+def synchronized_usage(method):
+    """Serialize mutable usage and concurrency counters."""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._state_lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+DEFAULT_INPUT_COST_PER_1M = 0.14
+DEFAULT_OUTPUT_COST_PER_1M = 0.28
+ZERO_COST_BILLING_MODES = {"free", "subscription", "prepaid", "token_plan", "token-plan"}
 
 
 @dataclass
@@ -46,6 +61,7 @@ class UsageController:
         self.config = config
         self.stats_dir = Path(stats_dir)
         self.stats_dir.mkdir(parents=True, exist_ok=True)
+        self._state_lock = threading.RLock()
 
         # 使用量统计
         self.daily_stats: Dict[str, UsageStats] = defaultdict(UsageStats)
@@ -64,6 +80,7 @@ class UsageController:
         self._update_config(config)
 
         # 加载今日统计
+        self.current_date = datetime.now().strftime("%Y-%m-%d")
         self._load_daily_stats()
 
     def _update_config(self, config: dict):
@@ -80,6 +97,7 @@ class UsageController:
 
         # 每模型速率限制
         self.per_model_limits = usage.get("per_model_limits", {})
+        self.model_configs = (config.get("models", {}) or {}).get("available", {}) or {}
 
     def update_config(self, config: dict):
         """热更新配置"""
@@ -89,8 +107,7 @@ class UsageController:
 
     def _get_daily_stats_file(self) -> Path:
         """获取今日统计文件路径"""
-        today = datetime.now().strftime("%Y-%m-%d")
-        return self.stats_dir / f"usage_{today}.json"
+        return self.stats_dir / f"usage_{self.current_date}.json"
 
     def _get_monthly_stats_file(self) -> Path:
         """获取本月统计文件路径"""
@@ -120,7 +137,7 @@ class UsageController:
 
                 # 检查日期是否是今天
                 file_date = data.get("date", "")
-                today = datetime.now().strftime("%Y-%m-%d")
+                today = self.current_date
                 if file_date != today:
                     logger.info(
                         f"统计文件日期 ({file_date}) 不是今天 ({today})，跳过加载"
@@ -143,6 +160,7 @@ class UsageController:
             except Exception as e:
                 logger.warning(f"加载统计文件失败: {e}")
 
+    @synchronized_usage
     def _save_daily_stats(self):
         """保存今日统计"""
         stats_file = self._get_daily_stats_file()
@@ -155,17 +173,39 @@ class UsageController:
                 }
 
             data = {
-                "date": datetime.now().strftime("%Y-%m-%d"),
+                "date": self.current_date,
                 "total": asdict(self.daily_stats.get("total", UsageStats())),
                 "models": {
                     name: asdict(stats) for name, stats in self.model_stats.items()
                 },
                 "hourly": hourly_data,
             }
-            with open(stats_file, "w") as f:
-                json.dump(data, f, indent=2)
+            tmp_file = stats_file.with_suffix(".json.tmp")
+            tmp_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            tmp_file.replace(stats_file)
+            try:
+                from asset_database import get_asset_database
+
+                get_asset_database().sync_usage_snapshot(data)
+            except Exception as exc:
+                logger.warning("SQLite usage mirror failed: %s", exc)
         except Exception as e:
             logger.warning(f"保存统计文件失败: {e}")
+
+    def _ensure_current_day(self):
+        """Roll in-memory daily limits and counters at local midnight."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today == self.current_date:
+            return
+
+        self._save_daily_stats()
+        self.current_date = today
+        self.daily_stats.clear()
+        self.model_stats.clear()
+        self.hourly_stats.clear()
+        self.rate_limit_states.clear()
+        self._load_daily_stats()
+        logger.info(f"用量统计已切换到新日期: {today}")
 
     def check_budget(self, model_name: str) -> bool:
         """检查是否还有预算
@@ -173,6 +213,8 @@ class UsageController:
         Returns:
             True 表示有预算，可以继续使用
         """
+        self._ensure_current_day()
+
         # 检查每日预算
         total_stats = self.daily_stats.get("total", UsageStats())
         if total_stats.cost >= self.daily_budget:
@@ -196,9 +238,40 @@ class UsageController:
             )
             return False
 
+        model_limits = self.per_model_limits.get(model_name, {})
+        model_stats = self.model_stats.get(model_name, UsageStats())
+
+        max_requests_per_day = int(model_limits.get("max_requests_per_day", 0) or 0)
+        if (
+            max_requests_per_day > 0
+            and model_stats.requests >= max_requests_per_day
+        ):
+            logger.warning(
+                f"模型 {model_name} 每日请求限制已达到: "
+                f"{model_stats.requests} / {max_requests_per_day}"
+            )
+            return False
+
+        max_tokens_per_day = int(model_limits.get("max_tokens_per_day", 0) or 0)
+        if max_tokens_per_day > 0 and model_stats.tokens >= max_tokens_per_day:
+            logger.warning(
+                f"模型 {model_name} 每日 Token 限制已达到: "
+                f"{model_stats.tokens} / {max_tokens_per_day}"
+            )
+            return False
+
+        max_cost_per_day = float(model_limits.get("max_cost_per_day", 0) or 0)
+        if max_cost_per_day > 0 and model_stats.cost >= max_cost_per_day:
+            logger.warning(
+                f"模型 {model_name} 每日费用限制已达到: "
+                f"{model_stats.cost:.4f} / {max_cost_per_day:.4f}"
+            )
+            return False
+
         return True
 
-    def check_rate_limit(self, model_name: str) -> bool:
+    @synchronized_usage
+    def check_rate_limit(self, model_name: str, *, log: bool = True) -> bool:
         """检查是否触发速率限制或并发限制
 
         Returns:
@@ -218,21 +291,24 @@ class UsageController:
         # 检查请求次数限制
         max_rpm = limits.get("max_requests_per_minute", 0)
         if max_rpm > 0 and len(state.requests) >= max_rpm:
-            logger.warning(
-                f"模型 {model_name} 请求次数限制: {len(state.requests)} / {max_rpm}"
-            )
+            if log:
+                logger.warning(
+                    f"模型 {model_name} 请求次数限制: {len(state.requests)} / {max_rpm}"
+                )
             return True
 
         # 检查并发限制（当前正在处理的请求数）
         max_concurrent = limits.get("max_concurrent", 0)
         if max_concurrent > 0 and state.active_requests >= max_concurrent:
-            logger.warning(
-                f"模型 {model_name} 并发限制: {state.active_requests} / {max_concurrent}"
-            )
+            if log:
+                logger.warning(
+                    f"模型 {model_name} 并发限制: {state.active_requests} / {max_concurrent}"
+                )
             return True
 
         return False
 
+    @synchronized_usage
     def acquire_model(self, model_name: str, force: bool = False) -> bool:
         """获取模型并发锁（请求开始时调用）
 
@@ -253,6 +329,7 @@ class UsageController:
         logger.debug(f"模型 {model_name} 获取锁: {state.active_requests} 个活跃请求")
         return True
 
+    @synchronized_usage
     def release_model(self, model_name: str):
         """释放模型并发锁（请求完成时调用）"""
         state = self.rate_limit_states[model_name]
@@ -275,6 +352,7 @@ class UsageController:
             return False
         return True
 
+    @synchronized_usage
     def record_usage(self, model_name: str, usage: dict):
         """记录使用量
 
@@ -282,6 +360,8 @@ class UsageController:
             model_name: 模型名称
             usage: 使用量数据，包含 prompt_tokens, completion_tokens, total_tokens, cost
         """
+        self._ensure_current_day()
+
         input_tokens = usage.get("prompt_tokens", 0) or 0
         output_tokens = usage.get("completion_tokens", 0) or 0
         total_tokens = usage.get("total_tokens", 0) or 0
@@ -291,11 +371,10 @@ class UsageController:
         if total_tokens == 0:
             total_tokens = input_tokens + output_tokens
 
-        # 统一按照 DeepSeek V4 Flash 价格计算费用
-        # 输入单价: $0.14 / 1M tokens
-        # 输出单价: $0.28 / 1M tokens
+        # Prefer per-model pricing when configured; otherwise use the default
+        # DeepSeek V4 Flash-compatible estimate.
         if cost == 0.0:
-            cost = (input_tokens * 0.14 / 1_000_000) + (output_tokens * 0.28 / 1_000_000)
+            cost = self.estimate_cost(model_name, input_tokens, output_tokens)
 
         # 更新每日统计
         total_stats = self.daily_stats.setdefault("total", UsageStats())
@@ -352,8 +431,10 @@ class UsageController:
             f"total_today={total_stats.tokens} tokens, ${total_stats.cost:.4f}"
         )
 
+    @synchronized_usage
     def get_usage_report(self) -> dict:
         """返回使用报告"""
+        self._ensure_current_day()
         total_stats = self.daily_stats.get("total", UsageStats())
         monthly_total = self.monthly_stats.get("total", UsageStats())
 
@@ -376,18 +457,143 @@ class UsageController:
                 "budget_limit": self.monthly_budget,
                 "budget_remaining": round(self.monthly_budget - monthly_total.cost, 4),
             },
+            "history": {
+                "7d": self._summarize_historical_stats(7),
+                "30d": self._summarize_historical_stats(30),
+                "total": self._summarize_all_historical_stats(),
+            },
             "per_model": {
                 name: {
                     "tokens": stats.tokens,
                     "cost": round(stats.cost, 4),
                     "requests": stats.requests,
+                    "input_tokens": stats.input_tokens,
+                    "output_tokens": stats.output_tokens,
+                    "limits": self.per_model_limits.get(name, {}),
+                    "budget_available": self.check_budget(name),
                 }
                 for name, stats in self.model_stats.items()
             },
         }
 
+    def _summarize_historical_stats(self, days: int) -> dict:
+        """Summarize saved usage files, with current in-memory day as source of truth."""
+        historical = self._load_historical_stats(days)
+        return self._summarize_usage_payload(historical, days=days)
+
+    def _summarize_all_historical_stats(self) -> dict:
+        """Summarize every saved daily usage file plus the current in-memory counters."""
+        historical = {}
+        for stats_file in self.stats_dir.glob("usage_*.json"):
+            date_part = stats_file.stem.removeprefix("usage_")
+            if len(date_part) != 10:
+                continue
+            try:
+                datetime.strptime(date_part, "%Y-%m-%d")
+                with open(stats_file, "r") as f:
+                    historical[date_part] = json.load(f)
+            except Exception as e:
+                logger.warning(f"加载历史统计失败 {date_part}: {e}")
+        return self._summarize_usage_payload(historical, days=None)
+
+    def _summarize_usage_payload(self, historical: Dict[str, dict], days: int | None) -> dict:
+        """Aggregate total usage from a date keyed usage payload."""
+        today = self.current_date
+        historical[today] = {
+            "date": today,
+            "total": asdict(self.daily_stats.get("total", UsageStats())),
+            "models": {
+                name: asdict(stats) for name, stats in self.model_stats.items()
+            },
+        }
+
+        total = UsageStats()
+        per_model: Dict[str, UsageStats] = defaultdict(UsageStats)
+        dates = sorted(historical.keys())
+        for data in historical.values():
+            stats = data.get("total", {})
+            total.tokens += int(stats.get("tokens") or 0)
+            total.cost += float(stats.get("cost") or 0)
+            total.requests += int(stats.get("requests") or 0)
+            total.input_tokens += int(stats.get("input_tokens") or 0)
+            total.output_tokens += int(stats.get("output_tokens") or 0)
+            for model_name, model_payload in data.get("models", {}).items():
+                model_stats = per_model[model_name]
+                model_stats.tokens += int(model_payload.get("tokens") or 0)
+                model_stats.cost += float(model_payload.get("cost") or 0)
+                model_stats.requests += int(model_payload.get("requests") or 0)
+                model_stats.input_tokens += int(model_payload.get("input_tokens") or 0)
+                model_stats.output_tokens += int(model_payload.get("output_tokens") or 0)
+
+        return {
+            "days": days or len(dates),
+            "days_with_data": len(dates),
+            "start_date": dates[0] if dates else "",
+            "end_date": dates[-1] if dates else "",
+            "tokens": total.tokens,
+            "input_tokens": total.input_tokens,
+            "output_tokens": total.output_tokens,
+            "requests": total.requests,
+            "cost": round(total.cost, 4),
+            "per_model": {
+                name: {
+                    "tokens": stats.tokens,
+                    "input_tokens": stats.input_tokens,
+                    "output_tokens": stats.output_tokens,
+                    "requests": stats.requests,
+                    "cost": round(stats.cost, 4),
+                }
+                for name, stats in per_model.items()
+            },
+        }
+
+    def estimate_cost(self, model_name: str, input_tokens: int, output_tokens: int) -> float:
+        """Estimate marginal request cost from model billing metadata and token counts."""
+        model_limits = self.per_model_limits.get(model_name, {}) or {}
+        model_config = self.model_configs.get(model_name, {}) or {}
+        if self._is_zero_marginal_cost(model_limits, model_config):
+            return 0.0
+        input_cost_per_1m = self._configured_price(
+            model_limits,
+            model_config,
+            ("input_cost_per_1m", "prompt_cost_per_1m", "input_price", "prompt_price"),
+            DEFAULT_INPUT_COST_PER_1M,
+        )
+        output_cost_per_1m = self._configured_price(
+            model_limits,
+            model_config,
+            ("output_cost_per_1m", "completion_cost_per_1m", "output_price", "completion_price"),
+            DEFAULT_OUTPUT_COST_PER_1M,
+        )
+        return (input_tokens * input_cost_per_1m / 1_000_000) + (
+            output_tokens * output_cost_per_1m / 1_000_000
+        )
+
+    def _is_zero_marginal_cost(self, model_limits: dict, model_config: dict) -> bool:
+        if bool(model_limits.get("free") or model_config.get("free")):
+            return True
+        billing_mode = str(
+            model_limits.get("billing_mode")
+            or model_limits.get("billing")
+            or model_config.get("billing_mode")
+            or model_config.get("billing")
+            or ""
+        ).strip().lower()
+        return billing_mode in ZERO_COST_BILLING_MODES
+
+    @staticmethod
+    def _configured_price(model_limits: dict, model_config: dict, keys: tuple[str, ...], default: float) -> float:
+        for source in (model_limits, model_config):
+            for key in keys:
+                value = source.get(key)
+                if value is not None and value != "":
+                    return float(value)
+        return default
+
+    @synchronized_usage
     def reset_daily_stats(self):
         """重置每日统计"""
+        self._ensure_current_day()
         # 保存当前统计到历史文件
         self._save_daily_stats()
 
@@ -400,6 +606,7 @@ class UsageController:
 
     def get_status(self) -> dict:
         """返回用量控制状态"""
+        self._ensure_current_day()
         total_stats = self.daily_stats.get("total", UsageStats())
 
         return {
@@ -529,8 +736,20 @@ class UsageController:
             return "nvidia"
         elif "openrouter" in model_lower or "or-" in model_lower:
             return "openrouter"
+        elif "volcengine" in model_lower or "ark-code" in model_lower:
+            return "volcengine"
         elif "minimax" in model_lower:
             return "minimax"
+        elif "siliconflow" in model_lower:
+            return "siliconflow"
+        elif "opencode" in model_lower:
+            return "opencode-go"
+        elif "deepseek" in model_lower:
+            return "deepseek"
+        elif "gpt" in model_lower or "openai-proxy" in model_lower:
+            return "openai-proxy"
+        elif "anyrouter" in model_lower:
+            return "anyrouter"
         else:
             return "other"
 
