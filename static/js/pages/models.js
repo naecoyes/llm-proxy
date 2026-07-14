@@ -323,7 +323,7 @@ export function mountModels(context) {
     root.innerHTML = `<div class="page-stack">
       ${renderActivityMetrics(status, logs, logsError)}
       <section class="panel"><header class="panel-header"><div><h2>Provider usage</h2><p>Total tokens and estimated spend grouped by provider</p></div></header><div class="panel-body">${renderProviderUsage(status)}</div></section>
-      <section class="panel"><header class="panel-header"><div><h2>Model administration</h2><p>Connectivity, limits, persistent use state, and write-only credentials · ${models.length} configured across ${new Set(models.map((m) => m.provider)).size} providers</p></div><div class="panel-actions model-admin-actions"><select class="model-routing-select" id="routingMode" aria-label="Model routing mode" title="${escapeHtml(status.routing?.description || "")}"><option value="balanced_all" ${status.routing?.mode === "balanced_all" ? "selected" : ""}>All eligible</option><option value="priority" ${status.routing?.mode === "priority" ? "selected" : ""}>Priority only</option></select><input id="modelSearch" type="search" placeholder="Search models" value="${escapeHtml(query)}"><button class="button" id="addModel" type="button">Add model</button></div></header><div class="panel-body flush" id="modelsTable">${renderModels(status, config, query)}</div></section>
+      <section class="panel"><header class="panel-header"><div><h2>Model administration</h2><p>Connectivity, limits, persistent use state, and write-only credentials · ${models.length} configured across ${new Set(models.map((m) => m.provider)).size} providers</p></div><div class="panel-actions model-admin-actions"><select class="model-routing-select" id="routingMode" aria-label="Model routing mode" title="${escapeHtml(status.routing?.description || "")}"><option value="balanced_all" ${status.routing?.mode === "balanced_all" ? "selected" : ""}>All eligible</option><option value="priority" ${status.routing?.mode === "priority" ? "selected" : ""}>Priority only</option></select><input id="modelSearch" type="search" placeholder="Search models" value="${escapeHtml(query)}"><button class="button ghost" id="refreshReasoning" type="button">Sync OpenRouter reasoning</button><button class="button" id="addModel" type="button">Add model</button></div></header><div class="panel-body flush" id="modelsTable">${renderModels(status, config, query)}</div></section>
     </div>`;
     bind();
   };
@@ -391,6 +391,18 @@ export function mountModels(context) {
   const bind = () => {
     root.querySelector("#modelSearch")?.addEventListener("input", debounce((event) => { query = event.target.value; root.querySelector("#modelsTable").innerHTML = renderModels(status, config, query); bindRows(); }, 120));
     root.querySelector("#addModel")?.addEventListener("click", () => openModelEditor());
+    root.querySelector("#refreshReasoning")?.addEventListener("click", async (event) => {
+      event.currentTarget.disabled = true;
+      try {
+        const result = await api.refreshModelReasoningCapabilities();
+        const count = Object.keys(result.models || {}).length;
+        toast(`OpenRouter reasoning metadata synced for ${count} model${count === 1 ? "" : "s"}`);
+        await poller.run();
+      } catch (error) {
+        toast(error.message, "error");
+        event.currentTarget.disabled = false;
+      }
+    });
     root.querySelector("#routingMode")?.addEventListener("change", async (event) => {
       event.target.disabled = true;
       try { await api.setRoutingMode(event.target.value); toast("Routing mode updated"); await poller.run(); } catch (error) { toast(error.message, "error"); event.target.disabled = false; }

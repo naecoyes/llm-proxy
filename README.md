@@ -434,7 +434,9 @@ unavailable, events are spooled under `llm_proxy/runtime/asset_spool/` and can b
 Nscan enables native reasoning at `high` by default only for models with a known or explicitly
 configured provider contract. DeepSeek uses its `thinking` request shape; OpenRouter uses the
 portable `reasoning.effort` object. `tencent/hy3:free` is recognized as an OpenRouter reasoning
-model and supports `none`, `low`, and `high` effort. In **Models**, set **Native reasoning support**,
+model and supports `none`, `low`, and `high` effort. When an OpenRouter model is added or edited,
+Nscan refreshes `/api/v1/models` once and reads its per-model reasoning metadata; **Sync OpenRouter
+reasoning** performs the same refresh on demand. In **Models**, set **Native reasoning support**,
 choose the provider request contract, and select the effort. Unknown models remain off until their
 reasoning API compatibility is explicitly confirmed, so Nscan never sends speculative parameters to
 an upstream provider. Reasoning is retained only for required tool-call continuity and is not stored

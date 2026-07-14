@@ -101,6 +101,7 @@ export const api = {
   deleteModel: (name) => request(`/proxy/models/${encodeURIComponent(name)}`, { method: "DELETE" }),
   toggleModel: (name, enabled) => request(`/proxy/models/${encodeURIComponent(name)}/${enabled ? "enable" : "disable"}`, { method: "POST" }),
   testModel: (name) => request(`/proxy/models/${encodeURIComponent(name)}/test`, { method: "POST" }),
+  refreshModelReasoningCapabilities: () => request("/proxy/models/reasoning-capabilities/refresh", { method: "POST" }),
   setRoutingMode: (mode) => request("/proxy/models/routing-mode", { method: "POST", ...jsonBody({ mode }) }),
   setEgressEnabled: (enabled) => request("/proxy/nscan-runtime/proxy-enabled", { method: "POST", ...jsonBody({ enabled }) }),
   setEgressStartup: (enabled) => request("/proxy/nscan-runtime/proxy-startup-enabled", { method: "POST", ...jsonBody({ enabled }) }),

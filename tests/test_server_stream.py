@@ -2,7 +2,11 @@ import json
 import unittest
 from types import SimpleNamespace
 
-from server import _prepare_openai_request_body, normalize_openai_sse_chunk
+from server import (
+    _prepare_openai_request_body,
+    normalize_openai_sse_chunk,
+    normalize_openrouter_reasoning_capability,
+)
 
 
 class StreamChunkNormalizationTests(unittest.TestCase):
@@ -92,6 +96,28 @@ class StreamChunkNormalizationTests(unittest.TestCase):
         body = _prepare_openai_request_body(model, {"messages": []})
         self.assertNotIn("reasoning", body)
         self.assertNotIn("reasoning_effort", body)
+
+    def test_normalizes_openrouter_reasoning_metadata(self):
+        capability = normalize_openrouter_reasoning_capability(
+            {
+                "reasoning": {
+                    "supported_efforts": ["high", "low", "invalid"],
+                    "default_effort": "none",
+                    "default_enabled": False,
+                    "mandatory": False,
+                    "supports_max_tokens": True,
+                }
+            }
+        )
+        self.assertEqual(capability["supported_efforts"], ["high", "low"])
+        self.assertEqual(capability["default_effort"], "none")
+        self.assertTrue(capability["supports_max_tokens"])
+
+    def test_ignores_models_without_openrouter_reasoning_metadata(self):
+        self.assertEqual(
+            normalize_openrouter_reasoning_capability({"id": "ordinary/model"}),
+            {"supported": False},
+        )
 
 
 if __name__ == "__main__":

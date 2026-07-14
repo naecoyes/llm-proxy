@@ -77,6 +77,29 @@ SCAN_CONTAINER_ALLOWED_PATHS = frozenset(
     }
 )
 ASSET_IMPORT_MAX_TARGETS = 10_000
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+
+
+def normalize_openrouter_reasoning_capability(model_data: dict[str, Any]) -> dict[str, Any]:
+    """Normalize OpenRouter's optional per-model reasoning metadata."""
+    reasoning = model_data.get("reasoning")
+    if not isinstance(reasoning, dict):
+        return {"supported": False}
+
+    valid_efforts = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+    efforts = [
+        str(value).lower()
+        for value in reasoning.get("supported_efforts", []) or []
+        if str(value).lower() in valid_efforts
+    ]
+    return {
+        "supported": True,
+        "supported_efforts": efforts,
+        "default_effort": str(reasoning.get("default_effort") or "").lower(),
+        "default_enabled": bool(reasoning.get("default_enabled", False)),
+        "mandatory": bool(reasoning.get("mandatory", False)),
+        "supports_max_tokens": bool(reasoning.get("supports_max_tokens", False)),
+    }
 
 
 def asset_import_target_values(raw: Any) -> list[str]:
@@ -584,6 +607,10 @@ class LLMProxyServer:
         self._mimo_token_lock: asyncio.Lock = asyncio.Lock()
         self._provider_balance_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._provider_balance_lock: asyncio.Lock = asyncio.Lock()
+        self._openrouter_reasoning_capabilities: dict[str, dict[str, Any]] = {}
+        self._openrouter_capabilities_updated_at: float = 0.0
+        self._openrouter_capabilities_error: str = ""
+        self._openrouter_capabilities_lock: asyncio.Lock = asyncio.Lock()
         self.is_shutting_down = False
 
     def _load_config(self) -> dict:
@@ -637,6 +664,7 @@ class LLMProxyServer:
         allowed_ips = server_config.get("allowed_ips", [])
         self.ip_whitelist._update_config(allowed_ips)
         self.scan_container_subnets = parse_scan_container_subnets(validated)
+        self._apply_openrouter_reasoning_capabilities()
 
     def _on_config_change(self, new_config: dict):
         """配置变化回调"""
@@ -762,6 +790,89 @@ class LLMProxyServer:
             await self.http_client.aclose()
 
         logger.info("Nscan Proxy Server 已停止")
+
+    def _configured_openrouter_models(self) -> dict[str, Any]:
+        return {
+            name: model
+            for name, model in self.model_manager.models.items()
+            if str(model.provider or "").lower() == "openrouter"
+        }
+
+    def _apply_openrouter_reasoning_capabilities(self) -> None:
+        """Apply cached discovery without overwriting explicit operator choices."""
+        stored = self.config.get("models", {}).get("available", {}) or {}
+        for name, model in self._configured_openrouter_models().items():
+            capability = self._openrouter_reasoning_capabilities.get(name) or {}
+            if not capability.get("supported"):
+                continue
+            configured = stored.get(name, {}) or {}
+            if "reasoning_supported" not in configured:
+                model.reasoning_supported = True
+            if "reasoning_api" not in configured or configured.get("reasoning_api") == "auto":
+                model.reasoning_api = "openrouter"
+            if "thinking_enabled" not in configured:
+                model.thinking_enabled = True
+            if "reasoning_effort" not in configured:
+                # High is Nscan's default. OpenRouter maps it to the nearest
+                # model-supported level when an exact high tier is unavailable.
+                model.reasoning_effort = "high"
+
+    async def refresh_openrouter_reasoning_capabilities(
+        self, *, force: bool = False
+    ) -> dict[str, Any]:
+        """Refresh reasoning support for configured OpenRouter models only."""
+        configured = self._configured_openrouter_models()
+        if not configured:
+            return self.get_openrouter_reasoning_status()
+
+        async with self._openrouter_capabilities_lock:
+            try:
+                client = self.http_client or httpx.AsyncClient(timeout=15.0)
+                close_client = self.http_client is None
+                try:
+                    response = await client.get(OPENROUTER_MODELS_URL, timeout=15.0)
+                finally:
+                    if close_client:
+                        await client.aclose()
+                response.raise_for_status()
+                records = response.json().get("data", [])
+                by_id = {
+                    str(record.get("id") or "").lower(): record
+                    for record in records
+                    if isinstance(record, dict)
+                }
+                discovered: dict[str, dict[str, Any]] = {}
+                for name, model in configured.items():
+                    record = by_id.get(str(model.model or "").lower())
+                    capability = normalize_openrouter_reasoning_capability(record or {})
+                    capability["model_id"] = model.model
+                    discovered[name] = capability
+                self._openrouter_reasoning_capabilities = discovered
+                self._openrouter_capabilities_updated_at = time.time()
+                self._openrouter_capabilities_error = ""
+                self._apply_openrouter_reasoning_capabilities()
+                logger.info(
+                    "Refreshed OpenRouter reasoning metadata for %s configured models",
+                    len(discovered),
+                )
+            except Exception as exc:
+                self._openrouter_capabilities_error = str(exc)[:200]
+                logger.warning("OpenRouter reasoning metadata refresh failed: %s", exc)
+            return self.get_openrouter_reasoning_status()
+
+    def get_openrouter_reasoning_status(self) -> dict[str, Any]:
+        return {
+            "updated_at": (
+                datetime.fromtimestamp(
+                    self._openrouter_capabilities_updated_at, timezone.utc
+                ).isoformat()
+                if self._openrouter_capabilities_updated_at
+                else None
+            ),
+            "refresh_trigger": "model_change_or_manual",
+            "error": self._openrouter_capabilities_error,
+            "models": copy.deepcopy(self._openrouter_reasoning_capabilities),
+        }
 
     async def _health_check_loop(self):
         """定时健康检查循环"""
@@ -2237,9 +2348,15 @@ document.getElementById("f").addEventListener("submit",async e=>{
     async def proxy_status(scan_mode: str = "redteam"):
         """返回代理状态"""
         routing_context = {"scan_mode": str(scan_mode or "").strip().lower()}
+        models = server.model_manager.get_all_models_status(routing_context)
+        reasoning_capabilities = server.get_openrouter_reasoning_status()
+        for name, capability in reasoning_capabilities.get("models", {}).items():
+            if name in models:
+                models[name]["reasoning_capability"] = capability
         return {
             "status": "running",
-            "models": server.model_manager.get_all_models_status(routing_context),
+            "models": models,
+            "openrouter_reasoning_capabilities": reasoning_capabilities,
             "usage": server.model_manager.usage_controller.get_usage_report(),
             "provider_balances": await server.get_provider_balances(),
             "health": server.model_manager.health_checker.get_health_report(),
@@ -2943,6 +3060,8 @@ document.getElementById("f").addEventListener("submit",async e=>{
 
             # 保存配置
             server.model_manager.save_config(str(server.config_path))
+            if str(model_config.get("provider") or "").lower() == "openrouter":
+                await server.refresh_openrouter_reasoning_capabilities(force=True)
 
             return {"message": f"Model {name} added", "model": name}
         except HTTPException:
@@ -3015,6 +3134,8 @@ document.getElementById("f").addEventListener("submit",async e=>{
 
             server.model_manager.update_config(server.config)
             server.model_manager.save_config(str(server.config_path))
+            if str(stored.get("provider") or "").lower() == "openrouter":
+                await server.refresh_openrouter_reasoning_capabilities(force=True)
 
             return {"message": f"Model {model_name} updated"}
         except HTTPException:
@@ -3049,6 +3170,11 @@ document.getElementById("f").addEventListener("submit",async e=>{
             "message": "Model active request counters reset",
             **result,
         }
+
+    @app.post("/proxy/models/reasoning-capabilities/refresh")
+    async def refresh_model_reasoning_capabilities():
+        """Refresh OpenRouter reasoning metadata for configured models."""
+        return await server.refresh_openrouter_reasoning_capabilities(force=True)
 
     @app.post("/proxy/models/{model_name}/reset")
     async def reset_model(model_name: str):
@@ -3088,6 +3214,13 @@ document.getElementById("f").addEventListener("submit",async e=>{
             "routing_tier": config.routing_tier,
             "allowed_scan_modes": config.allowed_scan_modes,
             "quota_policy": config.quota_policy,
+            "reasoning_supported": config.reasoning_supported,
+            "reasoning_api": config.reasoning_api,
+            "thinking_enabled": config.thinking_enabled,
+            "reasoning_effort": config.reasoning_effort,
+            "reasoning_capability": server.get_openrouter_reasoning_status()
+            .get("models", {})
+            .get(model_name, {}),
             "limits": server.config.get("usage", {})
             .get("per_model_limits", {})
             .get(model_name, {}),
