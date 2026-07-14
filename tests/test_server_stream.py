@@ -69,6 +69,30 @@ class StreamChunkNormalizationTests(unittest.TestCase):
         body = _prepare_openai_request_body(model, {"messages": []})
         self.assertEqual(body["reasoning_effort"], "max")
 
+    def test_openrouter_hy3_uses_high_reasoning(self):
+        model = SimpleNamespace(
+            provider="openrouter",
+            model="tencent/hy3:free",
+            thinking_enabled=True,
+            reasoning_supported=True,
+            reasoning_effort="high",
+        )
+        body = _prepare_openai_request_body(model, {"messages": []})
+        self.assertEqual(body["reasoning"], {"effort": "high"})
+        self.assertNotIn("thinking", body)
+
+    def test_unsupported_model_does_not_receive_reasoning_fields(self):
+        model = SimpleNamespace(
+            provider="openrouter",
+            model="other/model",
+            thinking_enabled=True,
+            reasoning_supported=False,
+            reasoning_effort="high",
+        )
+        body = _prepare_openai_request_body(model, {"messages": []})
+        self.assertNotIn("reasoning", body)
+        self.assertNotIn("reasoning_effort", body)
+
 
 if __name__ == "__main__":
     unittest.main()

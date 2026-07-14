@@ -27,7 +27,12 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from config_watcher import ConfigWatcher
-from model_manager import ModelManager, NoAvailableModelError
+from model_manager import (
+    ModelManager,
+    NoAvailableModelError,
+    default_reasoning_api,
+    supports_native_reasoning,
+)
 from request_logger import (
     SCAN_CONTEXT_FIELD_HEADERS,
     request_logger,
@@ -434,37 +439,53 @@ _DEEPSEEK_REASONING_EFFORTS = {
 }
 
 
-def _uses_deepseek_thinking(model_config: Any) -> bool:
-    return (
-        str(getattr(model_config, "provider", "")).lower() == "deepseek"
-        and bool(getattr(model_config, "thinking_enabled", True))
+def _reasoning_api(model_config: Any) -> str:
+    """Resolve a configured reasoning transport without guessing upstream support."""
+    provider = str(getattr(model_config, "provider", "") or "").lower()
+    model = str(getattr(model_config, "model", "") or "")
+    supported = bool(
+        getattr(model_config, "reasoning_supported", supports_native_reasoning(provider, model))
     )
+    configured = str(getattr(model_config, "reasoning_api", "") or "").lower()
+    return configured if configured and configured != "auto" else default_reasoning_api(provider, model, supported)
+
+
+def _uses_native_reasoning(model_config: Any) -> bool:
+    return bool(getattr(model_config, "thinking_enabled", False)) and _reasoning_api(model_config) != "none"
+
+
+def _uses_deepseek_thinking(model_config: Any) -> bool:
+    return _uses_native_reasoning(model_config) and _reasoning_api(model_config) == "deepseek"
 
 
 def _sanitize_reasoning_messages(
     messages: list[Any], *, preserve_tool_reasoning: bool
 ) -> list[Any]:
-    """Keep DeepSeek tool-turn reasoning, without retaining ordinary turn CoT."""
+    """Keep native tool-turn reasoning, without retaining ordinary turn CoT."""
     cleaned = copy.deepcopy(messages)
     for message in cleaned:
-        if not isinstance(message, dict) or "reasoning_content" not in message:
+        if not isinstance(message, dict):
             continue
-        if not (
+        should_preserve = (
             preserve_tool_reasoning
             and message.get("role") == "assistant"
             and bool(message.get("tool_calls"))
-        ):
-            message.pop("reasoning_content", None)
+        )
+        if should_preserve:
+            continue
+        for field in ("reasoning", "reasoning_content", "reasoning_details"):
+            message.pop(field, None)
     return cleaned
 
 
 def _prepare_openai_request_body(model_config: Any, request_body: dict) -> dict:
-    """Build a provider-safe body while preserving DeepSeek tool-call continuity."""
+    """Build a provider-safe body while preserving native tool-call continuity."""
     body = copy.deepcopy(request_body)
     deepseek_thinking = _uses_deepseek_thinking(model_config)
+    native_reasoning = _uses_native_reasoning(model_config)
     body["messages"] = _sanitize_reasoning_messages(
         body.get("messages") or [],
-        preserve_tool_reasoning=deepseek_thinking,
+        preserve_tool_reasoning=native_reasoning,
     )
 
     if deepseek_thinking:
@@ -482,6 +503,17 @@ def _prepare_openai_request_body(model_config: Any, request_body: dict) -> dict:
         body.pop("thinking", None)
         body.pop("reasoning_effort", None)
         body["thinking"] = {"type": "disabled"}
+    elif _reasoning_api(model_config) == "openrouter":
+        # OpenRouter normalizes provider-native thinking behind this request
+        # shape. High is the Nscan default for explicitly capable models.
+        effort = str(getattr(model_config, "reasoning_effort", "high") or "high").lower()
+        if effort not in {"none", "minimal", "low", "medium", "high", "xhigh", "max"}:
+            effort = "high"
+        body["reasoning"] = {"effort": effort}
+    elif _reasoning_api(model_config) == "openai" and native_reasoning:
+        body["reasoning_effort"] = str(
+            getattr(model_config, "reasoning_effort", "high") or "high"
+        ).lower()
     return body
 
 
@@ -1973,7 +2005,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
                                     yield f"data: {error_event}\n\n"
                                     break
 
-                                # Preserve DeepSeek tool-turn reasoning for the
+                                # Preserve native tool-turn reasoning for the
                                 # agent SDK, but never persist it in Nscan logs.
                                 # Collect diagnostics from every
                                 # SSE data line. A single network chunk may
@@ -1982,7 +2014,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
                                 # valid assistant content.
                                 chunk, stream_diag = normalize_openai_sse_chunk(
                                     chunk,
-                                    preserve_reasoning_content=_uses_deepseek_thinking(model_config),
+                                    preserve_reasoning_content=_uses_native_reasoning(model_config),
                                 )
                                 if stream_diag.get("has_content"):
                                     has_content_in_delta = True
@@ -2115,9 +2147,9 @@ document.getElementById("f").addEventListener("submit",async e=>{
                         model_name, model_config, body, stream=False
                     )
 
-                    # DeepSeek needs tool-turn reasoning returned to the SDK so
-                    # its next tool request can keep the required context.
-                    if isinstance(response_data, dict) and not _uses_deepseek_thinking(model_config):
+                    # Native reasoning returns to the SDK only when tool-turn
+                    # continuity is required.
+                    if isinstance(response_data, dict) and not _uses_native_reasoning(model_config):
                         choices = response_data.get("choices")
                         if isinstance(choices, list):
                             for c in choices:
@@ -2869,10 +2901,21 @@ document.getElementById("f").addEventListener("submit",async e=>{
                 "strip_provider_prefix": bool(body.get("strip_provider_prefix", False)),
                 "max_context_tokens": int(body.get("max_context_tokens", 0) or 0),
                 "request_overrides": body.get("request_overrides", {}),
+                "reasoning_supported": bool(
+                    body.get(
+                        "reasoning_supported",
+                        supports_native_reasoning(
+                            str(body.get("provider") or ""), body.get("model", "")
+                        ),
+                    )
+                ),
+                "reasoning_api": str(body.get("reasoning_api") or "auto").lower(),
                 "thinking_enabled": bool(
                     body.get(
                         "thinking_enabled",
-                        str(body.get("provider") or "").lower() == "deepseek",
+                        supports_native_reasoning(
+                            str(body.get("provider") or ""), body.get("model", "")
+                        ),
                     )
                 ),
                 "reasoning_effort": str(body.get("reasoning_effort") or "high").lower(),
@@ -2935,6 +2978,8 @@ document.getElementById("f").addEventListener("submit",async e=>{
                 "request_overrides",
                 "thinking_enabled",
                 "reasoning_effort",
+                "reasoning_supported",
+                "reasoning_api",
                 "enabled",
                 "free",
                 "peak_only",

@@ -429,6 +429,17 @@ Probe and Smart Batch write best-effort updates into the database. If the DB is 
 unavailable, events are spooled under `llm_proxy/runtime/asset_spool/` and can be replayed through
 `POST /proxy/assets/spool/replay`.
 
+### Native Reasoning
+
+Nscan enables native reasoning at `high` by default only for models with a known or explicitly
+configured provider contract. DeepSeek uses its `thinking` request shape; OpenRouter uses the
+portable `reasoning.effort` object. `tencent/hy3:free` is recognized as an OpenRouter reasoning
+model and supports `none`, `low`, and `high` effort. In **Models**, set **Native reasoning support**,
+choose the provider request contract, and select the effort. Unknown models remain off until their
+reasoning API compatibility is explicitly confirmed, so Nscan never sends speculative parameters to
+an upstream provider. Reasoning is retained only for required tool-call continuity and is not stored
+in Nscan request logs.
+
 Set the dashboard PIN with `NSCAN_DASHBOARD_PIN` or `admin.pin_code`. Existing deployments may use
 `admin.api_key` as a compatibility fallback. The first successful `X-Nscan-Pin` verification issues
 an HttpOnly, SameSite=Strict administration cookie, so later visits do not need the PIN again.

@@ -17,6 +17,32 @@ from usage_controller import UsageController
 logger = logging.getLogger(__name__)
 
 
+def supports_native_reasoning(provider: str, model: str) -> bool:
+    """Return known native reasoning support without guessing for every model."""
+    normalized_provider = str(provider or "").strip().lower()
+    normalized_model = str(model or "").strip().lower()
+    if normalized_provider == "deepseek":
+        return True
+    if normalized_provider != "openrouter":
+        return False
+
+    # Keep this intentionally narrow. Unknown OpenRouter models must be opted
+    # in by an operator after their provider contract is confirmed.
+    return normalized_model.removeprefix("openrouter/") == "tencent/hy3:free"
+
+
+def default_reasoning_api(provider: str, model: str, supported: bool) -> str:
+    """Select the request contract for a model that has native reasoning."""
+    if not supported:
+        return "none"
+    normalized_provider = str(provider or "").strip().lower()
+    if normalized_provider == "deepseek":
+        return "deepseek"
+    if normalized_provider == "openrouter":
+        return "openrouter"
+    return "openai"
+
+
 @dataclass
 class ModelConfig:
     """模型配置"""
@@ -40,6 +66,8 @@ class ModelConfig:
     allowed_scan_modes: list = field(default_factory=list)
     quota_policy: dict = field(default_factory=dict)
     max_context_tokens: int = 0
+    reasoning_supported: bool = False
+    reasoning_api: str = "none"
     thinking_enabled: bool = False
     reasoning_effort: str = "high"
 
@@ -101,13 +129,20 @@ class ModelManager:
 
         for name, model_conf in models_config.items():
             enabled = model_conf.get("enabled", True)
+            provider = str(model_conf.get("provider") or "")
+            configured_support = model_conf.get("reasoning_supported")
+            reasoning_supported = (
+                bool(configured_support)
+                if configured_support is not None
+                else supports_native_reasoning(provider, model_conf.get("model", ""))
+            )
 
             model = ModelConfig(
                 name=name,
                 model=model_conf.get("model", ""),
                 api_key=model_conf.get("api_key", ""),
                 api_base=model_conf.get("api_base", ""),
-                provider=model_conf.get("provider", ""),
+                provider=provider,
                 priority=model_conf.get("priority", 100),
                 enabled=enabled,
                 peak_only=model_conf.get("peak_only", False),
@@ -126,12 +161,19 @@ class ModelManager:
                     or model_conf.get("context_window")
                     or 0
                 ),
-                # DeepSeek native thinking is enabled by default. Other
-                # providers remain opt-in until their contract is configured.
+                reasoning_supported=reasoning_supported,
+                reasoning_api=str(
+                    model_conf.get("reasoning_api")
+                    or default_reasoning_api(
+                        provider, model_conf.get("model", ""), reasoning_supported
+                    )
+                ).lower(),
+                # Native-capable models default to high reasoning. Unknown
+                # providers remain opt-in until an operator confirms support.
                 thinking_enabled=bool(
                     model_conf.get(
                         "thinking_enabled",
-                        str(model_conf.get("provider") or "").lower() == "deepseek",
+                        reasoning_supported,
                     )
                 ),
                 reasoning_effort=str(model_conf.get("reasoning_effort") or "high").lower(),
@@ -280,6 +322,8 @@ class ModelManager:
                 "max_context_tokens": model.max_context_tokens,
                 "thinking_enabled": model.thinking_enabled,
                 "reasoning_effort": model.reasoning_effort,
+                "reasoning_supported": model.reasoning_supported,
+                "reasoning_api": model.reasoning_api,
             }
 
         quota_policy = model.quota_policy or {}
