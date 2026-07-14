@@ -1197,6 +1197,10 @@ class ModelManager:
                 "allowed_scan_modes": model.allowed_scan_modes,
                 "quota_policy": model.quota_policy,
                 "max_context_tokens": model.max_context_tokens,
+                "reasoning_supported": model.reasoning_supported,
+                "reasoning_api": model.reasoning_api,
+                "thinking_enabled": model.thinking_enabled,
+                "reasoning_effort": model.reasoning_effort,
                 "request_overrides": self.config.get("models", {})
                 .get("available", {})
                 .get(name, {})
