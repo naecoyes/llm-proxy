@@ -194,7 +194,7 @@ function renderModels(status, config, query) {
     const health = model.health || {};
     const route = model.auto_routing || {};
     const statusLabel = !model.enabled ? "Disabled" : health.healthy === false ? "Unhealthy" : "Healthy";
-    const tags = [model.free ? "Free" : "Paid", model.routing_tier === "reserve" ? "Reserve" : "", model.api_format === "anthropic" ? "Messages" : "Chat", ...(model.allowed_scan_modes || [])].filter(Boolean);
+    const tags = [model.free ? "Free" : "Paid", model.routing_tier === "reserve" ? "Reserve" : "", model.api_format === "anthropic" ? "Messages" : "Chat", model.thinking_enabled ? `Thinking ${model.reasoning_effort || "high"}` : "", ...(model.allowed_scan_modes || [])].filter(Boolean);
     const secondary = `<div class="tag-row">${tags.map((tag) => badge(tag, tag === "Free" ? "success" : "info")).join("")}</div><div class="mono">${escapeHtml(model.model || "-")} ${model.api_key_hint ? `· key •••${escapeHtml(model.api_key_hint)}` : ""}</div>`;
     return `<tr data-model="${escapeHtml(name)}"><td>${modelIdentity({ ...model, name }, { secondary })}</td>
       <td>${providerChip({ ...model, name })}</td><td>${model.priority ?? "-"}</td><td><div>${limits.max_concurrent || "unlimited"} concurrent</div><div class="cell-secondary">${limits.max_requests_per_minute || "unlimited"} RPM</div></td>
@@ -224,6 +224,8 @@ function modelForm(model = null) {
     <label class="field">Exact endpoint URL<select name="is_exact_url"><option value="false" ${!model?.is_exact_url ? "selected" : ""}>Append route</option><option value="true" ${model?.is_exact_url ? "selected" : ""}>Use exact URL</option></select></label>
     <label class="field">Strip provider prefix<select name="strip_provider_prefix"><option value="true" ${model?.strip_provider_prefix !== false ? "selected" : ""}>Enabled</option><option value="false" ${model?.strip_provider_prefix === false ? "selected" : ""}>Disabled</option></select></label>
     <label class="field">Context window<input name="max_context_tokens" type="number" min="0" value="${model?.max_context_tokens || 0}"><span class="field-help">0 means unknown; redteam routing may exclude small windows.</span></label>
+    <label class="field">Thinking mode<select name="thinking_enabled"><option value="true" ${model?.thinking_enabled !== false && model?.provider === "deepseek" ? "selected" : ""}>Enabled</option><option value="false" ${model?.thinking_enabled === false || model?.provider !== "deepseek" ? "selected" : ""}>Disabled</option></select><span class="field-help">DeepSeek native thinking. Tool-turn reasoning stays in the SDK only.</span></label>
+    <label class="field">Reasoning effort<select name="reasoning_effort"><option value="high" ${(model?.reasoning_effort || "high") === "high" ? "selected" : ""}>High</option><option value="max" ${(model?.reasoning_effort || "") === "max" ? "selected" : ""}>Max</option></select><span class="field-help">Default High; xhigh maps to Max.</span></label>
     <label class="field">Priority<input name="priority" type="number" min="0" value="${model?.priority ?? 100}"></label>
     <label class="field">Label<input name="label" value="${escapeHtml(model?.label || "")}" placeholder="Optional label"></label>
     <label class="field">Max concurrent<input name="max_concurrent" type="number" min="0" value="${limits.max_concurrent || 0}"><span class="field-help">0 uses the provider default.</span></label>
@@ -259,6 +261,8 @@ function formPayload(form, editing = false) {
     strip_provider_prefix: values.strip_provider_prefix !== "false",
     custom_headers: customHeaders,
     max_context_tokens: Number(values.max_context_tokens) || 0,
+    thinking_enabled: values.thinking_enabled === "true",
+    reasoning_effort: values.reasoning_effort || "high",
     priority: Number(values.priority) || 0,
     label: values.label.trim(),
     max_concurrent: Number(values.max_concurrent) || 0,

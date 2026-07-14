@@ -40,6 +40,8 @@ class ModelConfig:
     allowed_scan_modes: list = field(default_factory=list)
     quota_policy: dict = field(default_factory=dict)
     max_context_tokens: int = 0
+    thinking_enabled: bool = False
+    reasoning_effort: str = "high"
 
 
 class NoAvailableModelError(Exception):
@@ -124,6 +126,15 @@ class ModelManager:
                     or model_conf.get("context_window")
                     or 0
                 ),
+                # DeepSeek native thinking is enabled by default. Other
+                # providers remain opt-in until their contract is configured.
+                thinking_enabled=bool(
+                    model_conf.get(
+                        "thinking_enabled",
+                        str(model_conf.get("provider") or "").lower() == "deepseek",
+                    )
+                ),
+                reasoning_effort=str(model_conf.get("reasoning_effort") or "high").lower(),
             )
 
             self.models[name] = model
@@ -267,6 +278,8 @@ class ModelManager:
                 "allowed_scan_modes": allowed_modes,
                 "required_context_tokens": required_context,
                 "max_context_tokens": model.max_context_tokens,
+                "thinking_enabled": model.thinking_enabled,
+                "reasoning_effort": model.reasoning_effort,
             }
 
         quota_policy = model.quota_policy or {}

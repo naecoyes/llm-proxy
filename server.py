@@ -341,7 +341,9 @@ def list_asset_changes(cursor: str = "", limit: int = 500) -> dict[str, Any]:
     }
 
 
-def normalize_openai_sse_chunk(chunk: bytes | str) -> tuple[bytes | str, dict[str, Any]]:
+def normalize_openai_sse_chunk(
+    chunk: bytes | str, *, preserve_reasoning_content: bool = False
+) -> tuple[bytes | str, dict[str, Any]]:
     """Normalize one OpenAI-compatible SSE chunk and collect stream diagnostics.
 
     Some providers, notably DeepSeek-compatible streams, may omit final usage
@@ -399,14 +401,14 @@ def normalize_openai_sse_chunk(chunk: bytes | str) -> tuple[bytes | str, dict[st
                     diagnostics["finish_reason"] = finish_reason
                 delta = choice.get("delta") or {}
                 if isinstance(delta, dict):
-                    if "reasoning_content" in delta:
+                    if "reasoning_content" in delta and not preserve_reasoning_content:
                         delta.pop("reasoning_content", None)
                         changed = True
                     if str(delta.get("content") or "").strip():
                         diagnostics["has_content"] = True
                 message = choice.get("message") or {}
                 if isinstance(message, dict):
-                    if "reasoning_content" in message:
+                    if "reasoning_content" in message and not preserve_reasoning_content:
                         message.pop("reasoning_content", None)
                         changed = True
                     if str(message.get("content") or "").strip():
@@ -419,6 +421,68 @@ def normalize_openai_sse_chunk(chunk: bytes | str) -> tuple[bytes | str, dict[st
     if not changed:
         return chunk, diagnostics
     return (normalized.encode() if was_bytes else normalized), diagnostics
+
+
+_DEEPSEEK_REASONING_EFFORTS = {
+    "none": "high",
+    "minimal": "high",
+    "low": "high",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+}
+
+
+def _uses_deepseek_thinking(model_config: Any) -> bool:
+    return (
+        str(getattr(model_config, "provider", "")).lower() == "deepseek"
+        and bool(getattr(model_config, "thinking_enabled", True))
+    )
+
+
+def _sanitize_reasoning_messages(
+    messages: list[Any], *, preserve_tool_reasoning: bool
+) -> list[Any]:
+    """Keep DeepSeek tool-turn reasoning, without retaining ordinary turn CoT."""
+    cleaned = copy.deepcopy(messages)
+    for message in cleaned:
+        if not isinstance(message, dict) or "reasoning_content" not in message:
+            continue
+        if not (
+            preserve_tool_reasoning
+            and message.get("role") == "assistant"
+            and bool(message.get("tool_calls"))
+        ):
+            message.pop("reasoning_content", None)
+    return cleaned
+
+
+def _prepare_openai_request_body(model_config: Any, request_body: dict) -> dict:
+    """Build a provider-safe body while preserving DeepSeek tool-call continuity."""
+    body = copy.deepcopy(request_body)
+    deepseek_thinking = _uses_deepseek_thinking(model_config)
+    body["messages"] = _sanitize_reasoning_messages(
+        body.get("messages") or [],
+        preserve_tool_reasoning=deepseek_thinking,
+    )
+
+    if deepseek_thinking:
+        effort = _DEEPSEEK_REASONING_EFFORTS.get(
+            str(getattr(model_config, "reasoning_effort", "high") or "high").lower(),
+            "high",
+        )
+        # DeepSeek thinking ignores these sampling options. Removing them
+        # makes the effective request explicit and reproducible.
+        for field in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
+            body.pop(field, None)
+        body["thinking"] = {"type": "enabled"}
+        body["reasoning_effort"] = effort
+    elif str(getattr(model_config, "provider", "")).lower() == "deepseek":
+        body.pop("thinking", None)
+        body.pop("reasoning_effort", None)
+        body["thinking"] = {"type": "disabled"}
+    return body
 
 
 class IPWhitelist:
@@ -1226,25 +1290,12 @@ class LLMProxyServer:
         if hasattr(model_config, "custom_headers") and model_config.custom_headers:
             headers.update(model_config.custom_headers)
 
-        body = request_body.copy()
-
-        # Strip reasoning_content from all messages so that previous
-        # reasoning tokens never trigger provider rejections (e.g.
-        # DeepSeek: "reasoning_content must be passed back to API").
-        for msg in body.get("messages", []):
-            if isinstance(msg, dict):
-                msg.pop("reasoning_content", None)
+        body = _prepare_openai_request_body(model_config, request_body)
 
         model_id = model_config.model
         if getattr(model_config, "strip_provider_prefix", True) and "/" in model_id:
             model_id = model_id.split("/", 1)[1]
         body["model"] = model_id
-
-        # DeepSeek: disable native thinking to prevent new reasoning tokens.
-        if getattr(model_config, "provider", "") == "deepseek":
-            body.pop("thinking", None)
-            body.pop("reasoning_effort", None)
-            body["thinking"] = {"type": "disabled"}
 
         retry_mimo = 0
         while True:
@@ -1876,7 +1927,9 @@ document.getElementById("f").addEventListener("submit",async e=>{
                     requested_model=requested_model or "auto",
                     actual_model=model_name,
                     provider=model_config.provider,
-                    messages=messages,
+                    messages=_sanitize_reasoning_messages(
+                        messages, preserve_tool_reasoning=False
+                    ),
                     stream=stream,
                     model_id=model_config.model,
                     scan_context=scan_context,
@@ -1920,13 +1973,17 @@ document.getElementById("f").addEventListener("submit",async e=>{
                                     yield f"data: {error_event}\n\n"
                                     break
 
-                                # Strip reasoning_content before forwarding to
-                                # agent SDK and collect diagnostics from every
+                                # Preserve DeepSeek tool-turn reasoning for the
+                                # agent SDK, but never persist it in Nscan logs.
+                                # Collect diagnostics from every
                                 # SSE data line. A single network chunk may
                                 # contain multiple data events, and some
                                 # providers omit usage while still streaming
                                 # valid assistant content.
-                                chunk, stream_diag = normalize_openai_sse_chunk(chunk)
+                                chunk, stream_diag = normalize_openai_sse_chunk(
+                                    chunk,
+                                    preserve_reasoning_content=_uses_deepseek_thinking(model_config),
+                                )
                                 if stream_diag.get("has_content"):
                                     has_content_in_delta = True
                                 usage = stream_diag.get("usage")
@@ -2058,9 +2115,9 @@ document.getElementById("f").addEventListener("submit",async e=>{
                         model_name, model_config, body, stream=False
                     )
 
-                    # Strip reasoning_content from non-streaming response
-                    # before returning to agent SDK.
-                    if isinstance(response_data, dict):
+                    # DeepSeek needs tool-turn reasoning returned to the SDK so
+                    # its next tool request can keep the required context.
+                    if isinstance(response_data, dict) and not _uses_deepseek_thinking(model_config):
                         choices = response_data.get("choices")
                         if isinstance(choices, list):
                             for c in choices:
@@ -2812,6 +2869,13 @@ document.getElementById("f").addEventListener("submit",async e=>{
                 "strip_provider_prefix": bool(body.get("strip_provider_prefix", False)),
                 "max_context_tokens": int(body.get("max_context_tokens", 0) or 0),
                 "request_overrides": body.get("request_overrides", {}),
+                "thinking_enabled": bool(
+                    body.get(
+                        "thinking_enabled",
+                        str(body.get("provider") or "").lower() == "deepseek",
+                    )
+                ),
+                "reasoning_effort": str(body.get("reasoning_effort") or "high").lower(),
             }
 
             limits = server.config.setdefault("usage", {}).setdefault(
@@ -2869,6 +2933,8 @@ document.getElementById("f").addEventListener("submit",async e=>{
                 "strip_provider_prefix",
                 "max_context_tokens",
                 "request_overrides",
+                "thinking_enabled",
+                "reasoning_effort",
                 "enabled",
                 "free",
                 "peak_only",
