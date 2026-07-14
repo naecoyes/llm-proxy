@@ -16,7 +16,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urlsplit
@@ -26,7 +26,7 @@ try:
 except ModuleNotFoundError:  # package import from the project root
     from .target_policy import normalize_platform, target_host
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 7
 
 
 def now_iso() -> str:
@@ -157,6 +157,21 @@ class AssetDatabase:
                     UNIQUE(asset_id, ip, source)
                 );
                 CREATE INDEX IF NOT EXISTS idx_address_ip ON asset_addresses(ip);
+
+                CREATE TABLE IF NOT EXISTS asset_scope_decisions (
+                    asset_id INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+                    scope_status TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT '',
+                    confidence TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    evidence_json TEXT NOT NULL DEFAULT '[]',
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    catalog_version TEXT NOT NULL DEFAULT '',
+                    certificate_subject TEXT NOT NULL DEFAULT '',
+                    policy_version TEXT NOT NULL DEFAULT '',
+                    evaluated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_scope_status ON asset_scope_decisions(scope_status, category);
 
                 CREATE TABLE IF NOT EXISTS probe_runs (
                     id TEXT PRIMARY KEY,
@@ -456,6 +471,62 @@ class AssetDatabase:
                 );
                 CREATE INDEX IF NOT EXISTS idx_target_quarantine_platform ON target_quarantine(platform, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_target_quarantine_reason ON target_quarantine(reason, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS asset_import_batches (
+                    import_id TEXT PRIMARY KEY,
+                    source_type TEXT NOT NULL,
+                    source_ref TEXT NOT NULL,
+                    group_key TEXT NOT NULL DEFAULT '',
+                    sync_cursor TEXT NOT NULL,
+                    submitted_at TEXT NOT NULL,
+                    input_count INTEGER NOT NULL DEFAULT 0,
+                    accepted_count INTEGER NOT NULL DEFAULT 0,
+                    rejected_count INTEGER NOT NULL DEFAULT 0,
+                    created_count INTEGER NOT NULL DEFAULT 0,
+                    existing_count INTEGER NOT NULL DEFAULT 0,
+                    dry_run INTEGER NOT NULL DEFAULT 0,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    UNIQUE(source_type, source_ref, sync_cursor)
+                );
+                CREATE INDEX IF NOT EXISTS idx_asset_import_batches_source
+                  ON asset_import_batches(source_type, source_ref, submitted_at DESC);
+
+                CREATE TABLE IF NOT EXISTS asset_import_cursors (
+                    source_type TEXT NOT NULL,
+                    source_ref TEXT NOT NULL,
+                    sync_cursor TEXT NOT NULL,
+                    import_id TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL,
+                    batches_completed INTEGER NOT NULL DEFAULT 0,
+                    accepted_total INTEGER NOT NULL DEFAULT 0,
+                    created_total INTEGER NOT NULL DEFAULT 0,
+                    existing_total INTEGER NOT NULL DEFAULT 0,
+                    rejected_total INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(source_type, source_ref)
+                );
+
+                CREATE TABLE IF NOT EXISTS smart_batch_snapshots (
+                    batch_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL,
+                    state_path TEXT NOT NULL DEFAULT '',
+                    snapshot_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX IF NOT EXISTS idx_smart_batch_snapshots_updated
+                  ON smart_batch_snapshots(updated_at DESC, status);
+
+                CREATE TABLE IF NOT EXISTS smart_batch_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT '',
+                    engine TEXT NOT NULL DEFAULT '',
+                    phase TEXT NOT NULL DEFAULT '',
+                    submitted_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    job_path TEXT NOT NULL DEFAULT '',
+                    state_json TEXT NOT NULL DEFAULT '{}'
+                );
+                CREATE INDEX IF NOT EXISTS idx_smart_batch_jobs_updated
+                  ON smart_batch_jobs(updated_at DESC, status, engine);
                 """
             )
             connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -534,6 +605,66 @@ class AssetDatabase:
                 seen_at=seen_at,
                 root_domain=root_domain,
             )
+
+    def record_scope_decisions(
+        self,
+        decisions: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+        *,
+        source_type: str = "scope_gate",
+        source_ref: str = "",
+    ) -> int:
+        """Persist derived scope metadata without altering raw inventory data."""
+        timestamp = now_iso()
+        stored = 0
+        with self.transaction() as connection:
+            for decision in decisions:
+                if not isinstance(decision, dict):
+                    continue
+                target = str(decision.get("target") or "").strip()
+                status = str(decision.get("scope_status") or "").strip()
+                if not target or not status:
+                    continue
+                asset_id = self._asset_id(
+                    connection,
+                    target,
+                    source_type=source_type,
+                    source_ref=source_ref,
+                    seen_at=timestamp,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO asset_scope_decisions(
+                      asset_id,scope_status,category,confidence,reason,evidence_json,
+                      tags_json,catalog_version,certificate_subject,policy_version,evaluated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(asset_id) DO UPDATE SET
+                      scope_status=excluded.scope_status,
+                      category=excluded.category,
+                      confidence=excluded.confidence,
+                      reason=excluded.reason,
+                      evidence_json=excluded.evidence_json,
+                      tags_json=excluded.tags_json,
+                      catalog_version=excluded.catalog_version,
+                      certificate_subject=excluded.certificate_subject,
+                      policy_version=excluded.policy_version,
+                      evaluated_at=excluded.evaluated_at
+                    """,
+                    (
+                        asset_id,
+                        status,
+                        str(decision.get("category") or ""),
+                        str(decision.get("confidence") or ""),
+                        str(decision.get("reason") or ""),
+                        json.dumps(decision.get("evidence") or [], ensure_ascii=False),
+                        json.dumps(decision.get("tags") or [], ensure_ascii=False),
+                        str(decision.get("catalog_version") or ""),
+                        str(decision.get("certificate_subject") or "")[:2048],
+                        str(decision.get("policy_version") or "nscan-uae-public-interest-v1"),
+                        timestamp,
+                    ),
+                )
+                stored += 1
+        return stored
 
     def record_target_ingest(
         self,
@@ -660,6 +791,180 @@ class AssetDatabase:
             "dry_run": bool(dry_run),
             "created_at": timestamp,
         }
+
+    def record_asset_import(
+        self,
+        *,
+        source_type: str,
+        source_ref: str,
+        sync_cursor: str,
+        accepted_targets: list[str] | tuple[str, ...] | None = None,
+        rejected_targets: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+        input_count: int = 0,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist an inventory-only target batch without creating scan work.
+
+        The ``source_type/source_ref/sync_cursor`` key makes a replay of a
+        completed upstream page idempotent. Asset aliases and group membership
+        are also upserted, so a resumed importer can safely retry a batch.
+        """
+        source = normalize_platform(source_type)
+        reference = str(source_ref or "").strip()
+        cursor = str(sync_cursor or "").strip()
+        if not reference:
+            raise ValueError("source_ref is required for an asset import")
+        if not cursor:
+            raise ValueError("sync_cursor is required for an asset import")
+
+        accepted = [str(target).strip() for target in (accepted_targets or []) if str(target).strip()]
+        rejected = list(rejected_targets or [])
+        group_key = f"platform:{source}"
+        timestamp = now_iso()
+        import_id = f"asset-import-{datetime.now(timezone.utc):%Y%m%d%H%M%S}-{uuid.uuid4().hex[:8]}"
+        metadata_payload = {
+            **(metadata or {}),
+            "accepted_preview": accepted[:20],
+            "rejected_preview": rejected[:20],
+            "register_only": True,
+        }
+
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO asset_groups(group_key,label,platform,source_ref,created_at,updated_at,metadata_json)
+                VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(group_key) DO UPDATE SET
+                  platform=excluded.platform,
+                  source_ref=excluded.source_ref,
+                  updated_at=excluded.updated_at,
+                  metadata_json=excluded.metadata_json
+                """,
+                (
+                    group_key, source, source, reference, timestamp, timestamp,
+                    json.dumps(metadata or {}, ensure_ascii=False, default=str),
+                ),
+            )
+            existing_count = 0
+            created_count = 0
+            for target in accepted:
+                normalized = normalize_target(target)
+                exists = connection.execute(
+                    "SELECT 1 FROM assets WHERE canonical_key=?", (normalized["canonical_key"],)
+                ).fetchone()
+                if exists:
+                    existing_count += 1
+                else:
+                    created_count += 1
+                asset_id = self._asset_id(
+                    connection,
+                    target,
+                    source_type=source,
+                    source_ref=reference,
+                    seen_at=timestamp,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO asset_group_members(group_key,asset_id,source_ref,first_seen,last_seen)
+                    VALUES(?,?,?,?,?)
+                    ON CONFLICT(group_key,asset_id,source_ref) DO UPDATE SET last_seen=excluded.last_seen
+                    """,
+                    (group_key, asset_id, reference, timestamp, timestamp),
+                )
+
+            connection.execute(
+                """
+                INSERT INTO asset_import_batches(
+                  import_id,source_type,source_ref,group_key,sync_cursor,submitted_at,
+                  input_count,accepted_count,rejected_count,created_count,existing_count,dry_run,metadata_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(source_type,source_ref,sync_cursor) DO UPDATE SET
+                  submitted_at=excluded.submitted_at,
+                  input_count=excluded.input_count,
+                  accepted_count=excluded.accepted_count,
+                  rejected_count=excluded.rejected_count,
+                  created_count=excluded.created_count,
+                  existing_count=excluded.existing_count,
+                  metadata_json=excluded.metadata_json
+                """,
+                (
+                    import_id, source, reference, group_key, cursor, timestamp,
+                    int(input_count), len(accepted), len(rejected), created_count, existing_count,
+                    0, json.dumps(metadata_payload, ensure_ascii=False, default=str),
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT import_id FROM asset_import_batches
+                WHERE source_type=? AND source_ref=? AND sync_cursor=?
+                """,
+                (source, reference, cursor),
+            ).fetchone()
+            stored_import_id = str(row[0])
+            prior = connection.execute(
+                """
+                SELECT sync_cursor,import_id,batches_completed,accepted_total,created_total,existing_total,rejected_total
+                FROM asset_import_cursors WHERE source_type=? AND source_ref=?
+                """,
+                (source, reference),
+            ).fetchone()
+            cursor_is_new = prior is None or str(prior[0]) != cursor
+            connection.execute(
+                """
+                INSERT INTO asset_import_cursors(
+                  source_type,source_ref,sync_cursor,import_id,updated_at,batches_completed,
+                  accepted_total,created_total,existing_total,rejected_total
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(source_type,source_ref) DO UPDATE SET
+                  sync_cursor=excluded.sync_cursor,
+                  import_id=excluded.import_id,
+                  updated_at=excluded.updated_at,
+                  batches_completed=excluded.batches_completed,
+                  accepted_total=excluded.accepted_total,
+                  created_total=excluded.created_total,
+                  existing_total=excluded.existing_total,
+                  rejected_total=excluded.rejected_total
+                """,
+                (
+                    source, reference, cursor, stored_import_id, timestamp,
+                    (int(prior[2]) if prior else 0) + int(cursor_is_new),
+                    (int(prior[3]) if prior else 0) + (len(accepted) if cursor_is_new else 0),
+                    (int(prior[4]) if prior else 0) + (created_count if cursor_is_new else 0),
+                    (int(prior[5]) if prior else 0) + (existing_count if cursor_is_new else 0),
+                    (int(prior[6]) if prior else 0) + (len(rejected) if cursor_is_new else 0),
+                ),
+            )
+
+        return {
+            "import_id": stored_import_id,
+            "source": source,
+            "source_ref": reference,
+            "sync_cursor": cursor,
+            "group_key": group_key,
+            "input_count": int(input_count),
+            "accepted_count": len(accepted),
+            "rejected_count": len(rejected),
+            "created_count": created_count,
+            "existing_count": existing_count,
+            "replayed_cursor": not cursor_is_new,
+            "created_at": timestamp,
+        }
+
+    def asset_import_progress(self, *, source_type: str = "", source_ref: str = "") -> dict[str, Any]:
+        where: list[str] = []
+        params: list[Any] = []
+        if source_type:
+            where.append("source_type=?")
+            params.append(normalize_platform(source_type))
+        if source_ref:
+            where.append("source_ref=?")
+            params.append(str(source_ref).strip())
+        clause = " WHERE " + " AND ".join(where) if where else ""
+        with self.connect() as connection:
+            rows = connection.execute(  # noqa: S608
+                f"SELECT * FROM asset_import_cursors{clause} ORDER BY updated_at DESC", params
+            ).fetchall()
+        return {"generated_at": now_iso(), "items": [dict(row) for row in rows]}
 
     def asset_groups(self) -> dict[str, Any]:
         with self.connect() as connection:
@@ -800,12 +1105,192 @@ class AssetDatabase:
                         (asset_id, str(address), "probe", now_iso(), now_iso()),
                     )
 
+    def smart_batch_snapshots(
+        self,
+        *,
+        limit: int = 20,
+        include_finished: bool = True,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(200, int(limit)))
+        where = "" if include_finished else " WHERE status NOT IN ('completed','completed_with_errors','dry_run_completed','failed','timeout','success','terminated')"
+        with self.connect() as connection:
+            rows = connection.execute(  # noqa: S608 - predicate is fixed above
+                f"SELECT snapshot_json,state_path FROM smart_batch_snapshots{where} ORDER BY updated_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        snapshots: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(str(row["snapshot_json"] or "{}"))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                payload.setdefault("state_file", str(row["state_path"] or ""))
+                snapshots.append(payload)
+        return snapshots
+
+    def smart_batch_snapshot(self, batch_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT snapshot_json,state_path FROM smart_batch_snapshots WHERE batch_id=?",
+                (str(batch_id),),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(str(row["snapshot_json"] or "{}"))
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        payload.setdefault("state_file", str(row["state_path"] or ""))
+        return payload
+
+    def sync_smart_batch_job(self, job: dict[str, Any], job_path: str = "") -> None:
+        job_id = str(job.get("job_id") or "")
+        if not job_id:
+            return
+        updated_at = str(job.get("updated_at") or job.get("submitted_at") or now_iso())
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO smart_batch_jobs(job_id,status,engine,phase,submitted_at,updated_at,job_path,state_json)
+                VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                  status=excluded.status,engine=excluded.engine,phase=excluded.phase,
+                  submitted_at=COALESCE(excluded.submitted_at,smart_batch_jobs.submitted_at),
+                  updated_at=excluded.updated_at,job_path=excluded.job_path,state_json=excluded.state_json
+                """,
+                (
+                    job_id, str(job.get("status") or ""), str(job.get("engine") or ""),
+                    str(job.get("phase") or ""), job.get("submitted_at"), updated_at,
+                    str(job_path or ""), json.dumps(job, ensure_ascii=False, default=str),
+                ),
+            )
+
+    def smart_batch_jobs(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        limit = max(1, min(200, int(limit)))
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT state_json,job_path FROM smart_batch_jobs ORDER BY updated_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        jobs: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(str(row["state_json"] or "{}"))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                payload.setdefault("job_file", str(row["job_path"] or ""))
+                jobs.append(payload)
+        return jobs
+
+    def smart_batch_job(self, job_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT state_json,job_path FROM smart_batch_jobs WHERE job_id=?", (str(job_id),)
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(str(row["state_json"] or "{}"))
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        payload.setdefault("job_file", str(row["job_path"] or ""))
+        return payload
+
+    def usage_history(self, *, days: int = 30) -> dict[str, dict[str, Any]]:
+        """Return SQLite usage aggregates in the legacy daily JSON shape."""
+        days = max(1, min(365, int(days)))
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT usage_date,hour_slot,model_name,requests,input_tokens,output_tokens,total_tokens,cost
+                FROM model_usage_daily
+                WHERE usage_date >= date('now', ?)
+                ORDER BY usage_date,hour_slot,model_name
+                """,
+                (f"-{days - 1} days",),
+            ).fetchall()
+        history: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            day = str(row["usage_date"])
+            payload = history.setdefault(day, {"date": day, "models": {}, "hourly": {}})
+            stats = {
+                "requests": int(row["requests"] or 0), "input_tokens": int(row["input_tokens"] or 0),
+                "output_tokens": int(row["output_tokens"] or 0), "tokens": int(row["total_tokens"] or 0),
+                "cost": float(row["cost"] or 0),
+            }
+            slot = str(row["hour_slot"] or "")
+            name = str(row["model_name"] or "")
+            if not slot:
+                if name != "__total__":
+                    payload["models"][name] = stats
+            elif name != "total":
+                payload["hourly"].setdefault(slot, {})[name] = stats
+        return history
+
+    def hourly_response_usage(self, *, usage_date: str | None = None) -> dict[str, dict[str, dict[str, Any]]]:
+        """Aggregate one local accounting day from immutable response rows."""
+        if usage_date:
+            try:
+                day = date.fromisoformat(str(usage_date))
+            except ValueError as exc:
+                raise ValueError("usage_date must use YYYY-MM-DD") from exc
+        else:
+            day = datetime.now().astimezone().date()
+        start = f"{day.isoformat()}T00:00:00"
+        end = f"{(day + timedelta(days=1)).isoformat()}T00:00:00"
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT substr(responded_at, 12, 2) AS hour_slot, model_name,
+                       COUNT(*) AS requests, COALESCE(SUM(prompt_tokens), 0) AS input_tokens,
+                       COALESCE(SUM(completion_tokens), 0) AS output_tokens,
+                       COALESCE(SUM(total_tokens), 0) AS total_tokens, COALESCE(SUM(cost), 0) AS cost
+                FROM llm_responses
+                WHERE responded_at >= ? AND responded_at < ?
+                GROUP BY hour_slot, model_name
+                ORDER BY hour_slot, model_name
+                """,
+                (start, end),
+            ).fetchall()
+        hourly: dict[str, dict[str, dict[str, Any]]] = {}
+        for row in rows:
+            model_name = str(row["model_name"] or "")
+            if not model_name:
+                continue
+            slot = str(int(str(row["hour_slot"] or "0")))
+            hourly.setdefault(slot, {})[model_name] = {
+                "requests": int(row["requests"] or 0),
+                "input_tokens": int(row["input_tokens"] or 0),
+                "output_tokens": int(row["output_tokens"] or 0),
+                "tokens": int(row["total_tokens"] or 0),
+                "cost": float(row["cost"] or 0),
+            }
+        return hourly
+
     def sync_batch_snapshot(self, batch: dict[str, Any], state_path: str = "") -> None:
         batch_id = str(batch.get("batch_id") or "")
         if not batch_id:
             return
         summary = batch.get("summary") or {}
         with self.transaction() as connection:
+            updated_at = str(batch.get("updated_at") or now_iso())
+            connection.execute(
+                """
+                INSERT INTO smart_batch_snapshots(batch_id,status,updated_at,state_path,snapshot_json)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(batch_id) DO UPDATE SET status=excluded.status,updated_at=excluded.updated_at,
+                  state_path=excluded.state_path,snapshot_json=excluded.snapshot_json
+                """,
+                (
+                    batch_id, str(batch.get("status") or "unknown"), updated_at, str(state_path or ""),
+                    json.dumps(batch, ensure_ascii=False, default=str),
+                ),
+            )
             connection.execute(
                 """
                 INSERT INTO scan_batches(batch_id,status,lifecycle,scan_mode,started_at,updated_at,completed_at,
@@ -1390,6 +1875,18 @@ class AssetDatabase:
             findings = int(connection.execute("SELECT COUNT(*) FROM finding_refs").fetchone()[0])
             groups = int(connection.execute("SELECT COUNT(*) FROM asset_groups").fetchone()[0])
             quarantined = int(connection.execute("SELECT COUNT(*) FROM target_quarantine").fetchone()[0])
+            scope = {
+                str(row[0]): int(row[1])
+                for row in connection.execute(
+                    "SELECT scope_status,COUNT(*) FROM asset_scope_decisions GROUP BY scope_status"
+                )
+            }
+            scope_categories = {
+                str(row[0]): int(row[1])
+                for row in connection.execute(
+                    "SELECT category,COUNT(*) FROM asset_scope_decisions WHERE category<>'' GROUP BY category"
+                )
+            }
         return {
             "generated_at": now_iso(),
             "total": total,
@@ -1398,6 +1895,8 @@ class AssetDatabase:
             "findings": findings,
             "groups": groups,
             "quarantined_targets": quarantined,
+            "scope": scope,
+            "scope_categories": scope_categories,
         }
 
     def list_assets(
@@ -1409,6 +1908,8 @@ class AssetDatabase:
         source: str = "",
         platform: str = "",
         group: str = "",
+        scope_status: str = "",
+        scope_category: str = "",
         finding_min: int | None = None,
         finding_max: int | None = None,
         page: int = 1,
@@ -1444,6 +1945,12 @@ class AssetDatabase:
         if group:
             where.append("EXISTS(SELECT 1 FROM asset_group_members gm WHERE gm.asset_id=a.id AND gm.group_key=?)")
             params.append(str(group))
+        if scope_status:
+            where.append("COALESCE(sd.scope_status,'')=?")
+            params.append(scope_status)
+        if scope_category:
+            where.append("COALESCE(sd.category,'')=?")
+            params.append(scope_category)
         if finding_min is not None:
             where.append("(SELECT COUNT(*) FROM finding_refs f WHERE f.asset_id=a.id)>=?")
             params.append(max(0, int(finding_min)))
@@ -1458,9 +1965,10 @@ class AssetDatabase:
         }.get(sort, "a.last_seen DESC, a.target ASC")
         with self.connect() as connection:
             # Both `clause` and `order` come from fixed allowlists above.
-            total = int(connection.execute(f"SELECT COUNT(*) FROM assets a{clause}", params).fetchone()[0])  # noqa: S608
+            total = int(connection.execute(f"SELECT COUNT(*) FROM assets a LEFT JOIN asset_scope_decisions sd ON sd.asset_id=a.id{clause}", params).fetchone()[0])  # noqa: S608
             rows = connection.execute(  # noqa: S608
-                f"""SELECT a.*,
+                f"""SELECT a.*, sd.scope_status, sd.category AS scope_category,
+                sd.confidence AS scope_confidence, sd.reason AS scope_reason, sd.tags_json AS scope_tags_json,
                 (SELECT GROUP_CONCAT(ip, ', ') FROM (SELECT ip FROM asset_addresses x WHERE x.asset_id=a.id ORDER BY x.last_seen DESC LIMIT 4)) AS addresses,
                 (SELECT GROUP_CONCAT(platform, ', ') FROM (
                     SELECT DISTINCT g.platform
@@ -1470,7 +1978,7 @@ class AssetDatabase:
                     ORDER BY gm.last_seen DESC
                     LIMIT 4
                 )) AS platforms
-                FROM assets a{clause} ORDER BY {order} LIMIT ? OFFSET ?""",
+                FROM assets a LEFT JOIN asset_scope_decisions sd ON sd.asset_id=a.id{clause} ORDER BY {order} LIMIT ? OFFSET ?""",
                 [*params, page_size, (page - 1) * page_size],
             ).fetchall()
         return {
@@ -1479,7 +1987,7 @@ class AssetDatabase:
             "page": page,
             "page_size": page_size,
             "pages": max(1, (total + page_size - 1) // page_size),
-            "items": [dict(row) for row in rows],
+            "items": [self._scope_row(dict(row)) for row in rows],
         }
 
     def asset_detail(self, asset_id: int) -> dict[str, Any] | None:
@@ -1488,6 +1996,8 @@ class AssetDatabase:
             if not asset:
                 return None
             payload = dict(asset)
+            scope = connection.execute("SELECT * FROM asset_scope_decisions WHERE asset_id=?", (asset_id,)).fetchone()
+            payload["scope"] = self._scope_row(dict(scope)) if scope else None
             payload["aliases"] = [dict(row) for row in connection.execute("SELECT * FROM asset_aliases WHERE asset_id=? ORDER BY last_seen DESC", (asset_id,))]
             payload["groups"] = [dict(row) for row in connection.execute(
                 """
@@ -1506,6 +2016,59 @@ class AssetDatabase:
             payload["findings"] = [dict(row) for row in connection.execute("SELECT * FROM finding_refs WHERE asset_id=? ORDER BY found_at DESC", (asset_id,))]
             payload["artifacts"] = [dict(row) for row in connection.execute("SELECT * FROM artifact_refs WHERE asset_id=? ORDER BY created_at DESC", (asset_id,))]
         return payload
+
+    def retest_asset_findings(self, targets: list[str]) -> dict[str, dict[str, Any]]:
+        """Return exact-asset findings and aliases for an immutable retest baseline."""
+        canonical_targets = {normalize_target(target)["canonical_key"] for target in targets if str(target).strip()}
+        if not canonical_targets:
+            return {}
+        placeholders = ",".join("?" for _ in canonical_targets)
+        with self.connect() as connection:
+            assets = connection.execute(
+                f"SELECT id,canonical_key,target FROM assets WHERE canonical_key IN ({placeholders})",  # noqa: S608
+                sorted(canonical_targets),
+            ).fetchall()
+            asset_ids = [int(row["id"]) for row in assets]
+            aliases_by_asset: dict[int, list[str]] = {asset_id: [] for asset_id in asset_ids}
+            findings_by_asset: dict[int, list[dict[str, Any]]] = {asset_id: [] for asset_id in asset_ids}
+            if asset_ids:
+                ids = ",".join("?" for _ in asset_ids)
+                for row in connection.execute(
+                    f"SELECT asset_id,raw_target FROM asset_aliases WHERE asset_id IN ({ids}) ORDER BY last_seen DESC",  # noqa: S608
+                    asset_ids,
+                ):
+                    aliases_by_asset[int(row["asset_id"])].append(str(row["raw_target"] or ""))
+                for row in connection.execute(
+                    f"""
+                    SELECT f.*,r.archived,r.verified,r.starred
+                    FROM finding_refs f
+                    LEFT JOIN finding_review_state r
+                      ON r.state_key=(COALESCE(json_extract(f.metadata_json,'$.target'),'') || ':' || f.finding_id || ':' || f.title)
+                    WHERE f.asset_id IN ({ids})
+                    ORDER BY f.found_at DESC, f.severity ASC, f.title ASC
+                    """,  # noqa: S608
+                    asset_ids,
+                ):
+                    findings_by_asset[int(row["asset_id"])].append(dict(row))
+        result: dict[str, dict[str, Any]] = {}
+        for asset in assets:
+            asset_id = int(asset["id"])
+            result[str(asset["canonical_key"])] = {
+                "asset_id": asset_id,
+                "asset": str(asset["target"]),
+                "aliases": list(dict.fromkeys([str(asset["target"]), *aliases_by_asset[asset_id]])),
+                "findings": findings_by_asset[asset_id],
+            }
+        return result
+
+    @staticmethod
+    def _scope_row(row: dict[str, Any]) -> dict[str, Any]:
+        tags = row.get("scope_tags_json") or row.get("tags_json") or "[]"
+        try:
+            row["scope_tags"] = json.loads(tags) if isinstance(tags, str) else list(tags)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            row["scope_tags"] = []
+        return row
 
     def export_assets(self, format: str = "txt", **filters: Any) -> tuple[bytes, str]:
         page = 1

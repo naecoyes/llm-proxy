@@ -1,10 +1,13 @@
 """模型管理器 - 模型选择和路由"""
 
 import logging
+import os
 import random
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from health_checker import HealthChecker
@@ -211,11 +214,14 @@ class ModelManager:
                 "health_next_probe_at": health_next_probe_at,
             }
         if not self.health_checker.is_healthy(model_name):
+            circuit_state = health_state.circuit_state if health_state else ""
             return {
                 "eligible": False,
-                "reason": "unhealthy",
+                "reason": "network_cooldown" if circuit_state == "open" else "unhealthy",
                 "health_reason": health_reason,
                 "health_next_probe_at": health_next_probe_at,
+                "circuit_state": circuit_state,
+                "cooldown_until": health_state.cooldown_until if health_state else 0.0,
             }
         if not self.usage_controller.check_budget(model_name):
             return {
@@ -489,7 +495,9 @@ class ModelManager:
                 and requested_model not in self.disabled_models
             ):
                 model = self.models[requested_model]
-                if model.enabled:
+                if model.enabled and self.get_model_routing_status(
+                    requested_model, routing_context
+                )["eligible"]:
                     if not self.usage_controller.acquire_model(requested_model):
                         raise NoAvailableModelError(f"模型 {requested_model} 并发已满，请稍后重试")
                     return requested_model, model
@@ -500,6 +508,7 @@ class ModelManager:
                     model.model == requested_model
                     and name not in self.disabled_models
                     and model.enabled
+                    and self.get_model_routing_status(name, routing_context)["eligible"]
                 ):
                     if not self.usage_controller.acquire_model(name):
                         raise NoAvailableModelError(f"模型 {name} 并发已满，请稍后重试")
@@ -883,6 +892,26 @@ class ModelManager:
             self.health_checker.record_transient_failure(model_name, error_str)
             return True
 
+        # A single DNS/TCP/stream interruption is common on long-running
+        # scans. HealthChecker opens a short, jittered circuit only after the
+        # configured number of consecutive transient failures.
+        transient_markers = (
+            "all connection attempts failed",
+            "temporary failure in name resolution",
+            "name or service not known",
+            "connection reset",
+            "connection aborted",
+            "connection refused",
+            "server disconnected",
+            "network is unreachable",
+            "connect timeout",
+            "read timeout",
+        )
+        normalized_error = error_str.lower()
+        if any(marker in normalized_error for marker in transient_markers):
+            self.health_checker.record_transient_failure(model_name, error_str)
+            return True
+
         # 分类错误
         error_type = self.health_checker.classify_error(error_str)
 
@@ -1052,8 +1081,28 @@ class ModelManager:
         import yaml
 
         try:
-            with open(config_path, "w", encoding="utf-8") as f:
-                yaml.dump(self.config, f, allow_unicode=True, default_flow_style=False)
+            path = Path(config_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            rendered = yaml.dump(
+                self.config,
+                allow_unicode=True,
+                default_flow_style=False,
+                sort_keys=False,
+            )
+            fd, temp_path = tempfile.mkstemp(
+                dir=str(path.parent),
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(rendered)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_path, path)
+            finally:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
             logger.info(f"配置已保存到: {config_path}")
         except Exception as e:
             logger.error(f"保存配置失败: {e}")

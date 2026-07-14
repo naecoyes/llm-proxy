@@ -15,6 +15,29 @@ from usage_controller import UsageController
 
 
 class HealthStateConcurrencyTests(unittest.TestCase):
+    def test_network_circuit_opens_after_three_transient_failures_and_resets_on_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checker = HealthChecker(
+                {"failover": {"network_circuit_threshold": 3, "network_circuit_cooldown_seconds": 1}},
+                tmp,
+            )
+            checker.initialize_model("model-a")
+            checker.record_transient_failure("model-a", "temporary DNS error")
+            checker.record_transient_failure("model-a", "temporary DNS error")
+            self.assertTrue(checker.is_healthy("model-a"))
+
+            checker.record_transient_failure("model-a", "temporary DNS error")
+            state = checker.health_state["model-a"]
+            self.assertFalse(checker.is_healthy("model-a"))
+            self.assertEqual(state.circuit_state, "open")
+            self.assertEqual(state.transient_failures, 3)
+
+            checker.mark_healthy("model-a")
+            state = checker.health_state["model-a"]
+            self.assertTrue(checker.is_healthy("model-a"))
+            self.assertEqual(state.circuit_state, "closed")
+            self.assertEqual(state.transient_failures, 0)
+
     def test_concurrent_updates_are_atomic_and_persist_complete_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             checker = HealthChecker({}, tmp)

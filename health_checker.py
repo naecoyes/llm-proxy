@@ -2,6 +2,7 @@
 
 import json
 import logging
+import random
 import threading
 import time
 from dataclasses import dataclass
@@ -39,6 +40,10 @@ class ModelHealth:
     last_failure_at: float = 0.0
     recent_results: list = None  # 最近请求结果 [True/False]
     re_enable_at: float = 0.0  # 自动重新启用的时间戳
+    transient_failures: int = 0
+    circuit_state: str = "closed"  # closed | open | half_open
+    cooldown_until: float = 0.0
+    last_transient_error: str = ""
 
     def __post_init__(self):
         if self.recent_results is None:
@@ -113,6 +118,8 @@ class HealthChecker:
         self.retry_delay = failover.get("retry_delay", 2)
         self.max_retries = failover.get("max_retries", 3)
         self.enabled = failover.get("enabled", True)
+        self.network_circuit_threshold = int(failover.get("network_circuit_threshold", 3) or 3)
+        self.network_circuit_cooldown_seconds = int(failover.get("network_circuit_cooldown_seconds", 120) or 120)
 
         # 自定义速率限制模式
         custom_patterns = failover.get("rate_limit_patterns", [])
@@ -154,6 +161,10 @@ class HealthChecker:
                     last_failure_at=state.get("last_failure_at", 0.0),
                     recent_results=list(state.get("recent_results") or []),
                     re_enable_at=state.get("re_enable_at", 0.0),
+                    transient_failures=state.get("transient_failures", 0),
+                    circuit_state=state.get("circuit_state", "closed"),
+                    cooldown_until=state.get("cooldown_until", 0.0),
+                    last_transient_error=state.get("last_transient_error", ""),
                 )
 
             logger.info(f"已加载健康状态: {len(self.health_state)} 个模型")
@@ -181,6 +192,10 @@ class HealthChecker:
                     "last_failure_at": state.last_failure_at,
                     "recent_results": list(state.recent_results[-100:]),
                     "re_enable_at": state.re_enable_at,
+                    "transient_failures": state.transient_failures,
+                    "circuit_state": state.circuit_state,
+                    "cooldown_until": state.cooldown_until,
+                    "last_transient_error": state.last_transient_error,
                 }
 
             tmp_file = health_file.with_suffix(".json.tmp")
@@ -300,18 +315,40 @@ class HealthChecker:
 
     @synchronized_state
     def record_transient_failure(self, model_name: str, reason: str):
-        """Record a retryable failure without changing model health."""
+        """Record a network failure and open a short circuit after repetition."""
         state = self.health_state.get(model_name, ModelHealth())
         state.total_failures += 1
         state.last_failure_at = time.time()
+        state.transient_failures += 1
+        state.last_transient_error = reason[:300]
         state.recent_results.append(False)
         if len(state.recent_results) > 100:
             state.recent_results = state.recent_results[-100:]
+        threshold = max(1, self.network_circuit_threshold)
+        if state.transient_failures >= threshold:
+            jitter = random.randint(0, max(5, self.network_circuit_cooldown_seconds // 4))
+            state.healthy = False
+            state.reason = "network_circuit_open"
+            state.circuit_state = "open"
+            state.cooldown_until = time.time() + self.network_circuit_cooldown_seconds + jitter
+            state.next_probe_at = state.cooldown_until
+            state.probe_in_flight = False
+            logger.warning(
+                "Network circuit opened for %s after %d transient failures; cooldown %.0fs",
+                model_name,
+                state.transient_failures,
+                state.cooldown_until - time.time(),
+            )
+        else:
+            logger.info(
+                "Transient network failure for %s (%d/%d); model remains eligible: %s",
+                model_name,
+                state.transient_failures,
+                threshold,
+                reason[:160],
+            )
         self.health_state[model_name] = state
         self._save_health_state()
-        logger.info(
-            f"↻ 模型 {model_name} 瞬时失败，保持健康并由请求方重试: {reason}"
-        )
 
     @synchronized_state
     def mark_healthy(self, model_name: str):
@@ -328,6 +365,10 @@ class HealthChecker:
         state.next_probe_at = 0.0
         state.probe_in_flight = False
         state.consecutive_failures = 0
+        state.transient_failures = 0
+        state.circuit_state = "closed"
+        state.cooldown_until = 0.0
+        state.last_transient_error = ""
         state.total_successes += 1
         state.last_success_at = time.time()
 
@@ -350,6 +391,8 @@ class HealthChecker:
             True 表示健康
         """
         state = self.health_state.get(model_name, ModelHealth())
+        if state.circuit_state == "open":
+            return False
         return state.healthy
 
     @synchronized_state
@@ -360,6 +403,13 @@ class HealthChecker:
             True 表示应该探测
         """
         state = self.health_state.get(model_name, ModelHealth())
+
+        # A cooled-down network circuit is eligible for a single low-cost probe.
+        if state.circuit_state == "open" and time.time() >= state.cooldown_until:
+            state.circuit_state = "half_open"
+            self.health_state[model_name] = state
+            self._save_health_state()
+            return not state.probe_in_flight
 
         # 已经健康，不需要探测
         if state.healthy:
@@ -694,6 +744,10 @@ class HealthChecker:
                 "last_failure": self._format_time(state.last_failure_at),
                 "next_probe": self._format_time(state.next_probe_at),
                 "probe_in_flight": state.probe_in_flight,
+                "circuit_state": state.circuit_state,
+                "transient_failures": state.transient_failures,
+                "cooldown_until": self._format_time(state.cooldown_until),
+                "last_transient_error": state.last_transient_error,
             }
             for name, state in self.health_state.items()
         }
@@ -710,4 +764,5 @@ class HealthChecker:
             "unhealthy_models": unhealthy_count,
             "recovery_time": self.recovery_time,
             "max_consecutive_failures": self.max_consecutive_failures,
+            "network_circuit_threshold": self.network_circuit_threshold,
         }

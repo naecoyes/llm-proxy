@@ -1,10 +1,12 @@
-import { api } from "../api.js?v=20260702-batch-controls";
+import { api } from "../api.js?v=20260710-scan-freshness-v2";
 import { Poller } from "../poller.js";
 import { badge, confirmAction, emptyState, errorState, modelIdentity, openDrawer, panel, progress, skeleton, toast } from "../components.js";
 import { debounce, escapeHtml, formatBytes, formatDate, formatDuration, formatNumber, formatRate } from "../utils.js";
 
 const ACTIVE_STATUS = new Set(["running", "retrying"]);
 const DONE_STATUS = new Set(["success", "failed", "timeout"]);
+const lastProgressByBatch = new Map();
+let lastOverallProgress = 0;
 
 function allTasks(data) {
   return (data.batches || []).flatMap((batch) => (batch.tasks || []).map((task) => ({ ...task, batch_id: batch.batch_id })));
@@ -42,13 +44,33 @@ function taskStatus(task) {
   return isRetryPending(task) ? "retry-pending" : task.status || "unknown";
 }
 
+function taskEvidenceNote(task) {
+  if (String(task.engine || "").toLowerCase() !== "chelmon-claude") return "";
+  const requests = Number(task.target_request_count || 0);
+  const responses = Number(task.target_response_count || 0);
+  const errors = Number(task.target_error_count || 0);
+  const state = String(task.evidence_status || "");
+  if (responses > 0) {
+    return `<div class="cell-secondary">Evidence: ${formatNumber(responses)} response${responses === 1 ? "" : "s"} / ${formatNumber(requests)} request${requests === 1 ? "" : "s"}${errors ? ` · ${formatNumber(errors)} errors` : ""}</div>`;
+  }
+  if (state === "target_request_blocked") return '<div class="auto-requeue-note">Blocked by scope: no target response</div>';
+  if (state === "target_unreachable") return '<div class="auto-requeue-note">Target unreachable: no target response</div>';
+  if (state === "completed_without_evidence") return '<div class="auto-requeue-note">No target evidence: completion is retry-eligible</div>';
+  return "";
+}
+
 function batchCounts(batch) {
   const summary = batch.summary || {};
   const tasks = batch.tasks || [];
   const count = (status) => summary[status] ?? tasks.filter((task) => task.status === status).length;
+  const rawProgress = summary.display_progress_percent ?? summary.progress_percent ?? 0;
+  const batchId = batch.batch_id || "";
+  const previousProgress = batchId ? (lastProgressByBatch.get(batchId) || 0) : 0;
+  const stableProgress = Math.max(Number(rawProgress) || 0, previousProgress);
+  if (batchId) lastProgressByBatch.set(batchId, stableProgress);
   return {
     total: summary.total_tasks ?? tasks.length,
-    completed: summary.completed_tasks ?? tasks.filter((task) => DONE_STATUS.has(task.status)).length,
+    completed: summary.display_completed_tasks ?? summary.completed_tasks ?? tasks.filter((task) => DONE_STATUS.has(task.status)).length,
     pending: summary.pending ?? tasks.filter(isQueuedPending).length,
     running: summary.running ?? tasks.filter((task) => task.status === "running").length,
     retrying: summary.retrying ?? tasks.filter((task) => task.status === "retrying").length,
@@ -58,7 +80,7 @@ function batchCounts(batch) {
     success: summary.success ?? count("success"),
     failed: summary.failed ?? count("failed"),
     timeout: summary.timeout ?? count("timeout"),
-    progress: summary.progress_percent ?? 0,
+    progress: stableProgress,
   };
 }
 
@@ -108,7 +130,115 @@ function compactTargetName(value = "") {
   return target.length > 42 ? `${target.slice(0, 20)}…${target.slice(-18)}` : target;
 }
 
-function batchRow(batch, selectedId, { compact = false } = {}) {
+function scanEngineBadge(engine) {
+  const normalized = String(engine || "").trim().toLowerCase();
+  const engines = {
+    strix: { label: "Strix", className: "strix", detail: "Strix scan engine" },
+    "chelmon-claude": { label: "Chelmon-Claude", className: "chelmon", detail: "Chelmon-Claude scan engine" },
+    dual: { label: "Dual engine", className: "dual", detail: "Strix followed by Chelmon-Claude" },
+  };
+  const selected = engines[normalized] || {
+    label: normalized || "Strix",
+    className: "legacy",
+    detail: normalized ? "Recorded scan engine" : "Legacy snapshot; Strix inferred from the previous default",
+  };
+  return `<span class="engine-chip ${selected.className}" title="${escapeHtml(selected.detail)}">${escapeHtml(selected.label)}</span>`;
+}
+
+function dualStageForBatch(batch, jobs = []) {
+  const label = String(batch.label || "").toLowerCase();
+  const job = (jobs || []).find((item) => item.engine === "dual" && Array.isArray(item.children));
+  if (!job) return null;
+  return job.children
+    .map((child, index) => ({ job, child, index }))
+    .find(({ job, child }) => child.batch_id === batch.batch_id
+      || label === `${String(job.label || "").toLowerCase()}-${child.engine}`
+      || label.startsWith(`${String(job.label || "").toLowerCase()}-${child.engine}`)) || null;
+}
+
+function dualStageTone(status) {
+  const value = String(status || "pending").toLowerCase();
+  if (["running", "retrying"].includes(value)) return "running";
+  if (["completed", "success", "completed_with_errors"].includes(value)) return "complete";
+  if (["failed", "terminated", "timeout"].includes(value)) return "failed";
+  return "waiting";
+}
+
+function renderDualRunCard(job) {
+  const children = Array.isArray(job.children) ? job.children : [];
+  const targetPreview = (job.targets_preview || []).slice(0, 2).map(compactTargetName).join(" · ") || "Target details pending";
+  const runningChild = children.find((child) => ["running", "retrying"].includes(String(child.status || "").toLowerCase()));
+  const current = runningChild || children.find((child) => !["completed", "success", "completed_with_errors", "failed", "terminated", "timeout"].includes(String(child.status || "").toLowerCase()));
+  const currentLabel = current ? `${current.engine === "strix" ? "Stage 1" : "Stage 2"}: ${current.engine === "strix" ? "Strix redteam" : "Chelmon-Claude default"}` : "Finalizing results";
+  const canTerminate = job.process_alive && !["completed", "completed_with_errors", "terminated", "dry_run_completed"].includes(job.status);
+  const canResume = !job.process_alive && ["interrupted", "completed_with_errors"].includes(String(job.status || "").toLowerCase());
+  const workerMeta = job.worker_unit
+    ? ` · worker ${job.worker_unit} (${job.worker_status || "unknown"})`
+    : job.worker_mode ? ` · worker ${job.worker_mode}` : "";
+  return `<article class="dual-run-card">
+    <header class="dual-run-header"><div><div class="dual-run-title">${scanEngineBadge("dual")}<strong>${escapeHtml(job.label || job.job_id)}</strong>${badge(job.status || "running", job.process_alive ? "success" : "info")}</div><div class="dual-run-meta">${escapeHtml(job.job_id)} · ${formatNumber(job.target_count || 0)} target${Number(job.target_count || 0) === 1 ? "" : "s"} · ${escapeHtml(targetPreview)} · submitted ${formatDate(job.submitted_at)}${escapeHtml(workerMeta)}</div></div><div class="dual-run-actions">${badge(currentLabel, runningChild ? "success" : "info")}${canResume ? `<button class="button secondary small" type="button" data-dual-job-resume="${escapeHtml(job.job_id)}">Resume incomplete stages</button>` : ""}${canTerminate ? `<button class="button secondary small text-danger" type="button" data-dual-job-terminate="${escapeHtml(job.job_id)}">Terminate dual run</button>` : ""}</div></header>
+    <div class="dual-stage-flow">${children.map((child, index) => {
+      const isCurrent = child === current;
+      const stageName = child.engine === "strix" ? "Strix" : "Chelmon-Claude";
+      const stageMode = child.engine === "strix" ? "redteam" : "default";
+      const failure = child.error || child.report?.completion_error || "";
+      return `${index ? '<span class="dual-stage-arrow" aria-hidden="true">→</span>' : ""}<div class="dual-stage ${dualStageTone(child.status)} ${isCurrent ? "current" : ""}"><span class="dual-stage-number">${index + 1}</span><div><strong>${stageName}</strong><span>${stageMode}</span>${failure ? `<small class="dual-stage-error" title="${escapeHtml(failure)}">${escapeHtml(failure)}</small>` : ""}</div>${badge(child.status || "pending", dualStageTone(child.status) === "failed" ? "warning" : dualStageTone(child.status) === "running" ? "success" : "info")}</div>`;
+    }).join("")}</div>
+  </article>`;
+}
+
+function renderActiveScans(current, selectedId, jobs, {
+  containers,
+  containersError,
+  runtimeDetailsOpen,
+} = {}) {
+  const activeDualJobs = (jobs || []).filter((job) => job.engine === "dual"
+    && !["completed", "completed_with_errors", "terminated", "dry_run_completed"].includes(job.status));
+  // A dual parent card already represents its Strix and Chelmon child batches.
+  // Do not render those children again in the ordinary batch list.
+  const standaloneBatches = current.filter((batch) => !dualStageForBatch(batch, jobs));
+  const containerSummary = containers?.summary || {};
+  const orphanContainers = containerSummary.orphan_containers || 0;
+  const runtimeSummary = containers
+    ? `${containerSummary.strix_running || 0} containers${orphanContainers ? ` · ${orphanContainers} orphan` : ""}`
+    : "Load Docker telemetry on demand";
+  const scanContent = [
+    activeDualJobs.length ? `<div class="active-dual-runs"><div class="active-scan-section-label">Dual-engine runs</div><div class="dual-run-list">${activeDualJobs.map(renderDualRunCard).join("")}</div></div>` : "",
+    standaloneBatches.length ? `<div class="active-scan-section-label">Single-engine batches</div>${renderBatchList(standaloneBatches, selectedId, "current", jobs)}` : "",
+  ].filter(Boolean).join("") || emptyState("No current batches", "Smart Batch snapshots will appear here as soon as scans are planned.");
+  const runtimeContent = containersError
+    ? errorState(containersError)
+    : containers
+      ? `${renderContainers(containers)}${jobs?.length ? `<div class="runtime-submission-list"><div class="active-scan-section-label">Recent dashboard submissions</div><div class="batch-summary-list">${jobs.slice(0, 6).map(renderJobRow).join("")}</div></div>` : ""}`
+      : skeleton(2);
+  return `${scanContent}
+    <details class="active-runtime-details" ${runtimeDetailsOpen ? "open" : ""}>
+      <summary><span>Advanced runtime details</span><span class="muted">${escapeHtml(runtimeSummary)}</span></summary>
+      <div class="active-runtime-content"><div class="runtime-section-heading"><strong>Docker scan containers</strong><span>${escapeHtml(runtimeSummary)}</span></div>${runtimeContent}</div>
+    </details>`;
+}
+
+function renderSelectedTargetsPanel(selected, selectedDetail, queueTasks, filters, loadingDetail, targetsOpen) {
+  const subtitle = selected
+    ? `${loadingDetail ? "loading detail…" : `${queueTasks.length} active targets`} · ${scanEngineBadge(selected.engine)} <span>${escapeHtml(selected.scan_mode || "-")}</span>`
+    : "Select a batch";
+  const body = loadingDetail
+    ? skeleton(2)
+    : selected && batchPreparationStage(selected)
+      ? emptyState("Queue preflight", escapeHtml(selected.input_source?.preflight_detail || "Validating target safety and running multi-proxy liveness checks before tasks are created."))
+      : selectedDetail
+        ? renderTaskList(queueTasks, { limit: 50, compact: true, emptyTitle: "No matching targets", emptyDetail: "Change the filter or select another batch." })
+        : emptyState("Open target list", "Target detail is loaded only when this section is expanded.");
+  return `<details class="panel selected-targets-panel" ${targetsOpen ? "open" : ""}>
+    <summary><span><strong>Targets for selected scan</strong><span class="batch-detail-meta">${subtitle}</span></span><span class="details-summary-hint">${targetsOpen ? "Hide" : "Show"}</span></summary>
+    <div class="selected-targets-content">
+      <div class="panel-actions compact-controls"><select id="taskStatusFilter"><option value="">All</option>${[["running","Running"],["pending","Queued"],["retry","Retry"],["success","Succeeded"],["failed","Failed"]].map(([value, label]) => `<option value="${value}" ${filters.status === value ? "selected" : ""}>${label}</option>`).join("")}</select><input id="taskSearch" type="search" placeholder="Search targets" value="${escapeHtml(filters.query)}"></div>
+      <div class="compact-queue-body">${body}</div>
+    </div>
+  </details>`;
+}
+
+function batchRow(batch, selectedId, { compact = false, jobs = [] } = {}) {
   const counts = batchCounts(batch);
   const activeTarget = (batch.tasks || []).find(isActiveTask)?.target || "";
   const selected = batch.batch_id === selectedId ? "selected" : "";
@@ -118,10 +248,14 @@ function batchRow(batch, selectedId, { compact = false } = {}) {
   const health = preparation || batchHealth(counts);
   const paused = batch.paused === true || batch.status === "paused";
   const addedAt = batch.submitted_at || batch.started_at || batch.created_at;
+  const dualStage = dualStageForBatch(batch, jobs);
+  const engineMeta = dualStage
+    ? `<span class="dual-stage-inline">${scanEngineBadge("dual")} Stage ${dualStage.index + 1}/2 · ${escapeHtml(dualStage.child.engine === "strix" ? "Strix redteam" : "Chelmon-Claude default")}</span>`
+    : `${scanEngineBadge(batch.engine)}`;
   return `<div class="batch-control-row"><button class="batch-summary-row ${selected} ${compact ? "compact" : ""}" type="button" data-batch-id="${escapeHtml(batch.batch_id)}">
     <div class="batch-summary-main">
       <div class="batch-summary-title"><strong>${escapeHtml(batch.label || "Scan Batch")}</strong> <span class="muted mono text-sm">${escapeHtml(batch.batch_id)}</span>${badge(health.label, health.tone)}${compact ? "" : badge(batch.monitor_state || batch.lifecycle || batch.status || "unknown")}</div>
-      <div class="batch-summary-meta">${escapeHtml(batch.scan_mode || "-")} · ${preparation ? escapeHtml(preparation.detail) : `${counts.total} tasks`} · added ${formatDate(addedAt)}${activeTarget ? ` · active ${escapeHtml(compactTargetName(activeTarget))}` : ""}</div>
+      <div class="batch-summary-meta">${engineMeta} ${dualStage ? "" : `<span>${escapeHtml(batch.scan_mode || "-")}</span><span>·</span>`}<span>${preparation ? escapeHtml(preparation.detail) : `${counts.total} tasks`}</span><span>·</span><span>added ${formatDate(addedAt)}</span>${activeTarget ? `<span>·</span><span>active ${escapeHtml(compactTargetName(activeTarget))}</span>` : ""}</div>
     </div>
     <div class="batch-summary-progress">
       <div class="progress-line"><strong>${formatNumber(counts.progress, 1)}%</strong>${progress(counts.progress)}</div>
@@ -135,12 +269,24 @@ function batchRow(batch, selectedId, { compact = false } = {}) {
   </button><div class="batch-row-actions"><button class="button secondary small" type="button" data-batch-pause="${escapeHtml(batch.batch_id)}" data-paused="${paused}">${paused ? "Resume" : "Pause"}</button><button class="button secondary small text-danger" type="button" data-batch-terminate="${escapeHtml(batch.batch_id)}">Terminate</button><button class="button ghost small text-danger" type="button" data-batch-delete="${escapeHtml(batch.batch_id)}">Delete</button></div></div>`;
 }
 
-function renderBatchList(batches, selectedId, mode) {
+function renderBatchList(batches, selectedId, mode, jobs = []) {
   if (!batches.length) {
     const title = mode === "current" ? "No current batches" : "No historical batches";
     return emptyState(title, "Smart Batch snapshots will appear here as soon as scans are planned.");
   }
-  return `<div class="batch-summary-list">${batches.map((batch) => batchRow(batch, selectedId, { compact: mode === "current" })).join("")}</div>`;
+  return `<div class="batch-summary-list">${batches.map((batch) => batchRow(batch, selectedId, { compact: mode === "current", jobs })).join("")}</div>`;
+}
+
+function renderJobRow(job) {
+  const dual = job.engine === "dual";
+  const totalPasses = Number(job.total_passes || (dual ? 2 : 1));
+  const completedPasses = Number(job.completed_passes || 0);
+  const phase = dual ? `${completedPasses}/${totalPasses} passes (${Math.round((completedPasses / totalPasses) * 100)}%) · ${job.phase || "planned"}` : `PID ${job.pid || "-"}`;
+  const children = dual && Array.isArray(job.children)
+    ? `<div class="cell-secondary">${job.children.map((child) => `${escapeHtml(child.engine)} ${escapeHtml(child.mode)}: ${escapeHtml(child.status || "pending")}`).join(" · ")}</div>`
+    : "";
+  const canTerminate = dual && job.process_alive && !["completed", "completed_with_errors", "terminated"].includes(job.status);
+  return `<div class="job-row"><div><strong>${escapeHtml(job.label || job.job_id)}</strong><div class="cell-secondary">${job.target_count} targets · ${dual ? "Strix redteam → Chelmon default" : phase} · ${formatDate(job.submitted_at)}</div>${children}</div><div class="panel-actions">${badge(job.process_alive ? (dual ? `${phase}` : "running") : job.status || "submitted")}${canTerminate ? `<button class="button ghost small text-danger" type="button" data-dual-job-terminate="${escapeHtml(job.job_id)}">Terminate</button>` : ""}</div></div>`;
 }
 
 function aggregateCounts(batches) {
@@ -160,12 +306,18 @@ function aggregateCounts(batches) {
   }, { total: 0, completed: 0, pending: 0, running: 0, retryPending: 0, autoRequeuePending: 0, autoRequeueAttempts: 0, success: 0, failed: 0, timeout: 0 });
 }
 
-function renderSubmitForm(draft) {
+function renderSubmitForm(draft, engineHealth) {
+  const modeOptions = draft.engine === "dual"
+    ? [["dual", "Strix redteam → Chelmon default"], ["retest", "Retest: historical findings → Strix → Chelmon"]]
+    : draft.engine === "chelmon-claude"
+    ? [["default", "default"], ["redteam", "redteam"], ["deep", "deep"], ["standard", "standard"], ["quick", "quick"], ["getshell", "getshell"]]
+    : [["redteam", "redteam"], ["deep", "deep"], ["standard", "standard"], ["quick", "quick"], ["getshell", "getshell"]];
   return `<form id="scanSubmitForm" class="scan-submit-form">
     <label class="field wide"><span>Targets</span><textarea id="scanTargets" rows="8" placeholder="One target per line, for example:&#10;example.gov&#10;https://portal.example.gov">${escapeHtml(draft.targets)}</textarea></label>
     <div class="scan-form-grid">
       <label class="field"><span>Label</span><input id="scanLabel" placeholder="optional batch label" value="${escapeHtml(draft.label)}"></label>
-      <label class="field"><span>Mode</span><select id="scanMode">${["redteam","deep","standard","quick","getshell"].map((mode) => `<option value="${mode}" ${draft.mode === mode ? "selected" : ""}>${mode}</option>`).join("")}</select></label>
+      <label class="field"><span>Engine</span><select id="scanEngine">${[["strix","Strix"],["chelmon-claude","Chelmon-Claude"],["dual","Strix + Chelmon-Claude"]].map(([value, label]) => `<option value="${value}" ${draft.engine === value ? "selected" : ""}>${label}</option>`).join("")}</select></label>
+      <label class="field"><span>Mode</span><select id="scanMode">${modeOptions.map(([value, label]) => `<option value="${value}" ${draft.mode === value ? "selected" : ""}>${label}</option>`).join("")}</select>${draft.engine === "dual" ? "<small class=\"field-help\">Retest uses historical findings, then Strix redteam → Chelmon default.</small>" : ""}</label>
       <label class="field"><span>Parallel</span><input id="scanParallel" type="number" min="1" max="4" value="${escapeHtml(draft.parallel)}"></label>
       <label class="field"><span>Timeout</span><input id="scanTimeout" type="number" min="0" max="14400" step="300" value="${escapeHtml(draft.timeout)}"><small class="field-help">0 disables the per-target deadline.</small></label>
     </div>
@@ -175,10 +327,11 @@ function renderSubmitForm(draft) {
       <label><input id="scanProbeLive" type="checkbox" ${draft.probe_live_before_queue ? "checked" : ""}> Probe live targets before queue</label>
       <label><input id="scanSkipDnsGuard" type="checkbox" ${draft.skip_dns_guard ? "checked" : ""}> Trusted list (skip DNS-resolve guard)</label>
       <label><input id="scanMonitor" type="checkbox" ${draft.monitor ? "checked" : ""}> Resource monitor</label>
-      <label><input id="scanSkipScanned" type="checkbox" ${draft.skip_scanned ? "checked" : ""}> Skip scanned</label>
+      <label><input id="scanSkipScanned" type="checkbox" ${draft.skip_scanned ? "checked" : ""} ${draft.engine === "dual" ? "disabled" : ""}> Skip scanned${draft.engine === "dual" ? " (off for complete dual scan)" : ""}</label>
       <label><input id="scanDryRun" type="checkbox" ${draft.dry_run ? "checked" : ""}> Dry run only</label>
       <label class="danger-option"><input id="scanAllowPrivateTargets" type="checkbox" ${draft.allow_private_targets ? "checked" : ""}> Allow private/local targets</label>
     </div>
+    ${engineHealth && !engineHealth.ready ? `<div class="notice warning">Dual engine is unavailable: ${escapeHtml(Object.entries(engineHealth.checks || {}).filter(([, check]) => !check.ok).map(([name, check]) => `${name}${check.detail ? ` (${check.detail})` : ""}`).join(", ") || "runtime preflight pending")}. New jobs default to Strix until it is healthy.</div>` : ""}
     <div class="scan-submit-footer">
       <div class="muted" id="scanSubmitPreview">Paste targets to preview the batch.</div>
       <div class="panel-actions"><button class="button secondary" type="button" id="scanPreviewButton">Preview</button><button class="button" type="submit">Start batch</button></div>
@@ -187,10 +340,13 @@ function renderSubmitForm(draft) {
 }
 
 function formPayload(root) {
+  const engine = root.querySelector("#scanEngine")?.value || "dual";
+  const mode = root.querySelector("#scanMode")?.value || (engine === "dual" ? "dual" : engine === "chelmon-claude" ? "default" : "redteam");
   return {
     targets: root.querySelector("#scanTargets")?.value || "",
     label: root.querySelector("#scanLabel")?.value || "",
-    mode: root.querySelector("#scanMode")?.value || "redteam",
+    engine,
+    mode,
     parallel: Number(root.querySelector("#scanParallel")?.value || 4),
     timeout: Number(root.querySelector("#scanTimeout")?.value || 0),
     single_targets: root.querySelector("#scanSingleTargets")?.checked !== false,
@@ -205,6 +361,9 @@ function formPayload(root) {
     probe_proxy_quorum: 2,
     probe_max_proxy_nodes: 3,
     probe_keep_inconclusive: true,
+    source: "manual",
+    // Manual entry never bypasses the UAE public-interest scope gate.
+    allow_non_uae: false,
   };
 }
 
@@ -225,6 +384,7 @@ function renderTaskList(tasks, { limit = 10, emptyTitle = "No tasks", emptyDetai
     const retryText = task.next_retry_at && !autoRequeueText
       ? `<div class="auto-requeue-note">retry ${formatNumber(task.retry_count || 0)}/${formatNumber(task.max_retries || 0)} · ${escapeHtml(task.retry_reason || "pending")} · next ${formatDate(task.next_retry_at)}</div>`
       : "";
+    const evidenceText = taskEvidenceNote(task);
     if (compact) {
       const model = task.llm_model_primary || "awaiting model";
       const duration = task.duration_seconds == null ? "waiting" : formatDuration(task.duration_seconds);
@@ -232,7 +392,7 @@ function renderTaskList(tasks, { limit = 10, emptyTitle = "No tasks", emptyDetai
       return `<div class="scan-task-row compact">
         <div class="scan-task-main">
           <div class="scan-task-title"><strong>${escapeHtml(task.target || "-")}</strong>${badge(taskStatus(task))}</div>
-          ${autoRequeueText || retryText}
+          ${evidenceText}${autoRequeueText || retryText}
         </div>
         <div class="scan-task-compact-meta"><span>${escapeHtml(duration)}</span><span>${escapeHtml(model)}</span>${tokens ? `<span>${formatNumber(tokens)} tokens</span>` : ""}</div>
         <button class="button ghost small" type="button" ${scanId ? "" : "disabled"} data-scan-id="${escapeHtml(scanId)}" data-target="${escapeHtml(task.target || "")}">Inspect</button>
@@ -242,6 +402,7 @@ function renderTaskList(tasks, { limit = 10, emptyTitle = "No tasks", emptyDetai
       <div class="scan-task-main">
         <div class="scan-task-title"><strong>${escapeHtml(task.target || "-")}</strong>${badge(taskStatus(task))}</div>
         <div class="cell-secondary">${task.duration_seconds == null ? "Waiting to start" : formatDuration(task.duration_seconds)}${task.vulnerabilities_count ? ` · ${formatNumber(task.vulnerabilities_count)} findings` : ""}</div>
+        ${evidenceText}
         ${autoRequeueText || retryText}
       </div>
       <div class="scan-task-side">
@@ -277,7 +438,7 @@ function renderSelectedBatch(batch, filters) {
   const runningParallel = counts.running + counts.retrying;
   return `<div class="selected-batch">
     <div class="selected-batch-head">
-      <div><h2>${escapeHtml(batch.batch_id)}</h2><p>${escapeHtml(batch.scan_mode || "-")} · ${counts.completed}/${counts.total} complete · updated ${formatDate(batch.updated_at)}</p></div>
+      <div><h2>${escapeHtml(batch.batch_id)}</h2><p class="batch-detail-meta">${scanEngineBadge(batch.engine)} <span>${escapeHtml(batch.scan_mode || "-")}</span><span>·</span><span>${counts.completed}/${counts.total} complete</span><span>·</span><span>updated ${formatDate(batch.updated_at)}</span></p></div>
       <div class="selected-batch-progress"><strong>${formatNumber(counts.progress, 1)}%</strong>${progress(counts.progress)}${statusPills(counts)}</div>
     </div>
     <form class="batch-parallel-control" data-batch-parallel-form="${escapeHtml(batch.batch_id)}">
@@ -347,18 +508,20 @@ export function mountScans(context) {
   root.innerHTML = skeleton(6);
   let data = null;
   let jobs = null;
+  let engineHealth = null;
   let containers = null;
   let containersError = null;
   let selectedId = "";
   const batchDetails = new Map();
   let loadingDetail = false;
-  let advancedRuntimeOpen = false;
-  let firstTelemetryLoad = true;
+  let runtimeDetailsOpen = false;
+  let targetsOpen = false;
   const filters = { status: "", query: "" };
   const submitDraft = {
     targets: "",
     label: "",
-    mode: "redteam",
+    engine: "dual",
+    mode: "dual",
     parallel: 2,
     timeout: 0,
     single_targets: true,
@@ -405,14 +568,14 @@ export function mountScans(context) {
       return !queueQuery || `${task.target} ${task.status} ${task.llm_model_primary} ${task.last_error}`.toLowerCase().includes(queueQuery);
     }).sort((a, b) => Number(isActiveTask(b)) - Number(isActiveTask(a)));
     const summary = data.summary || {};
-    const overallProgress = summary.overall_progress_percent ?? 0;
+    const rawOverallProgress = summary.display_progress_percent ?? summary.overall_progress_percent ?? 0;
+    const overallProgress = Math.max(Number(rawOverallProgress) || 0, lastOverallProgress);
+    lastOverallProgress = overallProgress;
     const runningCount = activeTasks.length || summary.running_tasks || 0;
     const queuedCount = queuedTasks.length + autoRequeueTasks.length || (summary.pending_tasks || 0) + (summary.retry_pending_tasks || 0) + (summary.auto_requeue_pending_tasks || 0);
     const retryDueCount = dueRetryTasks.length || (summary.retry_due_tasks || 0) + (summary.auto_requeue_due_tasks || 0);
     const failedCount = failedTasks.length || (summary.failed_tasks || 0) + (summary.timeout_tasks || 0);
     const preflightBatches = current.filter((batch) => batchPreparationStage(batch));
-    const containerSummary = containers?.summary || {};
-    const orphanContainers = containerSummary.orphan_containers || 0;
     root.innerHTML = `<div class="page-stack scans-page">
       <div class="metrics-grid single-row scans-key-metrics">
         <div class="metric-card"><div class="metric-label">Current progress</div><div class="metric-value">${formatNumber(overallProgress, 1)}%</div><div class="metric-detail">${summary.total_tasks || 0} active-window tasks</div></div>
@@ -422,25 +585,32 @@ export function mountScans(context) {
         <div class="metric-card ${failedCount ? "warning" : ""}"><div class="metric-label">Failed</div><div class="metric-value">${failedCount}</div><div class="metric-detail">${summary.timeout_tasks || 0} timed out</div></div>
       </div>
 
-      ${panel("Active Scans", "Batches currently running or queued for execution", renderBatchList(current, selectedId, "current"), "", "scan-current-panel")}
+      ${panel("Active Scans", "Batches currently running or queued for execution", renderActiveScans(current, selectedId, jobs?.jobs || [], { containers, containersError, runtimeDetailsOpen }), "", "scan-current-panel")}
 
-      <section class="panel"><header class="panel-header"><div><h2>Targets for selected scan</h2><p>${selected ? `${loadingDetail ? "loading detail…" : `${queueTasks.length} targets shown`} · ${escapeHtml(selected.scan_mode || "-")}` : "Select a batch"}</p></div><div class="panel-actions compact-controls"><select id="taskStatusFilter"><option value="">All</option>${[["running","Running"],["pending","Queued"],["retry","Retry"],["success","Succeeded"],["failed","Failed"]].map(([value, label]) => `<option value="${value}" ${filters.status === value ? "selected" : ""}>${label}</option>`).join("")}</select><input id="taskSearch" type="search" placeholder="Search targets" value="${escapeHtml(filters.query)}"></div></header><div class="panel-body compact-queue-body">${loadingDetail ? skeleton(2) : selected && batchPreparationStage(selected) ? emptyState("Queue preflight", escapeHtml(selected.input_source?.preflight_detail || "Validating target safety and running multi-proxy liveness checks before tasks are created.")) : selectedDetail ? renderTaskList(queueTasks, { limit: 50, compact: true, emptyTitle: "No matching targets", emptyDetail: "Change the filter or select another batch." }) : emptyState("Select a batch", "Task detail is loaded on demand.")}</div></section>
+      ${renderSelectedTargetsPanel(selected, selectedDetail, queueTasks, filters, loadingDetail, targetsOpen)}
 
       <details class="panel advanced-panel scans-advanced"><summary>Create new scan</summary><div class="advanced-content page-stack">
-        ${renderSubmitForm(submitDraft)}
+        ${renderSubmitForm(submitDraft, engineHealth)}
       </div></details>
 
-      <details class="panel advanced-panel scans-advanced" ${advancedRuntimeOpen ? "open" : ""}><summary>Advanced runtime details</summary><div class="advanced-content page-stack">
-        ${panel("Docker scan containers", `${containers ? `${containerSummary.strix_running || 0} running · ${orphanContainers} orphan` : "Loading telemetry"}`, containersError ? errorState(containersError) : containers ? renderContainers(containers) : skeleton(2))}
-        ${jobs?.jobs?.length ? panel("Recent dashboard submissions", "Batches launched from this console", `<div class="batch-summary-list">${jobs.jobs.slice(0, 6).map((job) => `<div class="job-row"><div><strong>${escapeHtml(job.job_id)}</strong><div class="cell-secondary">${job.target_count} targets · PID ${escapeHtml(job.pid || "-")} · ${formatDate(job.submitted_at)}</div></div>${badge(job.process_alive ? "running" : job.status || "submitted")}</div>`).join("")}</div>`) : ""}
-      </div></details>
     </div>`;
     bind();
   }
 
   function bind() {
-    root.querySelector(".scans-advanced")?.addEventListener("toggle", (event) => {
-      advancedRuntimeOpen = event.currentTarget.open;
+    root.querySelector(".active-runtime-details")?.addEventListener("toggle", async (event) => {
+      runtimeDetailsOpen = event.currentTarget.open;
+      if (!runtimeDetailsOpen || containers || containersError) return;
+      try {
+        containers = await api.containers();
+      } catch (error) {
+        containersError = error;
+      }
+      render();
+    });
+    root.querySelector(".selected-targets-panel")?.addEventListener("toggle", async (event) => {
+      targetsOpen = event.currentTarget.open;
+      if (targetsOpen && selectedId) await loadBatchDetail(selectedId);
     });
     root.querySelectorAll("[data-batch-id]").forEach((button) => button.addEventListener("click", async () => {
       if (!currentBatches().some((batch) => batch.batch_id === button.dataset.batchId)) {
@@ -448,7 +618,8 @@ export function mountScans(context) {
         return;
       }
       selectedId = button.dataset.batchId;
-      await loadBatchDetail(selectedId);
+      if (targetsOpen) await loadBatchDetail(selectedId);
+      else render();
     }));
     root.querySelectorAll("[data-scan-id]").forEach((button) => button.addEventListener("click", () => inspectScan(button.dataset.scanId, button.dataset.target)));
     root.querySelector("#taskStatusFilter")?.addEventListener("change", (event) => {
@@ -461,6 +632,37 @@ export function mountScans(context) {
     }, 120));
     root.querySelector("#scanPreviewButton")?.addEventListener("click", previewSubmission);
     root.querySelector("#scanSubmitForm")?.addEventListener("submit", submitScan);
+    root.querySelector("#scanEngine")?.addEventListener("change", (event) => {
+      const nextEngine = event.target.value || "strix";
+      submitDraft.engine = nextEngine;
+      submitDraft.mode = nextEngine === "dual" ? "dual" : nextEngine === "chelmon-claude" ? "default" : "redteam";
+      if (nextEngine === "dual") submitDraft.skip_scanned = false;
+      render();
+    });
+    root.querySelectorAll("[data-dual-job-terminate]").forEach((button) => button.addEventListener("click", async () => {
+      const jobId = button.dataset.dualJobTerminate;
+      button.disabled = true;
+      try {
+        await api.terminateSmartBatchJob(jobId);
+        toast(`${jobId} termination requested`);
+        await load(undefined, { includeContainers: false });
+      } catch (error) {
+        toast(error.message, "error");
+        button.disabled = false;
+      }
+    }));
+    root.querySelectorAll("[data-dual-job-resume]").forEach((button) => button.addEventListener("click", async () => {
+      const jobId = button.dataset.dualJobResume;
+      button.disabled = true;
+      try {
+        await api.resumeSmartBatchJob(jobId);
+        toast(`${jobId} recovery worker started`);
+        await load(undefined, { includeContainers: false });
+      } catch (error) {
+        toast(error.message, "error");
+        button.disabled = false;
+      }
+    }));
     root.querySelectorAll("[data-batch-parallel-form]").forEach((form) => form.addEventListener("submit", updateBatchParallel));
     root.querySelectorAll("[data-batch-pause]").forEach((button) => button.addEventListener("click", controlBatchPause));
     root.querySelectorAll("[data-batch-terminate]").forEach((button) => button.addEventListener("click", controlBatchTerminate));
@@ -546,7 +748,11 @@ export function mountScans(context) {
     try {
       const result = await api.previewSmartBatchJob(formPayload(root));
       const blocked = restrictedTargetsPreview(result.rejected_targets || []);
-      preview.textContent = `${result.target_count} accepted targets · ${result.restricted_target_count || 0} blocked · ${result.options.mode} · parallel ${result.options.parallel} · egress ${result.options.use_socks5 ? "on" : "off"} · live probe ${result.options.probe_live_before_queue ? `on (${result.options.probe_proxy_quorum}/${result.options.probe_max_proxy_nodes} proxies)` : "off"}.${blocked}`;
+      const scope = ` scope: ${result.target_count || 0} admitted, ${result.scope_review_targets?.length || 0} review, ${result.scope_blocked_targets?.length || 0} out; catalog ${result.scope_catalog_version || "uninitialized"}.`;
+      const enginePlan = result.engine_plan?.length ? ` · ${result.engine_plan.map((item) => `${item.engine} ${item.mode}`).join(" → ")}` : "";
+      const retest = result.retest_baseline ? ` Retest baseline: ${Object.values(result.retest_baseline.targets || {}).reduce((sum, item) => sum + Number(item.historical_findings_count || 0), 0)} historical findings.` : "";
+      const groups = result.execution_groups ? ` Auto-routing: ${(result.execution_groups.new_targets || []).length} new · ${(result.execution_groups.retest_targets || []).length} previously scanned to Retest.` : "";
+      preview.textContent = `${result.target_count} accepted targets · ${result.restricted_target_count || 0} network blocked · ${result.options.engine || "strix"}${enginePlan} · parallel ${result.options.parallel} · egress ${result.options.use_socks5 ? "on" : "off"} · live probe ${result.options.probe_live_before_queue ? `on (${result.options.probe_proxy_quorum}/${result.options.probe_max_proxy_nodes} proxies)` : "off"}.${scope}${retest}${groups}${blocked}`;
       toast(result.restricted_target_count ? "Preview found restricted targets" : "Batch preview is valid", result.restricted_target_count ? "warning" : "success");
     } catch (error) {
       preview.textContent = error.message;
@@ -563,14 +769,15 @@ export function mountScans(context) {
     const probeText = payload.probe_live_before_queue ? ` A multi-proxy live probe (${payload.probe_proxy_quorum}/${payload.probe_max_proxy_nodes}) runs before queueing.` : "";
     const confirmed = await confirmAction({
       title: "Start Smart Batch",
-      message: `Start this batch${dryRunText} with mode ${payload.mode}, parallel ${payload.parallel}, and egress ${payload.use_socks5 ? "enabled" : "disabled"}?${probeText}${dnsText}${privateText}`,
+      message: `Start this batch${dryRunText} with ${payload.mode === "retest" ? "Retest: historical findings → Strix redteam → Chelmon-Claude default" : payload.engine === "dual" ? "Strix redteam followed by Chelmon-Claude default" : `engine ${payload.engine || "strix"}, mode ${payload.mode}`}, parallel ${payload.parallel}, and egress ${payload.use_socks5 ? "enabled" : "disabled"}?${probeText}${dnsText}${privateText}`,
       confirmLabel: "Start batch",
       danger: payload.allow_private_targets,
     });
     if (!confirmed) return;
     try {
       const result = await api.submitSmartBatchJob(payload);
-      toast(`Batch submitted: PID ${result.pid}`);
+      const submitted = result.jobs || [result];
+      toast(submitted.length > 1 ? `Submitted ${submitted.length} batches; scanned targets were routed to Retest.` : submitted[0]?.engine === "dual" ? `Dual-engine batch submitted: ${submitted[0]?.job_id}` : `Batch submitted: PID ${submitted[0]?.pid}`);
       submitDraft.targets = "";
       submitDraft.label = "";
       await load(undefined, { includeContainers: false });
@@ -580,20 +787,25 @@ export function mountScans(context) {
   }
 
   async function load(signal, { includeContainers = false } = {}) {
-    const shouldLoadContainers = includeContainers || firstTelemetryLoad || advancedRuntimeOpen;
-    firstTelemetryLoad = false;
+    const shouldLoadContainers = includeContainers || runtimeDetailsOpen;
     const containersRequest = shouldLoadContainers
       ? api.containers(signal).then((value) => ({ value }), (error) => ({ error }))
       : Promise.resolve({ value: containers });
-    const [batchData, jobData] = await Promise.all([
+    const [batchData, jobData, healthData] = await Promise.all([
       api.batches(signal, 60, { includeFinished: false, includeTasks: false }),
       api.smartBatchJobs(signal, 20).catch(() => ({ jobs: [] })),
+      api.smartBatchJobsHealth(signal).catch(() => null),
     ]);
     data = batchData;
     jobs = jobData;
+    engineHealth = healthData?.engines?.dual?.runtime || null;
+    if (engineHealth && !engineHealth.ready && submitDraft.engine === "dual") {
+      submitDraft.engine = "strix";
+      submitDraft.mode = "redteam";
+    }
     render();
     setFreshness(data.generated_at);
-    if (selectedId) await loadBatchDetail(selectedId, signal, { force: true });
+    if (selectedId && targetsOpen) await loadBatchDetail(selectedId, signal, { force: true });
     const telemetry = await containersRequest;
     if (telemetry.error) {
       if (telemetry.error.name === "AbortError") throw telemetry.error;
@@ -603,12 +815,15 @@ export function mountScans(context) {
       containersError = null;
     }
     render();
-    setFreshness(containers?.generated_at || data.generated_at, Boolean(containersError));
+    // Docker telemetry is optional. Its failure must not make the successfully
+    // loaded scan queue appear stale or hide current batches.
+    setFreshness(data.generated_at);
   }
 
   const poller = new Poller(5000, load, (error) => {
-    if (!data) root.innerHTML = errorState(error);
-    else setFreshness(null, true);
+    console.error("Scans refresh failed", error);
+    if (!data || !root.querySelector(".scans-page")) root.innerHTML = errorState(error);
+    setFreshness(null, true);
   }).start();
   setRefreshHandler(() => poller.run());
   return () => poller.stop();
@@ -656,6 +871,7 @@ export function mountScanHistory(context) {
     return batches.filter((batch) => {
       const haystack = [
         batch.batch_id,
+        batch.engine,
         batch.scan_mode,
         batch.status,
         batch.lifecycle,
@@ -694,7 +910,7 @@ export function mountScanHistory(context) {
 
       <section class="panel scan-history-panel"><header class="panel-header"><div><h2>Batch history</h2><p>One row per batch: state, completion, failures, running tasks, and queue size</p></div><div class="panel-actions"><select id="historyLifecycleFilter"><option value="history" ${historyFilters.lifecycle === "history" ? "selected" : ""}>Historical only</option><option value="current" ${historyFilters.lifecycle === "current" ? "selected" : ""}>Current only</option><option value="all" ${historyFilters.lifecycle === "all" ? "selected" : ""}>All batches</option></select><input id="historyBatchSearch" type="search" placeholder="Search batch, target, scan_id, error" value="${escapeHtml(historyFilters.query)}"></div></header><div class="panel-body">${renderBatchList(batches, selectedId, "history")}</div></section>
 
-      <section class="panel"><header class="panel-header"><div><h2>Targets for selected batch</h2><p>${selected ? `${escapeHtml(selected.batch_id)} · ${loadingDetail ? "loading detail…" : `${detailTasks.length} targets shown`}` : "Select a batch"}</p></div><div class="panel-actions compact-controls"><select id="taskStatusFilter"><option value="">All</option>${[["success","Succeeded"],["failed","Failed"],["timeout","Timed out"],["running","Running"],["pending","Queued"],["retry","Retry"]].map(([value, label]) => `<option value="${value}" ${filters.status === value ? "selected" : ""}>${label}</option>`).join("")}</select><input id="taskSearch" type="search" placeholder="Search targets" value="${escapeHtml(filters.query)}"></div></header><div class="panel-body">${loadingDetail ? skeleton(2) : selectedDetail ? renderTaskList(detailTasks, { limit: 100, emptyTitle: "No matching results", emptyDetail: "Change the filter or select another batch." }) : emptyState("Select a batch", "Task detail is loaded on demand.")}</div></section>
+        <section class="panel"><header class="panel-header"><div><h2>Targets for selected batch</h2><p class="batch-detail-meta">${selected ? `${escapeHtml(selected.batch_id)} · ${scanEngineBadge(selected.engine)} <span>${escapeHtml(selected.scan_mode || "-")}</span><span>·</span><span>${loadingDetail ? "loading detail…" : `${detailTasks.length} targets shown`}</span>` : "Select a batch"}</p></div><div class="panel-actions compact-controls"><select id="taskStatusFilter"><option value="">All</option>${[["success","Succeeded"],["failed","Failed"],["timeout","Timed out"],["running","Running"],["pending","Queued"],["retry","Retry"]].map(([value, label]) => `<option value="${value}" ${filters.status === value ? "selected" : ""}>${label}</option>`).join("")}</select><input id="taskSearch" type="search" placeholder="Search targets" value="${escapeHtml(filters.query)}"></div></header><div class="panel-body">${loadingDetail ? skeleton(2) : selectedDetail ? renderTaskList(detailTasks, { limit: 100, emptyTitle: "No matching results", emptyDetail: "Change the filter or select another batch." }) : emptyState("Select a batch", "Task detail is loaded on demand.")}</div></section>
 
       <details class="panel advanced-panel"><summary>Scanned targets (Deduplicated registry)</summary><div class="advanced-content page-stack">
         <section class="panel scanned-targets-panel"><header class="panel-header"><div><h2>Scanned targets</h2><p>Deduplicated registry across current, report, and legacy 0.8.3 history files</p></div><div class="panel-actions"><input id="scannedTargetSearch" type="search" placeholder="Search scanned targets" value="${escapeHtml(scannedFilters.query)}"></div></header><div class="panel-body">${renderScannedTargets()}</div></section>

@@ -9,6 +9,7 @@ const DEFAULT_FILTERS = {
   source: "",
   platform: "",
   group: "",
+  scope_status: "",
   sort: "last_seen",
   page: 1,
   page_size: 50,
@@ -21,11 +22,14 @@ function statusCount(map = {}, ...keys) {
 function renderSummary(summary = {}) {
   const scan = summary.scan_status || {};
   const probe = summary.probe_status || {};
+  const scope = summary.scope || {};
   return `<div class="metrics-grid single-row compact-metrics">
     <article class="metric-card"><div class="metric-label">Assets</div><div class="metric-value">${formatNumber(summary.total || 0, 0)}</div><div class="metric-detail">unique targets</div></article>
     <article class="metric-card"><div class="metric-label">Scanned</div><div class="metric-value">${formatNumber(statusCount(scan, "success", "completed", "succeeded"), 0)}</div><div class="metric-detail">database first, files fallback</div></article>
     <article class="metric-card"><div class="metric-label">Unscanned</div><div class="metric-value">${formatNumber(scan.unscanned || 0, 0)}</div><div class="metric-detail">ready for queueing</div></article>
     <article class="metric-card"><div class="metric-label">Live probe</div><div class="metric-value">${formatNumber(probe.alive || 0, 0)}</div><div class="metric-detail">last known alive</div></article>
+    <article class="metric-card"><div class="metric-label">In scope</div><div class="metric-value">${formatNumber(scope.in_scope || 0, 0)}</div><div class="metric-detail">high-confidence admission</div></article>
+    <article class="metric-card"><div class="metric-label">Scope review</div><div class="metric-value">${formatNumber(scope.scope_review_required || 0, 0)}</div><div class="metric-detail">stored, never auto-scanned</div></article>
     <article class="metric-card"><div class="metric-label">Findings refs</div><div class="metric-value">${formatNumber(summary.findings || 0, 0)}</div><div class="metric-detail">linked evidence</div></article>
     <article class="metric-card"><div class="metric-label">DB state</div><div class="metric-value">WAL</div><div class="metric-detail">SQLite shadow store</div></article>
   </div>`;
@@ -43,6 +47,10 @@ function renderFilters(filters, groups = {}) {
     <select id="assetProbeStatus">
       <option value="">All probe states</option>
       ${["unknown", "alive", "dead"].map((value) => `<option value="${value}" ${filters.probe_status === value ? "selected" : ""}>${value}</option>`).join("")}
+    </select>
+    <select id="assetScopeStatus">
+      <option value="">All scope states</option>
+      ${[["in_scope", "In scope"], ["scope_review_required", "Review required"], ["out_of_scope", "Out of scope"]].map(([value, label]) => `<option value="${value}" ${filters.scope_status === value ? "selected" : ""}>${label}</option>`).join("")}
     </select>
     <select id="assetPlatform">
       <option value="">All platforms</option>
@@ -66,9 +74,10 @@ function renderAssetTable(data = {}) {
   const rows = data.items || [];
   if (!rows.length) return emptyState("No assets match this filter", "Imported history, probes, and batch snapshots will appear here.");
   return `<div class="table-wrap"><table class="data-table assets-table">
-    <thead><tr><th>Target</th><th>Addresses</th><th>Probe</th><th>Scan</th><th>Findings</th><th>Last seen</th><th></th></tr></thead>
+    <thead><tr><th>Target</th><th>Scope</th><th>Addresses</th><th>Probe</th><th>Scan</th><th>Findings</th><th>Last seen</th><th></th></tr></thead>
     <tbody>${rows.map((item) => `<tr>
       <td><strong class="break-anywhere">${escapeHtml(item.target)}</strong><div class="cell-secondary">${escapeHtml(item.target_type || "target")}${item.root_domain ? ` · ${escapeHtml(item.root_domain)}` : ""}</div></td>
+      <td>${item.scope_status ? `${badge(item.scope_status)}${item.scope_category ? `<div class="cell-secondary">${escapeHtml(item.scope_category)}</div>` : ""}` : '<span class="muted">not evaluated</span>'}</td>
       <td class="break-anywhere">${escapeHtml(item.addresses || "-")}</td>
       <td>${badge(item.last_probe_status || "unknown")}</td>
       <td>${badge(item.last_scan_status || "unscanned")}${item.platforms ? `<div class="cell-secondary">${escapeHtml(item.platforms)}</div>` : ""}</td>
@@ -98,6 +107,7 @@ function detailList(items = [], formatter) {
 
 function renderDetail(detail) {
   return `<div class="drawer-stack">
+    ${panel("Scope", "Derived pre-scan admission decision", detail.scope ? `<div class="detail-row"><strong>${badge(detail.scope.scope_status || "unknown")}</strong><span>${escapeHtml(detail.scope.category || "no category")} · ${escapeHtml(detail.scope.confidence || "")}</span><span>${escapeHtml(detail.scope.reason || "")}</span></div>` : emptyState("Not evaluated", "The asset is stored, but has not passed through the scope gate yet."))}
     ${panel("Groups", "Platform/source grouping", detailList(detail.groups || [], (item) => `<div class="detail-row"><strong>${escapeHtml(item.label || item.platform || item.group_key)}</strong><span>${escapeHtml(item.group_key || "")} · ${formatDate(item.member_last_seen)}</span></div>`))}
     ${panel("Addresses", "Known DNS/IP observations", detailList(detail.addresses, (item) => `<div class="detail-row"><strong>${escapeHtml(item.ip)}</strong><span>${escapeHtml(item.source || "")} · ${formatDate(item.last_seen)}</span></div>`))}
     ${panel("Scans", "Batch and task history", detailList(detail.scans, (item) => `<div class="detail-row"><strong>${escapeHtml(item.batch_id || "-")}</strong><span>${badge(item.status || "unknown")} ${escapeHtml(item.scan_mode || "")} · ${formatDate(item.ended_at || item.started_at)}</span><span>${escapeHtml(item.model_name || "")}${item.total_tokens ? ` · ${formatNumber(item.total_tokens, 0)} tokens` : ""}</span></div>`))}
@@ -191,6 +201,7 @@ export function mountAssets({ root, setFreshness, setRefreshHandler }) {
     root.querySelector("#assetSearch")?.addEventListener("input", debouncedSearch);
     root.querySelector("#assetScanStatus")?.addEventListener("change", (event) => { filters.scan_status = event.target.value; filters.page = 1; load(); });
     root.querySelector("#assetProbeStatus")?.addEventListener("change", (event) => { filters.probe_status = event.target.value; filters.page = 1; load(); });
+    root.querySelector("#assetScopeStatus")?.addEventListener("change", (event) => { filters.scope_status = event.target.value; filters.page = 1; load(); });
     root.querySelector("#assetPlatform")?.addEventListener("change", (event) => { filters.platform = event.target.value; filters.group = ""; filters.page = 1; load(); });
     root.querySelector("#assetGroup")?.addEventListener("change", (event) => { filters.group = event.target.value; filters.platform = ""; filters.page = 1; load(); });
     root.querySelector("#assetSort")?.addEventListener("change", (event) => { filters.sort = event.target.value; filters.page = 1; load(); });

@@ -148,11 +148,12 @@ class UsageController:
                     self.model_stats[model_name] = UsageStats(**stats)
                 self.daily_stats["total"] = UsageStats(**data.get("total", {}))
 
-                # 加载每小时数据（只加载当前小时之前的）
+                # Keep the current hour too. Skipping it loses persisted usage
+                # after a service restart and later saves a partial bucket.
                 current_hour = datetime.now().astimezone().hour
                 for slot, slot_data in data.get("hourly", {}).items():
                     slot_hour = int(slot)
-                    if slot_hour < current_hour:
+                    if slot_hour <= current_hour:
                         for model_name, stats in slot_data.items():
                             self.hourly_stats[slot][model_name] = UsageStats(**stats)
 
@@ -335,6 +336,34 @@ class UsageController:
         state = self.rate_limit_states[model_name]
         state.active_requests = max(0, state.active_requests - 1)
         logger.debug(f"模型 {model_name} 释放锁: {state.active_requests} 个活跃请求")
+
+    @synchronized_usage
+    def reset_active_requests(self, model_name: str | None = None) -> dict:
+        """Reset runtime-only active request counters.
+
+        These counters are intentionally in-memory. If a request is cancelled,
+        the proxy process restarts mid-request, or a legacy retry path leaks a
+        fallback slot, the counter can remain non-zero even when there is no
+        active LLM process. This method is for operational recovery only and
+        does not change token/cost usage statistics.
+        """
+        if model_name:
+            state = self.rate_limit_states[model_name]
+            previous = state.active_requests
+            state.active_requests = 0
+            logger.warning("重置模型活跃请求计数: %s %s -> 0", model_name, previous)
+            return {"models": {model_name: previous}, "total_reset": previous}
+
+        reset: dict[str, int] = {}
+        total = 0
+        for name, state in self.rate_limit_states.items():
+            if state.active_requests:
+                reset[name] = state.active_requests
+                total += state.active_requests
+                state.active_requests = 0
+        if reset:
+            logger.warning("重置全部模型活跃请求计数: %s", reset)
+        return {"models": reset, "total_reset": total}
 
     def check_token_limit(self, token_count: int) -> bool:
         """检查单次请求 Token 是否超限
@@ -646,22 +675,45 @@ class UsageController:
 
         return result
 
-    def get_trend_data(self, granularity: str = "4h", model: str = None) -> dict:
+    def get_trend_data(self, granularity: str = "4h", model: str = None, group_by: str = "provider") -> dict:
         """获取趋势数据
 
         Args:
             granularity: 时间粒度，"day" 或 "4h"
             model: 模型名称，None 表示全部
+            group_by: "provider" aggregates configured providers, "model" keeps each model separate
 
         Returns:
             趋势数据
         """
         if granularity == "day":
-            return self._get_daily_trend(model)
+            return self._get_daily_trend(model, group_by)
         else:
-            return self._get_hourly_trend(model)
+            return self._get_hourly_trend(model, group_by)
 
-    def _get_hourly_trend(self, model: str = None) -> dict:
+    def _get_hourly_trend(self, model: str = None, group_by: str = "provider") -> dict:
+        hourly = {
+            slot: {
+                name: {
+                    "requests": stats.requests,
+                    "input_tokens": stats.input_tokens,
+                    "output_tokens": stats.output_tokens,
+                    "tokens": stats.tokens,
+                }
+                for name, stats in models.items()
+            }
+            for slot, models in self.hourly_stats.items()
+        }
+        return self.hourly_trend_from_history(hourly, model, group_by)
+
+    def hourly_trend_from_history(
+        self,
+        hourly: dict[str, dict[str, dict]],
+        model: str = None,
+        group_by: str = "provider",
+        *,
+        current_hour: int | None = None,
+    ) -> dict:
         """获取4小时粒度趋势数据（按 provider 聚合）
 
         Args:
@@ -670,12 +722,19 @@ class UsageController:
         Returns:
             4小时趋势数据
         """
-        labels = self.HOUR_SLOTS
+        # A future hour is not a zero-usage hour. Returning 12–23 as zero
+        # caused the line to fall to zero after the current hour and made the
+        # Activity chart look like a broken counter. Only expose hours that
+        # have started in the server's local accounting day.
+        if current_hour is None:
+            current_hour = datetime.now().astimezone().hour
+        current_hour = max(0, min(23, int(current_hour)))
+        labels = self.HOUR_SLOTS[: current_hour + 1]
         datasets = []
 
         # 收集所有模型名称
         all_models = set()
-        for slot_data in self.hourly_stats.values():
+        for slot_data in hourly.values():
             all_models.update(slot_data.keys())
         all_models.discard("total")
 
@@ -685,35 +744,37 @@ class UsageController:
         else:
             models_to_show = sorted(all_models)
 
-        # 按 provider 分组聚合
-        provider_data = {}  # provider -> {tokens: [], input: [], output: [], requests: []}
+        series_data = {}  # series -> {provider, models, tokens, input, output, requests}
 
         for model_name in models_to_show:
-            # 获取 provider（从模型名推断）
             provider = self._get_provider_from_model(model_name)
+            series_name = model_name if group_by == "model" else provider
 
-            if provider not in provider_data:
-                provider_data[provider] = {
+            if series_name not in series_data:
+                series_data[series_name] = {
+                    "provider": provider,
+                    "models": set(),
                     "tokens": [0] * len(labels),
                     "input_tokens": [0] * len(labels),
                     "output_tokens": [0] * len(labels),
                     "requests": [0] * len(labels),
                 }
+            series_data[series_name]["models"].add(model_name)
 
             for i, slot in enumerate(labels):
-                slot_stats = self.hourly_stats.get(slot, {}).get(
-                    model_name, UsageStats()
-                )
-                provider_data[provider]["tokens"][i] += slot_stats.tokens
-                provider_data[provider]["input_tokens"][i] += slot_stats.input_tokens
-                provider_data[provider]["output_tokens"][i] += slot_stats.output_tokens
-                provider_data[provider]["requests"][i] += slot_stats.requests
+                slot_stats = (hourly.get(slot, {}) or {}).get(model_name, {})
+                series_data[series_name]["tokens"][i] += int(slot_stats.get("tokens") or 0)
+                series_data[series_name]["input_tokens"][i] += int(slot_stats.get("input_tokens") or 0)
+                series_data[series_name]["output_tokens"][i] += int(slot_stats.get("output_tokens") or 0)
+                series_data[series_name]["requests"][i] += int(slot_stats.get("requests") or 0)
 
         # 构建数据集
-        for provider, data in sorted(provider_data.items()):
+        for series_name, data in sorted(series_data.items()):
             datasets.append(
                 {
-                    "model": provider,
+                    "model": series_name,
+                    "provider": data["provider"],
+                    "models": sorted(data["models"]),
                     "tokens": data["tokens"],
                     "input_tokens": data["input_tokens"],
                     "output_tokens": data["output_tokens"],
@@ -723,20 +784,35 @@ class UsageController:
 
         return {
             "granularity": "4h",
+            "group_by": group_by,
+            "window": "today_to_current_hour",
+            "current_hour": current_hour,
             "labels": labels,
             "datasets": datasets,
         }
 
     def _get_provider_from_model(self, model_name: str) -> str:
-        """从模型名推断 provider"""
+        """Return the provider for a model.
+
+        Prefer the configured provider because newly added routes often have
+        arbitrary display names. The keyword fallback keeps older persisted
+        usage files readable even if the model was removed from config.
+        """
+        configured = (
+            self.model_configs.get(model_name, {}).get("provider")
+            or self.per_model_limits.get(model_name, {}).get("provider")
+        )
+        if configured:
+            return str(configured).strip().lower()
+
         model_lower = model_name.lower()
-        if "mimo" in model_lower or "xiaomi" in model_lower:
+        if "mimo" in model_lower or "xiaomi" in model_lower or "token-plan" in model_lower:
             return "xiaomi"
         elif "nvidia" in model_lower:
             return "nvidia"
         elif "openrouter" in model_lower or "or-" in model_lower:
             return "openrouter"
-        elif "volcengine" in model_lower or "ark-code" in model_lower:
+        elif "volcengine" in model_lower or "ark-code" in model_lower or "huoshan" in model_lower or "doubao" in model_lower:
             return "volcengine"
         elif "minimax" in model_lower:
             return "minimax"
@@ -750,10 +826,12 @@ class UsageController:
             return "openai-proxy"
         elif "anyrouter" in model_lower:
             return "anyrouter"
+        elif "hy3" in model_lower or "hunyuan" in model_lower or "tencent" in model_lower:
+            return "hy3"
         else:
             return "other"
 
-    def _get_daily_trend(self, model: str = None) -> dict:
+    def _get_daily_trend(self, model: str = None, group_by: str = "provider") -> dict:
         """获取天粒度趋势数据
 
         Args:
@@ -762,8 +840,15 @@ class UsageController:
         Returns:
             天趋势数据
         """
-        # 加载历史数据
-        historical = self._load_historical_stats(30)
+        return self.daily_trend_from_history(self._load_historical_stats(30), model, group_by)
+
+    def daily_trend_from_history(
+        self,
+        historical: dict[str, dict],
+        model: str = None,
+        group_by: str = "provider",
+    ) -> dict:
+        """Aggregate daily trend from SQLite or legacy JSON history."""
 
         # 按日期排序
         dates = sorted(historical.keys())
@@ -779,37 +864,42 @@ class UsageController:
         else:
             models_to_show = sorted(all_models)
 
-        # 按 provider 分组聚合
-        provider_data = {}  # provider -> {tokens: [], input: [], output: [], requests: []}
+        series_data = {}  # series -> {provider, models, tokens, input, output, requests}
 
         for model_name in models_to_show:
             provider = self._get_provider_from_model(model_name)
+            series_name = model_name if group_by == "model" else provider
 
-            if provider not in provider_data:
-                provider_data[provider] = {
+            if series_name not in series_data:
+                series_data[series_name] = {
+                    "provider": provider,
+                    "models": set(),
                     "tokens": [0] * len(dates),
                     "input_tokens": [0] * len(dates),
                     "output_tokens": [0] * len(dates),
                     "requests": [0] * len(dates),
                 }
+            series_data[series_name]["models"].add(model_name)
 
             for i, day_key in enumerate(dates):
                 model_stats = historical[day_key].get("models", {}).get(model_name, {})
-                provider_data[provider]["tokens"][i] += model_stats.get("tokens", 0)
-                provider_data[provider]["input_tokens"][i] += model_stats.get(
+                series_data[series_name]["tokens"][i] += model_stats.get("tokens", 0)
+                series_data[series_name]["input_tokens"][i] += model_stats.get(
                     "input_tokens", 0
                 )
-                provider_data[provider]["output_tokens"][i] += model_stats.get(
+                series_data[series_name]["output_tokens"][i] += model_stats.get(
                     "output_tokens", 0
                 )
-                provider_data[provider]["requests"][i] += model_stats.get("requests", 0)
+                series_data[series_name]["requests"][i] += model_stats.get("requests", 0)
 
         # 构建数据集
         datasets = []
-        for provider, data in sorted(provider_data.items()):
+        for series_name, data in sorted(series_data.items()):
             datasets.append(
                 {
-                    "model": provider,
+                    "model": series_name,
+                    "provider": data["provider"],
+                    "models": sorted(data["models"]),
                     "tokens": data["tokens"],
                     "input_tokens": data["input_tokens"],
                     "output_tokens": data["output_tokens"],
@@ -819,6 +909,7 @@ class UsageController:
 
         return {
             "granularity": "day",
+            "group_by": group_by,
             "labels": dates,
             "datasets": datasets,
         }

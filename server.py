@@ -2,12 +2,16 @@
 
 import asyncio
 import base64
+import copy
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
 import secrets
+import shutil
+import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -49,13 +53,237 @@ from strix_runtime_monitor import (
     upsert_strix_egress_node,
 )
 from egress_usage_monitor import get_egress_usage
-from asset_database import get_asset_database
+from chelmon_runtime import get_chelmon_runtime_status
+from asset_database import get_asset_database, normalize_target
 from findings import FindingsService, create_findings_router
-from smart_batch_jobs import SmartBatchJobManager
+from smart_batch_jobs import SmartBatchJobManager, analyze_targets
+from target_policy import load_scope_catalog, save_scope_catalog
 
 logger = logging.getLogger(__name__)
 
 DASHBOARD_SESSION_COOKIE = "nscan_admin_session"
+DEFAULT_RESPONSE_TOKEN_BUDGET = 16_384
+CONTEXT_COMPACT_RECENT_MESSAGES = 12
+DEFAULT_SCAN_CONTAINER_SUBNETS = ("172.29.0.0/24",)
+SCAN_CONTAINER_ALLOWED_PATHS = frozenset(
+    {
+        "/v1/chat/completions",
+        "/v1/models",
+    }
+)
+ASSET_IMPORT_MAX_TARGETS = 10_000
+
+
+def asset_import_target_values(raw: Any) -> list[str]:
+    """Return submitted values for a bounded, inventory-only import."""
+    if isinstance(raw, list):
+        return [str(value).strip() for value in raw if str(value).strip()]
+    return [line.strip() for line in str(raw or "").splitlines() if line.strip()]
+
+
+def asset_import_cursor(payload: dict[str, Any]) -> str:
+    # ``0`` is a valid upstream cursor, so do not use a truthiness fallback.
+    value = payload.get("sync_cursor") if "sync_cursor" in payload else payload.get("cursor")
+    return str(value).strip() if value is not None else ""
+
+
+def deep_merge_config(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge config updates while preserving unspecified sections."""
+    merged = copy.deepcopy(base)
+    for key, value in patch.items():
+        if (
+            isinstance(value, dict)
+            and isinstance(merged.get(key), dict)
+        ):
+            merged[key] = deep_merge_config(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def parse_scan_container_subnets(config: dict[str, Any]) -> list[ipaddress._BaseNetwork]:
+    configured = (
+        os.environ.get("NSCAN_SCAN_CONTAINER_SUBNETS")
+        or config.get("server", {}).get("scan_container_subnets")
+        or DEFAULT_SCAN_CONTAINER_SUBNETS
+    )
+    if isinstance(configured, str):
+        candidates = [item.strip() for item in configured.split(",") if item.strip()]
+    elif isinstance(configured, (list, tuple, set)):
+        candidates = [str(item).strip() for item in configured if str(item).strip()]
+    else:
+        candidates = list(DEFAULT_SCAN_CONTAINER_SUBNETS)
+
+    networks: list[ipaddress._BaseNetwork] = []
+    for candidate in candidates:
+        try:
+            networks.append(ipaddress.ip_network(candidate, strict=False))
+        except ValueError:
+            logger.warning("Ignoring invalid scan container subnet: %s", candidate)
+    return networks
+
+
+def is_scan_container_peer(
+    peer_ip: str,
+    scan_container_subnets: list[ipaddress._BaseNetwork],
+) -> bool:
+    try:
+        address = ipaddress.ip_address(peer_ip)
+    except ValueError:
+        return False
+    return any(address in network for network in scan_container_subnets)
+
+
+def validate_proxy_config(candidate: Any) -> dict[str, Any]:
+    if not isinstance(candidate, dict):
+        raise ValueError("Config payload must be a JSON object")
+
+    for section in ("admin", "server", "usage", "models", "providers"):
+        section_value = candidate.get(section)
+        if section_value is not None and not isinstance(section_value, dict):
+            raise ValueError(f"Config section '{section}' must be an object")
+
+    models = candidate.get("models", {})
+    available_models = models.get("available") if isinstance(models, dict) else None
+    if not isinstance(available_models, dict) or not available_models:
+        raise ValueError("Config must include at least one model under models.available")
+
+    providers = candidate.get("providers")
+    if not isinstance(providers, dict) or not providers:
+        raise ValueError("Config must include at least one provider")
+
+    for model_name, model_config in available_models.items():
+        if not isinstance(model_config, dict):
+            raise ValueError(f"Model '{model_name}' config must be an object")
+        for required_field in ("model", "api_base", "provider"):
+            if not str(model_config.get(required_field) or "").strip():
+                raise ValueError(
+                    f"Model '{model_name}' is missing required field '{required_field}'"
+                )
+        provider_name = str(model_config.get("provider") or "").strip()
+        if provider_name not in providers:
+            raise ValueError(
+                f"Model '{model_name}' references unknown provider '{provider_name}'"
+            )
+
+    return candidate
+
+
+def _rough_token_count(value: Any) -> int:
+    """Fast, dependency-free token estimate for routing safety.
+
+    This intentionally over-estimates JSON/tool payloads a little. The value is
+    only used to skip models whose configured context windows are too small,
+    avoiding provider-side 400s after a large redteam context has accumulated.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return max(1, len(value) // 4) if value else 0
+    try:
+        rendered = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        rendered = str(value)
+    return max(1, len(rendered) // 4) if rendered else 0
+
+
+def estimate_request_context_tokens(body: dict[str, Any]) -> int:
+    """Estimate prompt + expected output tokens for model context routing."""
+    prompt_tokens = _rough_token_count(body.get("messages") or body.get("input") or [])
+    prompt_tokens += _rough_token_count(body.get("tools") or [])
+    prompt_tokens += _rough_token_count(body.get("response_format") or {})
+    max_output = (
+        body.get("max_completion_tokens")
+        or body.get("max_output_tokens")
+        or body.get("max_tokens")
+        or DEFAULT_RESPONSE_TOKEN_BUDGET
+    )
+    try:
+        output_tokens = int(max_output or 0)
+    except (TypeError, ValueError):
+        output_tokens = DEFAULT_RESPONSE_TOKEN_BUDGET
+    return prompt_tokens + max(0, output_tokens)
+
+
+def _message_preview(message: dict[str, Any], max_chars: int = 900) -> str:
+    role = str(message.get("role") or "unknown")
+    content = message.get("content", "")
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text":
+                parts.append(str(item.get("text") or ""))
+            elif item.get("type") == "image_url":
+                parts.append("[image omitted]")
+        text = "\n".join(parts)
+    else:
+        text = str(content or "")
+    text = text.replace("\r", " ").strip()
+    if len(text) > max_chars:
+        text = f"{text[:max_chars].rstrip()} …[truncated]"
+    return f"{role}: {text}" if text else f"{role}: [empty]"
+
+
+def compact_request_context(body: dict[str, Any], token_budget: int) -> tuple[dict[str, Any], bool]:
+    """Compact old chat history while preserving system and recent messages."""
+    messages = body.get("messages")
+    if not isinstance(messages, list) or len(messages) <= CONTEXT_COMPACT_RECENT_MESSAGES + 2:
+        return body, False
+
+    system_messages = [
+        msg for msg in messages if isinstance(msg, dict) and msg.get("role") == "system"
+    ]
+    regular_messages = [
+        msg for msg in messages if isinstance(msg, dict) and msg.get("role") != "system"
+    ]
+    if len(regular_messages) <= CONTEXT_COMPACT_RECENT_MESSAGES:
+        return body, False
+
+    recent_messages = regular_messages[-CONTEXT_COMPACT_RECENT_MESSAGES:]
+    old_messages = regular_messages[:-CONTEXT_COMPACT_RECENT_MESSAGES]
+    summary_lines = [
+        "== Nscan compacted earlier agent context ==",
+        f"Compacted {len(old_messages)} older messages to stay within the model context window.",
+        "Preserve this as background only; the most recent messages below are authoritative.",
+    ]
+    # Keep enough breadcrumbs for security continuity without replaying huge
+    # tool outputs. The final budget enforcement below will trim further if
+    # needed.
+    for idx, msg in enumerate(old_messages[-80:], start=max(1, len(old_messages) - 79)):
+        if isinstance(msg, dict):
+            summary_lines.append(f"[{idx}] {_message_preview(msg)}")
+
+    compacted_messages = [
+        *system_messages,
+        {"role": "user", "content": "\n".join(summary_lines)},
+        *recent_messages,
+    ]
+    compacted_body = {**body, "messages": compacted_messages}
+
+    # If the recent tail is still too large, progressively keep fewer recent
+    # messages before finally shortening the synthetic summary.
+    keep = CONTEXT_COMPACT_RECENT_MESSAGES
+    while keep > 3 and estimate_request_context_tokens(compacted_body) > token_budget:
+        keep -= 1
+        compacted_body["messages"] = [
+            *system_messages,
+            {"role": "user", "content": "\n".join(summary_lines[:20])},
+            *regular_messages[-keep:],
+        ]
+
+    if estimate_request_context_tokens(compacted_body) > token_budget:
+        compacted_body["messages"] = [
+            *system_messages,
+            {
+                "role": "user",
+                "content": "\n".join(summary_lines[:8]) + "\n[Older detailed context omitted]",
+            },
+            *regular_messages[-3:],
+        ]
+
+    return compacted_body, True
 
 
 def _asset_change_key(item: dict[str, Any]) -> tuple[str, int]:
@@ -241,6 +469,7 @@ class LLMProxyServer:
         server_config = self.config.get("server", {})
         allowed_ips = server_config.get("allowed_ips", [])
         self.ip_whitelist = IPWhitelist(allowed_ips)
+        self.scan_container_subnets = parse_scan_container_subnets(self.config)
 
         # 初始化模型管理器
         self.model_manager = ModelManager(self.config, str(self.stats_dir))
@@ -264,24 +493,58 @@ class LLMProxyServer:
     def _load_config(self) -> dict:
         """加载配置文件"""
         with open(self.config_path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f)
+            config = yaml.safe_load(f) or {}
+        return validate_proxy_config(config)
 
-    def _save_config(self):
-        """保存配置文件"""
-        with open(self.config_path, "w", encoding="utf-8") as f:
-            yaml.dump(self.config, f, allow_unicode=True, default_flow_style=False)
+    def _save_config(self, config: Optional[dict] = None, *, create_backup: bool = False):
+        """保存配置文件，使用原子替换防止写入中断损坏。"""
+        target_config = validate_proxy_config(config if config is not None else self.config)
+        rendered = yaml.dump(
+            target_config,
+            allow_unicode=True,
+            default_flow_style=False,
+            sort_keys=False,
+        )
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            dir=str(self.config_path.parent),
+            prefix=f".{self.config_path.name}.",
+            suffix=".tmp",
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(rendered)
+                f.flush()
+                os.fsync(f.fileno())
+            if create_backup and self.config_path.exists():
+                backup_dir = self.config_path.parent / "backups"
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                backup_name = (
+                    f"{self.config_path.stem}-"
+                    f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+                    f"{self.config_path.suffix}"
+                )
+                shutil.copy2(self.config_path, backup_dir / backup_name)
+            os.replace(temp_path, self.config_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+    def _apply_runtime_config(self, new_config: dict):
+        """Apply a validated config snapshot to in-memory runtime state."""
+        validated = validate_proxy_config(new_config)
+        self.config = validated
+        self.model_manager.update_config(validated)
+        self._provider_balance_cache.clear()
+
+        server_config = validated.get("server", {})
+        allowed_ips = server_config.get("allowed_ips", [])
+        self.ip_whitelist._update_config(allowed_ips)
+        self.scan_container_subnets = parse_scan_container_subnets(validated)
 
     def _on_config_change(self, new_config: dict):
         """配置变化回调"""
-        self.config = new_config
-        self.model_manager.update_config(new_config)
-        self._provider_balance_cache.clear()
-
-        # 更新 IP 白名单
-        server_config = new_config.get("server", {})
-        allowed_ips = server_config.get("allowed_ips", [])
-        self.ip_whitelist._update_config(allowed_ips)
-
+        self._apply_runtime_config(new_config)
         logger.info("配置已热更新")
 
     def _official_deepseek_model(self):
@@ -429,9 +692,9 @@ class LLMProxyServer:
                 await asyncio.sleep(60)
 
     async def _check_unhealthy_models(self):
-        """检查所有 unhealthy 模型，401 直接删除"""
+        """Probe unhealthy models without discarding operator-managed configuration."""
         health_report = self.model_manager.health_checker.get_health_report()
-        models_to_delete = []
+        models_to_disable = []
         models_to_reset = []
 
         for name, health in health_report.items():
@@ -443,14 +706,16 @@ class LLMProxyServer:
             model_config = self.model_manager.models[name]
             reason = health.get("reason", "")
 
-            # 401 直接标记删除
+            # An invalid or expired credential is actionable, but it is not a
+            # reason to destroy the model definition. Keep it for the operator
+            # to update and explicitly re-enable.
             if (
                 "401" in reason
                 or "Invalid API Key" in reason.lower()
                 or "authentication" in reason.lower()
             ):
-                models_to_delete.append(name)
-                logger.warning(f"🗑️ 模型 {name} 认证失败，将删除: {reason}")
+                models_to_disable.append(name)
+                logger.warning(f"模型 {name} 认证失败，已禁用并保留配置: {reason}")
                 continue
 
             # 其他错误尝试探测
@@ -487,8 +752,8 @@ class LLMProxyServer:
                     models_to_reset.append(name)
                     logger.info(f"🟢 模型 {name} 探测成功，重置健康状态")
                 elif response.status_code == 401:
-                    models_to_delete.append(name)
-                    logger.warning(f"🗑️ 模型 {name} 探测返回 401，将删除")
+                    models_to_disable.append(name)
+                    logger.warning(f"模型 {name} 探测返回 401，已禁用并保留配置")
                 else:
                     logger.debug(
                         f"模型 {name} 探测返回 {response.status_code}，保持状态"
@@ -503,9 +768,12 @@ class LLMProxyServer:
         for name in models_to_reset:
             self.model_manager.health_checker.mark_healthy(name)
 
-        # 删除 401 模型
-        for name in models_to_delete:
-            self._delete_model(name)
+        # Persist a disabled model instead of deleting it. This preserves its
+        # provider mapping, limits, and credentials for an operator fix.
+        for name in dict.fromkeys(models_to_disable):
+            self.model_manager.disable_model(name, cooldown=False)
+        if models_to_disable:
+            self.model_manager.save_config(str(self.config_path))
 
     def _delete_model(self, model_name: str):
         """从配置中删除模型"""
@@ -860,14 +1128,30 @@ class LLMProxyServer:
             )
             
             reason_str = f"HTTP {status_code}" if status_code else str(e)
+            from request_logger import request_logger
+            error_detail = getattr(e, "detail", str(e)) if isinstance(e, HTTPException) else str(e)
+            request_logger.log_response(
+                request_id=request_id,
+                model_name=model_name,
+                duration=time.time() - start_time,
+                status="failed",
+                error=error_detail,
+                scan_context=scan_context,
+            )
             
             if fallback:
                 new_model_name, new_model_config = fallback
+                # select_fallback_model() reserves a concurrency slot while
+                # checking candidates. The next loop iteration calls
+                # select_model() again and will reserve the real request slot.
+                # Without this release, every fallback switch leaks one active
+                # request and redteam capacity eventually reaches 0 despite no
+                # active LLM process.
+                self.model_manager.usage_controller.release_model(new_model_name)
                 logger.warning(
                     f"[{request_id}] 模型 {model_name} 请求失败 ({reason_str})，"
                     f"切换到备用模型: {new_model_name} ({attempt + 1}/{max_retries})"
                 )
-                from request_logger import request_logger
                 request_logger.log_model_switch(
                     request_id=request_id,
                     from_model=old_model,
@@ -882,7 +1166,6 @@ class LLMProxyServer:
                     f"[{request_id}] 模型 {model_name} 请求失败 ({reason_str})，"
                     f"切换模型重试 ({attempt + 1}/{max_retries})"
                 )
-                from request_logger import request_logger
                 request_logger.log_model_switch(
                     request_id=request_id,
                     from_model=old_model,
@@ -1262,7 +1545,8 @@ def create_app(config_path: str) -> FastAPI:
             value = sanitize_scan_context_value(request.headers.get(header_name) or "")
             if value:
                 context[key] = value
-        if not context.get("scan_mode"): context["scan_mode"] = "deep"
+        if not context.get("scan_mode"):
+            context["scan_mode"] = "redteam"
         return context
 
     def get_dashboard_pin() -> tuple[str, str]:
@@ -1462,6 +1746,16 @@ document.getElementById("f").addEventListener("submit",async e=>{
         client_ip = get_client_ip(request)
         peer_ip = get_peer_ip(request)
         is_local_client = peer_ip in ["127.0.0.1", "::1", "localhost"]
+        path = request.url.path
+
+        if is_scan_container_peer(peer_ip, server.scan_container_subnets):
+            if path not in SCAN_CONTAINER_ALLOWED_PATHS:
+                logger.warning("拒绝扫描容器访问管理面: %s - %s", peer_ip, path)
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "Scan containers may only access inference endpoints"},
+                )
+            return await call_next(request)
 
         # Enforce IP whitelist (TCP peer address, not spoofable forwarded headers)
         if not is_local_client and not server.ip_whitelist.is_allowed(peer_ip):
@@ -1472,7 +1766,6 @@ document.getElementById("f").addEventListener("submit",async e=>{
 
         if request_needs_pin(request) and not request_has_valid_pin(request):
             accept = request.headers.get("accept", "")
-            path = request.url.path
             # Browser page request: return a full-screen PIN login gate HTML
             if "text/html" in accept and path in {"/", "/settings"}:
                 return HTMLResponse(content=_build_login_gate_html(), status_code=401)
@@ -1526,13 +1819,39 @@ document.getElementById("f").addEventListener("submit",async e=>{
         stream = body.get("stream", False)
         requested_model = body.get("model", None)
         messages = body.get("messages", [])
+        max_configured_context = max(
+            (
+                model.max_context_tokens
+                for model in server.model_manager.models.values()
+                if model.enabled
+                and model.name not in server.model_manager.disabled_models
+                and model.max_context_tokens
+            ),
+            default=0,
+        )
+        if max_configured_context:
+            estimated_context = estimate_request_context_tokens(body)
+            if estimated_context > max_configured_context:
+                compact_budget = max(32_768, int(max_configured_context * 0.95))
+                body, compacted = compact_request_context(body, compact_budget)
+                if compacted:
+                    logger.info(
+                        "[%s] compacted LLM context because it exceeds the configured model context window: estimated=%s budget=%s new_estimated=%s",
+                        request_id,
+                        estimated_context,
+                        compact_budget,
+                        estimate_request_context_tokens(body),
+                    )
+                    messages = body.get("messages", [])
+        routing_context = dict(scan_context or {})
+        routing_context["required_context_tokens"] = estimate_request_context_tokens(body)
         max_retries = server.model_manager.health_checker.max_retries
         last_error = None
 
         for attempt in range(max_retries + 1):
             try:
                 model_name, model_config = server.model_manager.select_model(
-                    requested_model, scan_context
+                    requested_model, routing_context
                 )
             except NoAvailableModelError as e:
                 raise HTTPException(status_code=503, detail=str(e)) from e
@@ -1658,7 +1977,18 @@ document.getElementById("f").addEventListener("submit",async e=>{
                             or has_content_in_delta
                             or (valid_chunk_count > 2 and finish_reason_stop)
                         )
-                        is_success = not stream_error and has_real_output
+                        # The OpenAI Agents SDK often closes a streamed HTTP
+                        # response as soon as it has received a complete tool
+                        # call. Starlette surfaces that as GeneratorExit /
+                        # CancelledError even though useful content and usage
+                        # were already delivered. Treat those as successful
+                        # early client closes so Activity does not show them as
+                        # provider failures.
+                        client_closed_after_output = client_cancelled and has_real_output
+                        is_success = (
+                            (not stream_error and has_real_output)
+                            or client_closed_after_output
+                        )
 
                         if is_success:
                             server.model_manager.handle_success(model_name)
@@ -1674,7 +2004,9 @@ document.getElementById("f").addEventListener("submit",async e=>{
                             server.model_manager.handle_error(model_name, RuntimeError(error_msg))
 
                         zero_usage_partial = is_success and total_tokens == 0
-                        if client_cancelled:
+                        if client_closed_after_output:
+                            status = "success"
+                        elif client_cancelled:
                             status = (
                                 "interrupted"
                                 if server.is_shutting_down
@@ -1706,6 +2038,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
                         logger.info(
                             f"[{request_id}] 流式请求{'完成' if is_success else '失败'}: {model_name} | "
                             f"耗时: {duration:.2f}s | tokens: {total_tokens}"
+                            f"{' | client_closed_after_output' if client_closed_after_output else ''}"
                         )
 
                     return StreamingResponse(
@@ -1776,7 +2109,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
                         attempt,
                         max_retries,
                         start_time,
-                        scan_context=scan_context,
+                        scan_context=routing_context,
                     )
                     model_name = next_model
                     model_config = next_config
@@ -1845,14 +2178,32 @@ document.getElementById("f").addEventListener("submit",async e=>{
         return server.model_manager.usage_controller.get_usage_report()
 
     @app.get("/proxy/usage/trend")
-    async def proxy_usage_trend(granularity: str = "4h", model: str = None):
+    async def proxy_usage_trend(granularity: str = "4h", model: str = None, group_by: str = "provider"):
         """返回趋势数据
 
         Args:
             granularity: 时间粒度，"day" 或 "4h"
             model: 模型名称，可选
+            group_by: "provider" 或 "model"
         """
-        return server.model_manager.usage_controller.get_trend_data(granularity, model)
+        safe_group_by = group_by if group_by in {"provider", "model"} else "provider"
+        if granularity == "day":
+            # Historical trend is database-first. JSON usage files remain a
+            # recovery/export copy, but no longer decide dashboard history.
+            history = await asyncio.to_thread(get_asset_database().usage_history, days=30)
+            if history:
+                return server.model_manager.usage_controller.daily_trend_from_history(
+                    history, model, safe_group_by,
+                )
+        else:
+            # The response ledger is durable per request and therefore cannot
+            # lose the current hour during a proxy restart.
+            hourly = await asyncio.to_thread(get_asset_database().hourly_response_usage)
+            if hourly:
+                return server.model_manager.usage_controller.hourly_trend_from_history(
+                    hourly, model, safe_group_by,
+                )
+        return server.model_manager.usage_controller.get_trend_data(granularity, model, safe_group_by)
 
     @app.get("/proxy/system/resources")
     async def proxy_system_resources():
@@ -2248,11 +2599,18 @@ document.getElementById("f").addEventListener("submit",async e=>{
     async def update_config(request: Request):
         """更新配置"""
         try:
-            new_config = await request.json()
-            server.config = new_config
-            server.model_manager.update_config(new_config)
-            server._save_config()
-            return {"message": "Config updated"}
+            config_patch = await request.json()
+            if not isinstance(config_patch, dict):
+                raise ValueError("Config update must be a JSON object")
+            merged_config = validate_proxy_config(
+                deep_merge_config(server.config, config_patch)
+            )
+            server._save_config(merged_config, create_backup=True)
+            server._apply_runtime_config(merged_config)
+            return {
+                "message": "Config updated",
+                "top_level_keys": sorted(config_patch.keys()),
+            }
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -2448,7 +2806,23 @@ document.getElementById("f").addEventListener("submit",async e=>{
                 "routing_tier": body.get("routing_tier", "standard"),
                 "allowed_scan_modes": body.get("allowed_scan_modes", []),
                 "quota_policy": body.get("quota_policy", {}),
+                "api_format": body.get("api_format", "openai"),
+                "is_exact_url": bool(body.get("is_exact_url", False)),
+                "custom_headers": body.get("custom_headers", {}),
+                "strip_provider_prefix": bool(body.get("strip_provider_prefix", False)),
+                "max_context_tokens": int(body.get("max_context_tokens", 0) or 0),
+                "request_overrides": body.get("request_overrides", {}),
             }
+
+            limits = server.config.setdefault("usage", {}).setdefault(
+                "per_model_limits", {}
+            ).setdefault(name, {})
+            for field in (
+                "max_concurrent", "max_requests_per_minute", "input_cost_per_1m",
+                "output_cost_per_1m", "cached_read_cost_per_1m",
+            ):
+                if field in body and body[field] not in (None, ""):
+                    limits[field] = body[field]
 
             # 添加到配置
             if "models" not in server.config:
@@ -2489,6 +2863,12 @@ document.getElementById("f").addEventListener("submit",async e=>{
                 "routing_tier",
                 "allowed_scan_modes",
                 "quota_policy",
+                "api_format",
+                "is_exact_url",
+                "custom_headers",
+                "strip_provider_prefix",
+                "max_context_tokens",
+                "request_overrides",
                 "enabled",
                 "free",
                 "peak_only",
@@ -2504,6 +2884,17 @@ document.getElementById("f").addEventListener("submit",async e=>{
             for field in ("max_concurrent", "max_requests_per_minute"):
                 if field in body:
                     value = int(body[field] or 0)
+                    if value < 0:
+                        raise ValueError(f"{field} must be zero or greater")
+                    if value:
+                        limits[field] = value
+                    else:
+                        limits.pop(field, None)
+            for field in (
+                "input_cost_per_1m", "output_cost_per_1m", "cached_read_cost_per_1m",
+            ):
+                if field in body:
+                    value = float(body[field] or 0)
                     if value < 0:
                         raise ValueError(f"{field} must be zero or greater")
                     if value:
@@ -2528,25 +2919,25 @@ document.getElementById("f").addEventListener("submit",async e=>{
                 status_code=404, detail=f"Model not found: {model_name}"
             )
 
-        # 从配置中删除
-        if "models" in server.config and "available" in server.config["models"]:
-            if model_name in server.config["models"]["available"]:
-                del server.config["models"]["available"][model_name]
-
-        # 从providers配置中删除
-        if "providers" in server.config:
-            for provider, provider_config in server.config["providers"].items():
-                if "fallback_models" in provider_config:
-                    if model_name in provider_config["fallback_models"]:
-                        provider_config["fallback_models"].remove(model_name)
-
-        # 更新模型管理器
-        server.model_manager.update_config(server.config)
-
-        # 保存配置
-        server.model_manager.save_config(str(server.config_path))
+        # Explicit deletion removes only this model and its model-scoped
+        # metadata. Provider definitions remain because they may be shared.
+        server.model_manager.delete_model(model_name)
 
         return {"message": f"Model {model_name} deleted"}
+
+    @app.post("/proxy/models/active-requests/reset")
+    async def reset_model_active_requests(model_name: Optional[str] = None):
+        """重置模型运行时并发槽位计数，不清空用量统计。"""
+        result = server.model_manager.usage_controller.reset_active_requests(model_name)
+        if model_name:
+            server.model_manager.mark_model_inactive(model_name)
+        else:
+            for name in result.get("models", {}):
+                server.model_manager.mark_model_inactive(name)
+        return {
+            "message": "Model active request counters reset",
+            **result,
+        }
 
     @app.post("/proxy/models/{model_name}/reset")
     async def reset_model(model_name: str):
@@ -2729,6 +3120,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
 
     @app.get("/proxy/smart-batch/jobs/health-summary")
     async def proxy_smart_batch_jobs_health_summary():
+        chelmon_runtime = await asyncio.to_thread(get_chelmon_runtime_status)
         modes = {}
         enabled_total = 0
         eligible_total = 0
@@ -2751,8 +3143,31 @@ document.getElementById("f").addEventListener("submit",async e=>{
             "status": "running",
             "enabledModels": enabled_total,
             "eligibleModels": eligible_total,
+            "engines": {
+                "strix": {"available": True, "default": False},
+                "chelmon-claude": {
+                    "available": bool(chelmon_runtime.get("ready")),
+                    "default": False,
+                    "aliases": ["ansecai"],
+                    "runtime": chelmon_runtime,
+                },
+                "dual": {
+                    "available": bool(chelmon_runtime.get("ready")),
+                    "default": bool(chelmon_runtime.get("ready")),
+                    "plan": [
+                        {"engine": "strix", "mode": "redteam"},
+                        {"engine": "chelmon-claude", "mode": "default"},
+                    ],
+                    "runtime": chelmon_runtime,
+                },
+            },
+            "sharedModes": ["redteam", "deep", "standard", "quick", "getshell"],
             "modes": modes,
         }
+
+    @app.get("/proxy/smart-batch/jobs/runtime-summary")
+    async def proxy_smart_batch_jobs_runtime_summary():
+        return await asyncio.to_thread(_job_manager.runtime_summary)
 
     @app.get("/proxy/smart-batch/jobs/{job_id}/report")
     async def proxy_smart_batch_job_report(job_id: str):
@@ -2768,6 +3183,24 @@ document.getElementById("f").addEventListener("submit",async e=>{
         except KeyError:
             raise HTTPException(status_code=404, detail="Smart Batch job not found") from None
 
+    @app.post("/proxy/smart-batch/jobs/{job_id}/terminate")
+    async def proxy_smart_batch_job_terminate(job_id: str):
+        try:
+            return await asyncio.to_thread(_job_manager.terminate_job, job_id, "dashboard")
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Smart Batch job not found") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+
+    @app.post("/proxy/smart-batch/jobs/{job_id}/resume")
+    async def proxy_smart_batch_job_resume(job_id: str):
+        try:
+            return await asyncio.to_thread(_job_manager.resume_job, job_id, "dashboard")
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Smart Batch job not found") from None
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+
     @app.post("/proxy/smart-batch/jobs")
     async def proxy_smart_batch_jobs_submit(request: Request):
         try:
@@ -2775,7 +3208,43 @@ document.getElementById("f").addEventListener("submit",async e=>{
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid JSON body") from None
         try:
-            return await asyncio.to_thread(_job_manager.submit, payload)
+            preview = await asyncio.to_thread(_job_manager.preview, payload)
+            options = preview.get("options") if isinstance(preview.get("options"), dict) else {}
+            accepted = list(preview.get("accepted_targets") or [])
+            if not accepted:
+                # Keep submit semantics aligned with SmartBatchJobManager.submit:
+                # a scope/private/DNS rejection must never look like a successful
+                # empty submission merely because automatic routing has no group.
+                raise ValueError("No accepted targets supplied")
+            workflow_mode = str(options.get("workflow_mode") or "")
+            source = str(options.get("source") or "")
+            jobs = []
+            if workflow_mode == "retest":
+                baseline = await _findings_service.retest_baseline(accepted)
+                job_payload = {**payload, "targets": accepted, "_retest_baseline": baseline}
+                jobs.append(await asyncio.to_thread(_job_manager.submit, job_payload))
+            elif source != "target_ingest":
+                scanned_keys = await asyncio.to_thread(get_asset_database().scanned_targets)
+                rescans = [target for target in accepted if normalize_target(target)["canonical_key"] in scanned_keys]
+                new_targets = [target for target in accepted if target not in rescans]
+                if new_targets:
+                    jobs.append(await asyncio.to_thread(_job_manager.submit, {**payload, "targets": new_targets}))
+                if rescans:
+                    baseline = await _findings_service.retest_baseline(rescans)
+                    label = str(payload.get("label") or "retest")
+                    jobs.append(await asyncio.to_thread(_job_manager.submit, {
+                        **payload, "targets": rescans, "engine": "dual", "mode": "retest",
+                        "label": f"{label}-retest", "_retest_baseline": baseline,
+                    }))
+            else:
+                jobs.append(await asyncio.to_thread(_job_manager.submit, payload))
+            if len(jobs) == 1:
+                return jobs[0]
+            return {
+                "status": "started", "jobs": jobs, "job": jobs[0] if jobs else None,
+                "new_target_count": sum(int(job.get("target_count") or 0) for job in jobs if job.get("workflow_mode") != "retest"),
+                "retest_target_count": sum(int(job.get("target_count") or 0) for job in jobs if job.get("workflow_mode") == "retest"),
+            }
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
@@ -2789,12 +3258,146 @@ document.getElementById("f").addEventListener("submit",async e=>{
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid JSON body") from None
         try:
-            return await asyncio.to_thread(_job_manager.preview, payload)
+            preview = await asyncio.to_thread(_job_manager.preview, payload)
+            options = preview.get("options") if isinstance(preview.get("options"), dict) else {}
+            accepted = list(preview.get("accepted_targets") or [])
+            if str(options.get("workflow_mode") or "") == "retest":
+                baseline = await _findings_service.retest_baseline(accepted)
+                summaries = {
+                    target: {
+                        "asset_id": item.get("asset_id"),
+                        "historical_findings_count": item.get("finding_count", 0),
+                        "omitted_count": item.get("omitted_count", 0),
+                        "context_bytes": item.get("context_bytes", 0),
+                        "classifications": {
+                            label: sum(1 for record in item.get("records", []) if record.get("classification") == label)
+                            for label in ("verified_active", "unverified_lead", "excluded_false_positive", "archived")
+                        },
+                    }
+                    for target, item in (baseline.get("targets") or {}).items()
+                }
+                preview["retest_baseline"] = {"max_bytes_per_target": baseline.get("max_bytes_per_target"), "targets": summaries}
+            elif str(options.get("source") or "") != "target_ingest":
+                scanned_keys = await asyncio.to_thread(get_asset_database().scanned_targets)
+                preview["execution_groups"] = {
+                    "new_targets": [target for target in accepted if normalize_target(target)["canonical_key"] not in scanned_keys],
+                    "retest_targets": [target for target in accepted if normalize_target(target)["canonical_key"] in scanned_keys],
+                }
+            return preview
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
             logger.exception("smart batch preview error")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.post("/proxy/assets/import")
+    async def proxy_assets_import(request: Request):
+        """Register a page of external assets without creating a scan job.
+
+        This route is intentionally separate from ``target-ingest``. It is
+        suitable for large upstream inventories: callers submit at most 10,000
+        public targets with a stable source reference and cursor, then may
+        safely replay a cursor after a network interruption.
+        """
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body") from None
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="JSON body must be an object")
+        source = str(payload.get("source") or "pii_alive_assets").strip()
+        source_ref = str(payload.get("source_ref") or "").strip()
+        cursor = asset_import_cursor(payload)
+        targets = payload.get("targets")
+        values = asset_import_target_values(targets)
+        if not source:
+            raise HTTPException(status_code=422, detail="source is required")
+        if not source_ref:
+            raise HTTPException(status_code=422, detail="source_ref is required")
+        if not cursor:
+            raise HTTPException(status_code=422, detail="sync_cursor is required")
+        if not values:
+            raise HTTPException(status_code=422, detail="targets is required")
+        if len(values) > ASSET_IMPORT_MAX_TARGETS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"asset import batch limit is {ASSET_IMPORT_MAX_TARGETS} targets",
+            )
+
+        try:
+            # Inventory registration deliberately accepts public targets from
+            # every country. The UAE scope policy remains enforced later when
+            # an operator creates an automatic scan job. Private/local targets
+            # are still rejected here and never enter the shared inventory.
+            analysis = await asyncio.to_thread(
+                analyze_targets,
+                values,
+                max_targets=ASSET_IMPORT_MAX_TARGETS,
+                allow_private=False,
+                check_dns=False,
+                source="dashboard",
+                allow_non_uae=False,
+                enforce_scope=False,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        accepted_targets = list(analysis.get("accepted_targets") or [])
+        rejected_targets = list(analysis.get("rejected_targets") or [])
+        if bool(payload.get("dry_run", False)):
+            return {
+                "status": "dry_run",
+                "register_only": True,
+                "source": source,
+                "source_ref": source_ref,
+                "sync_cursor": cursor,
+                "input_count": len(values),
+                "accepted_count": len(accepted_targets),
+                "rejected_count": len(rejected_targets),
+                "accepted_targets": accepted_targets[:50],
+                "rejected_targets": rejected_targets[:50],
+                "scan_job": None,
+            }
+
+        db = get_asset_database()
+        record = await asyncio.to_thread(
+            db.record_asset_import,
+            source_type=source,
+            source_ref=source_ref,
+            sync_cursor=cursor,
+            accepted_targets=accepted_targets,
+            rejected_targets=rejected_targets,
+            input_count=len(values),
+            metadata={
+                "source_type": "asset_import",
+                "label": str(payload.get("label") or ""),
+                "inventory_only": True,
+                "scope_policy": "deferred_until_scan_submission",
+            },
+        )
+        await asyncio.to_thread(
+            db.record_scope_decisions,
+            list(analysis.get("scope_decisions") or []),
+            source_type=source,
+            source_ref=source_ref,
+        )
+        return {
+            "status": "registered",
+            "register_only": True,
+            **record,
+            "scan_job": None,
+            "accepted_targets": accepted_targets[:50],
+            "rejected_targets": rejected_targets[:50],
+        }
+
+    @app.get("/proxy/assets/imports")
+    async def proxy_assets_imports(source: str = "", source_ref: str = ""):
+        db = get_asset_database()
+        return await asyncio.to_thread(
+            db.asset_import_progress,
+            source_type=source,
+            source_ref=source_ref,
+        )
 
     @app.post("/proxy/target-ingest")
     async def proxy_target_ingest(request: Request):
@@ -2812,7 +3415,85 @@ document.getElementById("f").addEventListener("submit",async e=>{
             raise HTTPException(status_code=422, detail="targets is required")
 
         dry_run = bool(payload.get("dry_run", False))
+        register_only = bool(payload.get("register_only", False))
         source_ref = str(payload.get("source_ref") or "").strip()
+        if register_only:
+            cursor = asset_import_cursor(payload)
+            values = asset_import_target_values(targets)
+            if not source_ref:
+                raise HTTPException(status_code=422, detail="source_ref is required when register_only=true")
+            if not cursor:
+                raise HTTPException(status_code=422, detail="sync_cursor is required when register_only=true")
+            if len(values) > ASSET_IMPORT_MAX_TARGETS:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"asset import batch limit is {ASSET_IMPORT_MAX_TARGETS} targets",
+                )
+            try:
+                analysis = await asyncio.to_thread(
+                    analyze_targets,
+                    values,
+                    max_targets=ASSET_IMPORT_MAX_TARGETS,
+                    allow_private=False,
+                    check_dns=False,
+                    source="target_ingest",
+                    allow_non_uae=False,
+                    country=str(payload.get("country") or ""),
+                    region=str(payload.get("region") or ""),
+                    enforce_scope=False,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            accepted_targets = list(analysis.get("accepted_targets") or [])
+            rejected_targets = list(analysis.get("rejected_targets") or [])
+            if dry_run:
+                return {
+                    "status": "dry_run",
+                    "register_only": True,
+                    "platform": platform,
+                    "source_ref": source_ref,
+                    "sync_cursor": cursor,
+                    "accepted_count": len(accepted_targets),
+                    "rejected_count": len(rejected_targets),
+                    "accepted_targets": accepted_targets[:50],
+                    "rejected_targets": rejected_targets[:50],
+                    "scan_job": None,
+                }
+            db = get_asset_database()
+            record = await asyncio.to_thread(
+                db.record_asset_import,
+                source_type=platform,
+                source_ref=source_ref,
+                sync_cursor=cursor,
+                accepted_targets=accepted_targets,
+                rejected_targets=rejected_targets,
+                input_count=len(values),
+                metadata={
+                    "source_type": "target_ingest_register_only",
+                    "platform": platform,
+                    "country": str(payload.get("country") or ""),
+                    "region": str(payload.get("region") or ""),
+                    "inventory_only": True,
+                },
+            )
+            await asyncio.to_thread(
+                db.record_scope_decisions,
+                list(analysis.get("scope_decisions") or []),
+                source_type=platform,
+                source_ref=source_ref,
+            )
+            return {
+                "status": "registered" if accepted_targets else "quarantined",
+                "register_only": True,
+                **record,
+                "scan_job": None,
+                "accepted_targets": accepted_targets[:50],
+                "rejected_targets": rejected_targets[:50],
+            }
+        engine = str(payload.get("engine") or "dual").strip().lower()
+        if engine == "ansecai":
+            engine = "chelmon-claude"
+        mode = str(payload.get("mode") or "redteam").strip().lower()
         ingest_payload = {
             **payload,
             "source": "target_ingest",
@@ -2828,6 +3509,10 @@ document.getElementById("f").addEventListener("submit",async e=>{
             logger.exception("target ingest preview error")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+        preview_options = preview.get("options") if isinstance(preview.get("options"), dict) else {}
+        engine = str(preview_options.get("engine") or engine)
+        mode = str(preview_options.get("mode") or mode)
+
         accepted_targets = list(preview.get("accepted_targets") or [])
         rejected_targets = list(preview.get("rejected_targets") or [])
         if dry_run:
@@ -2835,6 +3520,9 @@ document.getElementById("f").addEventListener("submit",async e=>{
                 "status": "dry_run",
                 "platform": platform,
                 "source_ref": source_ref,
+                "engine": engine,
+                "mode": mode,
+                "engine_plan": preview.get("engine_plan", []),
                 "accepted_count": len(accepted_targets),
                 "rejected_count": len(rejected_targets),
                 "preview": preview,
@@ -2867,14 +3555,26 @@ document.getElementById("f").addEventListener("submit",async e=>{
             dry_run=False,
             metadata={
                 "source_type": "target_ingest",
+                "engine": engine,
+                "mode": mode,
+                "engine_plan": preview.get("engine_plan", []),
                 "country": str(payload.get("country") or ""),
                 "region": str(payload.get("region") or ""),
                 "submitted_count": len(targets) if isinstance(targets, list) else len(str(targets).splitlines()),
             },
         )
+        await asyncio.to_thread(
+            db.record_scope_decisions,
+            list(preview.get("scope_decisions") or []),
+            source_type=platform,
+            source_ref=source_ref,
+        )
         return {
             "status": "accepted" if accepted_targets else "quarantined",
             **ingest_record,
+            "engine": engine,
+            "mode": mode,
+            "engine_plan": preview.get("engine_plan", []),
             "job": job,
             "accepted_targets": accepted_targets[:50],
             "rejected_targets": rejected_targets,
@@ -2999,6 +3699,42 @@ document.getElementById("f").addEventListener("submit",async e=>{
         db = get_asset_database()
         return await asyncio.to_thread(db.summary)
 
+    @app.get("/proxy/assets/scope-summary")
+    async def proxy_assets_scope_summary():
+        db = get_asset_database()
+        summary = await asyncio.to_thread(db.summary)
+        catalog = await asyncio.to_thread(load_scope_catalog)
+        return {
+            "generated_at": summary.get("generated_at"),
+            "scope": summary.get("scope", {}),
+            "categories": summary.get("scope_categories", {}),
+            "catalog": {
+                "version": catalog.get("version", "uninitialized"),
+                "generated_at": catalog.get("generated_at", ""),
+                "source": catalog.get("source", ""),
+                "item_count": len(catalog.get("items") or []),
+            },
+        }
+
+    @app.post("/proxy/assets/scope-catalog")
+    async def proxy_assets_scope_catalog(request: Request):
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body") from None
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="Scope catalog must be a JSON object")
+        try:
+            catalog = await asyncio.to_thread(save_scope_catalog, payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "status": "updated",
+            "version": catalog.get("version"),
+            "source": catalog.get("source"),
+            "item_count": len(catalog.get("items") or []),
+        }
+
     @app.get("/proxy/assets/export")
     async def proxy_assets_export(
         format: str = "csv",
@@ -3008,6 +3744,8 @@ document.getElementById("f").addEventListener("submit",async e=>{
         source: str = "",
         platform: str = "",
         group: str = "",
+        scope_status: str = "",
+        scope_category: str = "",
     ):
         from fastapi.responses import Response as FastAPIResponse
         db = get_asset_database()
@@ -3018,6 +3756,8 @@ document.getElementById("f").addEventListener("submit",async e=>{
             "source": source,
             "platform": platform,
             "group": group,
+            "scope_status": scope_status,
+            "scope_category": scope_category,
         }.items() if v}
         data, media_type = await asyncio.to_thread(db.export_assets, format, **filters)
         ext = {"json": "json", "csv": "csv"}.get(format, "txt")
@@ -3037,6 +3777,8 @@ document.getElementById("f").addEventListener("submit",async e=>{
         source: str = "",
         platform: str = "",
         group: str = "",
+        scope_status: str = "",
+        scope_category: str = "",
         sort: str = "last_seen",
     ):
         if sort not in {"last_seen", "last_scanned", "findings", "target"}:
@@ -3050,6 +3792,8 @@ document.getElementById("f").addEventListener("submit",async e=>{
             source=source,
             platform=platform,
             group=group,
+            scope_status=scope_status,
+            scope_category=scope_category,
             sort=sort,
             page=page,
             page_size=page_size,

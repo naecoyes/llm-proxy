@@ -50,6 +50,32 @@ def read_smart_batch_status(
     include_finished: bool = True,
     include_tasks: bool = True,
 ) -> dict[str, Any]:
+    # SQLite is the dashboard source of truth. JSON state files remain a
+    # scanner-compatible checkpoint and are imported once when upgrading an
+    # older installation with no snapshots yet.
+    try:
+        from asset_database import get_asset_database
+
+        stored = get_asset_database().smart_batch_snapshots(
+            limit=limit, include_finished=include_finished,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Smart Batch SQLite read failed; using checkpoints: %s", exc)
+        stored = []
+    if stored:
+        stored = [_refresh_checkpoint_if_newer(batch) for batch in stored]
+        batches = [enrich_batch(batch, Path(str(batch.get("state_file") or get_state_dir() / f"{batch.get('batch_id')}.json"))) for batch in stored]
+        if not include_tasks:
+            for batch in batches:
+                batch["task_count"] = len(batch.get("tasks") or [])
+                batch.pop("tasks", None)
+                batch.pop("recent_events", None)
+        return {
+            "state_dir": str(get_state_dir()), "generated_at": now_iso(),
+            "summary": summarize_batches(batches), "batches": batches,
+            "errors": [], "source": "sqlite",
+        }
+
     state_dir = get_state_dir()
     files = (
         sorted(
@@ -81,9 +107,16 @@ def read_smart_batch_status(
             enriched["task_count"] = len(enriched.get("tasks") or [])
             enriched.pop("tasks", None)
             enriched.pop("recent_events", None)
-        batches.append(enriched)
-        if len(batches) >= max(1, min(int(limit or 20), 200)):
-            break
+        # Backfill every legacy checkpoint once; only the response itself is
+        # bounded. Subsequent polls avoid directory scans entirely.
+        try:
+            from asset_database import get_asset_database
+
+            get_asset_database().sync_batch_snapshot(batch, str(path))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Smart Batch checkpoint backfill failed for %s: %s", path, exc)
+        if len(batches) < max(1, min(int(limit or 20), 200)):
+            batches.append(enriched)
 
     return {
         "state_dir": str(state_dir),
@@ -91,18 +124,70 @@ def read_smart_batch_status(
         "summary": summarize_batches(batches),
         "batches": batches,
         "errors": errors,
+        "source": "checkpoint_backfill",
     }
 
 
 def read_smart_batch_detail(batch_id: str) -> dict[str, Any] | None:
+    try:
+        from asset_database import get_asset_database
+
+        stored = get_asset_database().smart_batch_snapshot(batch_id)
+        if stored:
+            stored = _refresh_checkpoint_if_newer(stored)
+            path = Path(str(stored.get("state_file") or get_state_dir() / f"{batch_id}.json"))
+            return enrich_batch(stored, path)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Smart Batch SQLite detail read failed for %s: %s", batch_id, exc)
     state_dir = get_state_dir()
     path = state_dir / f"{batch_id}.json"
     if not path.exists():
         return None
     try:
-        return enrich_batch(json.loads(path.read_text(encoding="utf-8")), path)
+        batch = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            from asset_database import get_asset_database
+
+            get_asset_database().sync_batch_snapshot(batch, str(path))
+        except Exception:  # noqa: BLE001
+            pass
+        return enrich_batch(batch, path)
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _refresh_checkpoint_if_newer(batch: dict[str, Any]) -> dict[str, Any]:
+    """Bridge a pre-migration scanner that still writes a JSON checkpoint.
+
+    New scanner processes write the same state to SQLite themselves. During a
+    rolling upgrade, however, an already-running process has the old module in
+    memory. A newer checkpoint is imported once before returning it so the UI
+    never regresses while that process drains.
+    """
+    state_path = Path(str(batch.get("state_file") or ""))
+    if not state_path.is_file():
+        return batch
+    updated = parse_datetime(batch.get("updated_at"))
+    try:
+        modified = datetime.fromtimestamp(state_path.stat().st_mtime, timezone.utc)
+    except OSError:
+        return batch
+    if updated and modified <= updated:
+        return batch
+    try:
+        fresh = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return batch
+    if not isinstance(fresh, dict):
+        return batch
+    try:
+        from asset_database import get_asset_database
+
+        get_asset_database().sync_batch_snapshot(fresh, str(state_path))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Smart Batch rolling-upgrade checkpoint sync failed for %s: %s", state_path, exc)
+    fresh.setdefault("state_file", str(state_path))
+    return fresh
 
 
 def set_smart_batch_parallel(batch_id: str, parallel: int, source: str = "dashboard") -> dict[str, Any]:
@@ -286,6 +371,12 @@ def terminate_smart_batch(batch_id: str, source: str = "dashboard") -> dict[str,
         "message": "Smart Batch terminated by operator", "source": source,
     })
     _write_json_atomic(state_file, raw)
+    try:
+        from asset_database import get_asset_database
+
+        get_asset_database().sync_batch_snapshot(raw, str(state_file))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Batch termination SQLite sync failed for %s: %s", batch_id, exc)
     return {"status": "terminated", "batch_id": batch_id, "terminated_processes": len(processes), "removed_containers": removed_containers}
 
 
@@ -375,6 +466,14 @@ def normalize_batch_summary(batch: dict[str, Any]) -> dict[str, Any]:
     )
     summary["completed_tasks"] = completed
     summary["progress_percent"] = round(completed / total * 100, 2) if total else 0
+    display_completed = max(
+        completed,
+        int(original.get("display_completed_tasks") or 0),
+    )
+    summary["display_completed_tasks"] = min(display_completed, total) if total else 0
+    summary["display_progress_percent"] = (
+        round(summary["display_completed_tasks"] / total * 100, 2) if total else 0
+    )
     return summary
 
 
@@ -447,6 +546,8 @@ def summarize_batches(batches: list[dict[str, Any]]) -> dict[str, Any]:
         "auto_requeue_attempts_total": 0,
         "attempt_count_total": 0,
         "overall_progress_percent": 0,
+        "display_completed_tasks": 0,
+        "display_progress_percent": 0,
     }
     for batch in batches:
         lifecycle = batch.get("lifecycle")
@@ -476,6 +577,11 @@ def summarize_batches(batches: list[dict[str, Any]]) -> dict[str, Any]:
         summary["auto_requeued_tasks"] += int(batch_summary.get("auto_requeued_tasks") or 0)
         summary["auto_requeue_attempts_total"] += int(batch_summary.get("auto_requeue_attempts_total") or 0)
         summary["attempt_count_total"] += int(batch_summary.get("attempt_count_total") or 0)
+        summary["display_completed_tasks"] += int(
+            batch_summary.get("display_completed_tasks")
+            if batch_summary.get("display_completed_tasks") is not None
+            else batch_summary.get("completed_tasks") or 0
+        )
         if not (has_retry_due_summary and has_auto_due_summary):
             derived_due = derive_due_retry_counts(batch)
             if not has_retry_due_summary:
@@ -485,6 +591,9 @@ def summarize_batches(batches: list[dict[str, Any]]) -> dict[str, Any]:
     completed = summary["successful_tasks"] + summary["failed_tasks"] + summary["timeout_tasks"]
     if summary["total_tasks"]:
         summary["overall_progress_percent"] = round(completed / summary["total_tasks"] * 100, 2)
+        display_completed = max(completed, min(summary["display_completed_tasks"], summary["total_tasks"]))
+        summary["display_completed_tasks"] = display_completed
+        summary["display_progress_percent"] = round(display_completed / summary["total_tasks"] * 100, 2)
     return summary
 
 

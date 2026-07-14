@@ -40,19 +40,21 @@ function sortNewest(rows) {
 function activeProcesses(requests) {
   const grouped = new Map();
   for (const row of requests) {
-    if (row.classified_status === "stale_no_response" || row.classified_status === "orphan_request") continue;
+    // The process panel is an operational view, not a recent-activity feed.
+    // Completed requests belong in the request table below; otherwise a fast
+    // serial Chelmon run makes many finished targets look concurrent.
+    if (row.classified_status !== "pending_active") continue;
     const key = row.scan_id || `${row.proxy_slot || "auto"}:${row.client_ip || "local"}`;
     const timestamp = new Date(row.response_timestamp || row.request_timestamp || 0).getTime();
     const current = grouped.get(key);
     if (!current || timestamp > current.timestamp) grouped.set(key, { ...row, timestamp, key });
   }
-  const cutoff = Date.now() - STALE_PENDING_MS;
-  return [...grouped.values()].filter((row) => row.classified_status === "pending_active" || row.timestamp >= cutoff).sort((a, b) => b.timestamp - a.timestamp);
+  return [...grouped.values()].sort((a, b) => b.timestamp - a.timestamp);
 }
 
 function renderProcesses(requests) {
   const processes = activeProcesses(requests);
-  if (!processes.length) return emptyState("No active LLM processes", "Requests seen in the last ten minutes will appear here.");
+  if (!processes.length) return emptyState("No active LLM calls", "Completed calls are available in Request activity.");
   return `<div class="process-list">${processes.slice(0, 12).map((row) => `<button class="process-row" type="button" data-process-scan="${escapeHtml(row.scan_id || "")}"><div class="process-main"><div class="process-title">${escapeHtml(row.scan_target || row.scan_id || row.proxy_slot || row.client_ip || "local")}</div><div class="process-meta">${modelIdentity({ name: row.actual_model || "awaiting model", model: row.actual_model || "", provider: row.provider || row.proxy_slot || "" }, { compact: true, secondary: `${escapeHtml(row.provider || row.proxy_slot || "-")} · PID ${escapeHtml(row.scan_pid || "-")}` })}</div></div>${badge(row.classified_status || "active")}</button>`).join("")}</div>`;
 }
 
@@ -117,7 +119,12 @@ function drawTrend(trend, existing) {
   return new window.Chart(canvas, {
     type: "line",
     data: { labels: trend.labels, datasets: (trend.datasets || []).map((dataset, index) => ({ label: dataset.model, data: dataset.tokens, borderColor: colors[index % colors.length], backgroundColor: "transparent", borderWidth: 2, pointRadius: 2, tension: .25 })) },
-    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: "bottom", labels: { boxWidth: 10, usePointStyle: true } } }, scales: { x: { grid: { display: false } }, y: { beginAtZero: true, ticks: { callback: (value) => formatNumber(value, 0) } } } },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: "bottom", labels: { boxWidth: 10, usePointStyle: true } }, tooltip: { callbacks: { afterLabel: (context) => {
+      const members = context.dataset.models || [];
+      if (!members.length || members.length === 1) return "";
+      const shown = members.slice(0, 6).join(", ");
+      return `Models: ${shown}${members.length > 6 ? ` +${members.length - 6} more` : ""}`;
+    } } } }, scales: { x: { grid: { display: false } }, y: { beginAtZero: true, ticks: { callback: (value) => formatNumber(value, 0) } } } },
   });
 }
 
@@ -134,6 +141,8 @@ export function mountActivity(context) {
   let chart = null;
   let trendLoadedAt = 0;
   let page = 1;
+  let trendGranularity = "4h";
+  let trendGroupBy = "provider";
   const filters = { query: "", status: "", model: "", scan: "" };
 
   const renderTable = () => {
@@ -156,8 +165,8 @@ export function mountActivity(context) {
     const requests = joinedRequests(logs);
     const renderedRows = renderLogRows(requests, filters, page);
     root.innerHTML = `<div class="page-stack">
-      <div class="equal-grid activity-summary-grid"><section class="panel"><header class="panel-header"><div><h2>Active processes</h2><p>Grouped by scan_id, then legacy proxy slot and client</p></div></header><div class="panel-body">${renderProcesses(requests)}</div></section><section class="panel"><header class="panel-header"><div><h2>Stale / orphan requests</h2><p>Requests with no response after ${Math.round(STALE_PENDING_MS / 60000)} min, or missing scan context</p></div></header><div class="panel-body">${renderStalePanel(requests)}</div></section></div>
-      <section class="panel" id="usageTrendPanel"><header class="panel-header"><div><h2>Usage trend</h2><p>Token activity by provider or model · refreshed hourly</p></div></header><div class="panel-body"><div class="chart-wrap">${window.Chart ? '<canvas id="activityTrendChart"></canvas>' : emptyState("Chart library unavailable")}</div></div></section>
+      <div class="equal-grid activity-summary-grid"><section class="panel"><header class="panel-header"><div><h2>Active LLM calls</h2><p>Only requests currently awaiting a provider response, grouped by scan_id</p></div></header><div class="panel-body">${renderProcesses(requests)}</div></section><section class="panel"><header class="panel-header"><div><h2>Stale / orphan requests</h2><p>Requests with no response after ${Math.round(STALE_PENDING_MS / 60000)} min, or missing scan context</p></div></header><div class="panel-body">${renderStalePanel(requests)}</div></section></div>
+      <section class="panel" id="usageTrendPanel"><header class="panel-header"><div><h2>Usage trend</h2><p>Token activity by provider or model · refreshed hourly</p></div><div class="panel-actions compact-controls"><select id="trendGranularity" aria-label="Trend range"><option value="4h" ${trendGranularity === "4h" ? "selected" : ""}>Hourly</option><option value="day" ${trendGranularity === "day" ? "selected" : ""}>30d</option></select><select id="trendGroupBy" aria-label="Trend grouping"><option value="provider" ${trendGroupBy === "provider" ? "selected" : ""}>Provider</option><option value="model" ${trendGroupBy === "model" ? "selected" : ""}>Model</option></select></div></header><div class="panel-body"><div class="chart-wrap">${window.Chart ? '<canvas id="activityTrendChart"></canvas>' : emptyState("Chart library unavailable")}</div></div></section>
       <section class="panel"><header class="panel-header"><div><h2>Request activity</h2><p>Joined request, response, and model-switch records, newest first</p></div><div class="panel-actions"><input id="activitySearch" type="search" placeholder="Request or error" value="${escapeHtml(filters.query)}"><input id="activityScan" type="search" placeholder="scan_id or target" value="${escapeHtml(filters.scan)}"><input id="activityModel" type="search" placeholder="Model or provider" value="${escapeHtml(filters.model)}"><select id="activityStatus"><option value="">All statuses</option>${["pending_active","stale_no_response","orphan_request","success","partial","failed","cancelled","interrupted","error"].map((value) => `<option value="${value}" ${filters.status === value ? "selected" : ""}>${value}</option>`).join("")}</select></div></header><div class="panel-body" id="activityLogTable">${renderedRows.html}</div></section>
     </div>`;
     if (preservedTrendPanel) {
@@ -172,6 +181,20 @@ export function mountActivity(context) {
     const filterInput = (selector, key) => root.querySelector(selector)?.addEventListener("input", debounce((event) => { filters[key] = event.target.value; page = 1; renderTable(); }, 120));
     filterInput("#activitySearch", "query"); filterInput("#activityScan", "scan"); filterInput("#activityModel", "model");
     root.querySelector("#activityStatus")?.addEventListener("change", (event) => { filters.status = event.target.value; page = 1; renderTable(); });
+    root.querySelector("#trendGranularity")?.addEventListener("change", async (event) => {
+      trendGranularity = event.target.value;
+      trendLoadedAt = 0;
+      trend = await api.trend(null, trendGranularity, "", trendGroupBy);
+      trendLoadedAt = Date.now();
+      render({ redrawTrend: true });
+    });
+    root.querySelector("#trendGroupBy")?.addEventListener("change", async (event) => {
+      trendGroupBy = event.target.value;
+      trendLoadedAt = 0;
+      trend = await api.trend(null, trendGranularity, "", trendGroupBy);
+      trendLoadedAt = Date.now();
+      render({ redrawTrend: true });
+    });
     bindTable();
   };
 
@@ -179,7 +202,7 @@ export function mountActivity(context) {
     const shouldRefreshTrend = !trend || Date.now() - trendLoadedAt >= TREND_REFRESH_MS;
     const [nextLogs, nextTrend] = await Promise.all([
       api.logs(signal, { limit: 1000, days: 2, joined: true }),
-      shouldRefreshTrend ? api.trend(signal, "4h") : Promise.resolve(null),
+      shouldRefreshTrend ? api.trend(signal, trendGranularity, "", trendGroupBy) : Promise.resolve(null),
     ]);
     logs = nextLogs;
     if (nextTrend) {

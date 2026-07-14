@@ -85,15 +85,32 @@ function renderHostResources(resources = {}) {
 }
 
 function renderFindingsTrend(history = {}) {
-  const points = Array.isArray(history.points) ? history.points : [];
+  const points = sampleWeeklyTrendPoints(Array.isArray(history.points) ? history.points : []);
   const count = points.length;
   return `<section class="overview-card overview-findings-trend">
     <header>
-      <div><h2>Findings Trend</h2><p>Total, Critical, High, and Achieved changes over the last ${Number(history.days || 30)} days</p></div>
+      <div><h2>Findings Trend</h2><p>Total, Critical, High, and Achieved · weekly points over the last ${Number(history.days || 365)} days</p></div>
       <a class="button secondary small" href="#findings">Open Findings</a>
     </header>
     <div class="chart-wrap">${count ? renderFindingsTrendSvg(points) : emptyState("Trend collection started", "The first hourly Findings snapshot has been saved.")}</div>
   </section>`;
+}
+
+function sampleWeeklyTrendPoints(points = []) {
+  if (points.length <= 16) return points;
+  const byWeek = new Map();
+  for (const point of points) {
+    const date = new Date(point.bucket || point.observed_at || 0);
+    if (!Number.isFinite(date.getTime())) continue;
+    const yearStart = Date.UTC(date.getUTCFullYear(), 0, 1);
+    const dayOfYear = Math.floor((Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()) - yearStart) / 86400000) + 1;
+    const week = Math.ceil((dayOfYear + new Date(yearStart).getUTCDay()) / 7);
+    byWeek.set(`${date.getUTCFullYear()}-W${String(week).padStart(2, "0")}`, point);
+  }
+  const sampled = [...byWeek.keys()].sort().map((key) => byWeek.get(key)).filter(Boolean);
+  const latest = points[points.length - 1];
+  if (latest && sampled[sampled.length - 1]?.bucket !== latest.bucket) sampled.push(latest);
+  return sampled.length ? sampled : points;
 }
 
 function renderFindingsTrendSvg(points = []) {
@@ -103,9 +120,9 @@ function renderFindingsTrendSvg(points = []) {
     ["high", "High", "#f59e0b"],
     ["achieved", "Achieved", "#16a34a"],
   ];
-  const width = 900;
-  const height = 230;
-  const pad = { top: 18, right: 18, bottom: 32, left: 54 };
+  const width = 545;
+  const height = 185;
+  const pad = { top: 14, right: 14, bottom: 28, left: 48 };
   const plotW = width - pad.left - pad.right;
   const plotH = height - pad.top - pad.bottom;
   const values = points.flatMap((point) => series.map(([key]) => Number(point[key] || 0)));
@@ -295,12 +312,14 @@ function renderReadiness(data, telemetryState) {
 function renderOverview(data, telemetryState = "ready", findingsHistory = {}) {
   return `<div class="page-stack overview-page">
     ${renderHero(data)}
-    ${renderFindingsTrend(findingsHistory)}
-    ${renderHostResources(data.resources || {})}
-    <div class="overview-main-grid">
-      ${renderScanFlow(data)}
-      ${renderAlerts(data)}
+    <div class="overview-top-grid">
+      ${renderFindingsTrend(findingsHistory)}
+      <div class="overview-side-stack">
+        ${renderScanFlow(data)}
+        ${renderAlerts(data)}
+      </div>
     </div>
+    ${renderHostResources(data.resources || {})}
     <div class="overview-main-grid">
       ${renderActiveTasks(data.scans?.active_tasks || [])}
       ${renderReadiness(data, telemetryState)}
@@ -317,7 +336,7 @@ export function mountOverview(context) {
     root.innerHTML = renderOverview(data, telemetryState, lastFindingsHistory || {});
   };
   const load = async (signal) => {
-    const [data, history] = await Promise.all([api.summary(signal, false), api.findingsHistory(signal, 30)]);
+    const [data, history] = await Promise.all([api.summary(signal, false), api.findingsHistory(signal, 365, "week")]);
     lastData = data;
     lastFindingsHistory = history;
     render(data, "loading");

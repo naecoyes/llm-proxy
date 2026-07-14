@@ -51,6 +51,57 @@ class UsagePricingTests(unittest.TestCase):
 
         self.assertAlmostEqual(controller.model_stats["or-gemini"].cost, 1.74)
 
+    def test_trend_uses_configured_provider_for_new_models(self):
+        controller = self.make_controller(
+            available={"hy3-free": {"provider": "hy3", "free": True}},
+        )
+
+        controller.record_usage("hy3-free", {"prompt_tokens": 100, "completion_tokens": 50})
+
+        trend = controller.get_trend_data("4h")
+        labels = {dataset["model"] for dataset in trend["datasets"]}
+
+        self.assertIn("hy3", labels)
+        self.assertNotIn("other", labels)
+
+        by_model = controller.get_trend_data("4h", group_by="model")
+        model_labels = {dataset["model"] for dataset in by_model["datasets"]}
+
+        self.assertIn("hy3-free", model_labels)
+
+    def test_legacy_model_aliases_do_not_fall_into_other(self):
+        controller = self.make_controller()
+        controller.record_usage("huoshan-doubao-code", {"total_tokens": 100})
+        controller.record_usage("token-plan-cn-1", {"total_tokens": 100})
+
+        trend = controller.get_trend_data("4h")
+        labels = {dataset["model"] for dataset in trend["datasets"]}
+
+        self.assertIn("volcengine", labels)
+        self.assertIn("xiaomi", labels)
+        self.assertNotIn("other", labels)
+
+    def test_provider_dataset_lists_its_member_models(self):
+        controller = self.make_controller(
+            available={"tencent/hy3-free": {"provider": "openrouter", "free": True}},
+        )
+        controller.record_usage("tencent/hy3-free", {"total_tokens": 100})
+
+        trend = controller.get_trend_data("4h")
+        dataset = next(item for item in trend["datasets"] if item["model"] == "openrouter")
+
+        self.assertEqual(dataset["models"], ["tencent/hy3-free"])
+
+    def test_hourly_trend_never_returns_future_zero_buckets(self):
+        controller = self.make_controller()
+        controller.record_usage("deepseek-v4", {"total_tokens": 100})
+
+        trend = controller.get_trend_data("4h")
+        current_hour = __import__("datetime").datetime.now().astimezone().hour
+
+        self.assertEqual(trend["labels"][-1], str(current_hour))
+        self.assertEqual(len(trend["datasets"][0]["tokens"]), current_hour + 1)
+
 
 if __name__ == "__main__":
     unittest.main()

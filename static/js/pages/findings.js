@@ -17,6 +17,10 @@ Testing requirements:
 
 - Use proxy 127.0.0.1:8080 for all test requests
 - Analyze actual traffic through Burp Suite packet capture
+- Do not impose a time deadline. Continue until the target and vulnerability path have been assessed as completely as practical
+- Do not optimize for token or cost savings. Prefer accuracy, completeness, and defensible evidence over brevity
+- Use the most comprehensive verification path available. When in doubt, gather more evidence before concluding
+- Preserve full reasoning context where possible. Only reduce context when required to avoid a provider hard context-window failure
 - Use English only in all test traffic, including URLs, query parameters, headers, cookies, request bodies, payloads, filenames, comments, and any other controllable packet content
 - Do not include Chinese characters in any request or response data that you generate during testing; keep all generated packet content in English/ASCII
 
@@ -67,6 +71,7 @@ function safeMarkdown(markdown = "") {
 
 function stateBadges(item) {
   const labels = [];
+  if (item.review_state === "pending_evidence_review") labels.push(badge("Evidence review", "warning"));
   if (item.state?.unread) labels.push(badge("Unread", "info"));
   if (item.state?.marked) labels.push(badge("Marked", "warning"));
   if (item.state?.starred) labels.push(badge("Verified", "success"));
@@ -94,15 +99,37 @@ function metricFilterCard(kind, label, value, detail = "", tone = "") {
   </button>`;
 }
 
+function severityBreakdown(counts = {}) {
+  const value = (name) => fullNumber(Number(counts[name] || counts[name.toUpperCase()] || 0));
+  return `<span class="finding-severity-count critical">C ${value("critical")}</span>
+    <span class="finding-severity-count high">H ${value("high")}</span>
+    <span class="finding-severity-count medium">M ${value("medium")}</span>`;
+}
+
+function stateMetricFilterCard(kind, label, value, counts = {}) {
+  return `<button class="metric-card finding-metric-card" type="button" data-finding-metric="${escapeHtml(kind)}">
+    <div class="metric-label">${escapeHtml(label)}</div>
+    <div class="metric-value">${escapeHtml(value)}</div>
+    <div class="finding-severity-breakdown">${severityBreakdown(counts)}</div>
+  </button>`;
+}
+
 function renderMetrics(summary) {
   const achieved = summary.achieved ?? summary.archived ?? 0;
+  const unachieved = summary.unachieved_by_severity || Object.fromEntries(
+    ["critical", "high", "medium", "low", "info", "unknown"].map((severity) => [
+      severity,
+      Math.max(0, Number(summary[severity] || 0) - Number(summary.achieved_by_severity?.[severity] || 0)),
+    ]),
+  );
+  const unachievedTotal = summary.unachieved_total ?? Math.max(0, Number(summary.total || 0) - Number(achieved));
   return `<div class="metrics-grid findings-metrics single-row">
-    ${metricFilterCard("total", "Total", fullNumber(summary.total), `${fullNumber(summary.targets)} targets`)}
-    ${metricFilterCard("critical", "Critical", fullNumber(summary.critical), "Immediate review", summary.critical ? "critical" : "")}
-    ${metricFilterCard("high", "High", fullNumber(summary.high), "High-impact findings", summary.high ? "warning" : "")}
+    ${metricFilterCard("total", "Total", fullNumber(unachievedTotal), `${fullNumber(summary.total)} total · ${fullNumber(summary.pending_evidence_review)} Chelmon review pending`)}
+    ${metricFilterCard("critical", "Critical", fullNumber(unachieved.critical), `${fullNumber(summary.critical)} total`, unachieved.critical ? "critical" : "")}
+    ${metricFilterCard("high", "High", fullNumber(unachieved.high), `${fullNumber(summary.high)} total`, unachieved.high ? "warning" : "")}
     ${metricFilterCard("unread", "Unread", fullNumber(summary.unread), `${fullNumber(summary.archived)} archived`)}
-    ${metricFilterCard("verified", "Verified", fullNumber(summary.verified), "Confirmed findings")}
-    ${metricFilterCard("achieved", "Achieved", fullNumber(achieved), "Completed findings")}
+    ${stateMetricFilterCard("verified", "Verified", fullNumber(summary.verified), summary.verified_by_severity)}
+    ${stateMetricFilterCard("achieved", "Achieved", fullNumber(achieved), summary.achieved_by_severity)}
   </div>`;
 }
 
@@ -112,7 +139,7 @@ function renderToolbar(summary, filters) {
   return `<div class="findings-toolbar">
     <label class="search-field grow"><span class="sr-only">Search findings</span><input class="input" id="findingSearch" value="${escapeHtml(filters.q)}" placeholder="Search target, title, ID, or source"></label>
     <select class="select" id="findingSeverity" aria-label="Severity"><option value="">All severities</option>${["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "UNKNOWN"].map(value => `<option ${filters.severity === value ? "selected" : ""}>${value}</option>`).join("")}</select>
-    <select class="select" id="findingStatus" aria-label="Review status"><option value="">All states</option>${[["needs-review", "Needs review"], ["unread", "Unread"], ["marked", "Marked"], ["verified", "Verified"], ["false-positive", "False positive"], ["archived", "Archived"], ["unarchived", "All unarchived"]].map(([value, label]) => `<option value="${value}" ${filters.status === value ? "selected" : ""}>${label}</option>`).join("")}</select>
+    <select class="select" id="findingStatus" aria-label="Review status"><option value="">All states</option>${[["needs-review", "Needs review"], ["pending-evidence-review", "Chelmon evidence review"], ["unread", "Unread"], ["marked", "Marked"], ["verified", "Verified"], ["false-positive", "False positive"], ["archived", "Archived"], ["unarchived", "All unarchived"]].map(([value, label]) => `<option value="${value}" ${filters.status === value ? "selected" : ""}>${label}</option>`).join("")}</select>
     <select class="select" id="findingSource" aria-label="Source"><option value="">All sources</option>${sources.map(value => `<option value="${escapeHtml(value)}" ${filters.source === value ? "selected" : ""}>${escapeHtml(value)}</option>`).join("")}</select>
     <select class="select" id="findingSort" aria-label="Sort findings">
       ${[
@@ -178,6 +205,14 @@ function findingDrawer(item, markdown = "", loading = false, related = [], relat
   const reportActions = [];
   if (item.has_report) reportActions.push(`<a class="button secondary small" href="/proxy/vulnerabilities/${item.record_id}/content?download=true">Download Markdown</a>`);
   if (markdown) reportActions.push('<button class="button secondary small" type="button" data-copy-prompt>Copy prompt</button>');
+  const exported = item.state?.report_generator;
+  if (item.state?.starred && !exported) {
+    reportActions.push(`<button class="button secondary small" type="button" data-report-generator>Send to Report Generator</button>`);
+  } else if (exported) {
+    reportActions.push('<span class="muted text-sm">Report draft created in PwnDoc</span>');
+  } else {
+    reportActions.push('<span class="muted text-sm">Verify this finding before sending it to Report Generator.</span>');
+  }
   return `<div class="finding-detail">
     <div class="finding-detail-meta"><div>${badge(item.severity, severityTone[item.severity])} ${item.is_high_value ? badge("High value", "warning") : ""}</div><dl><dt>Target</dt><dd>${escapeHtml(item.target || "Unknown")}</dd><dt>ID</dt><dd>${escapeHtml(item.id || "-")}</dd><dt>CVSS</dt><dd>${escapeHtml(item.cvss || "-")}</dd><dt>Source</dt><dd>${escapeHtml(item.source_file || "-")}</dd><dt>Found</dt><dd>${escapeHtml(item.timestamp || "-")}</dd></dl></div>
     <div class="finding-actions"><button class="button secondary small" data-finding-action="star">${item.state?.starred ? "Unverify" : "Verify"}</button><button class="button secondary small" data-finding-action="mark">${item.state?.marked ? "Unmark" : "Mark"}</button><button class="button secondary small" data-finding-action="false-positive">False positive</button><button class="button secondary small" data-finding-action="archive">${item.state?.archived ? "Restore" : "Archive"}</button></div>
@@ -213,6 +248,7 @@ export function mountFindings({ root, setFreshness, setRefreshHandler, setTopbar
   let controller = null;
   let pollTimer = null;
   let fullscreen = localStorage.getItem("nscan-findings-fullscreen") === "true";
+  let achievedTypeLoadId = 0;
 
   root.innerHTML = skeleton(4);
   function applyFullscreen() {
@@ -223,7 +259,7 @@ export function mountFindings({ root, setFreshness, setRefreshHandler, setTopbar
   }
 
   function renderActions() {
-    setTopbarActions(`<button class="button secondary" id="findingsFullscreen" type="button"><span>${fullscreen ? "Exit full view" : "Full view"}</span></button><a class="button secondary" href="/proxy/vulnerabilities/export?format=csv">Export CSV</a><button class="button secondary" id="findingsAutoClean" type="button">Auto-clean</button>`);
+    setTopbarActions(`<button class="button secondary" id="findingsFullscreen" type="button"><span>${fullscreen ? "Exit full view" : "Full view"}</span></button><a class="button secondary" href="/proxy/vulnerabilities/export?format=pwndoc-docx">Export Word</a><a class="button secondary" href="/proxy/vulnerabilities/export?format=csv">Export CSV</a><button class="button secondary" id="findingsAutoClean" type="button">Auto-clean</button>`);
     document.getElementById("findingsFullscreen")?.addEventListener("click", () => {
       fullscreen = !fullscreen;
       applyFullscreen();
@@ -256,6 +292,53 @@ export function mountFindings({ root, setFreshness, setRefreshHandler, setTopbar
     summary = await api.findingsSummary(controller?.signal);
   }
 
+  async function hydrateAchievedTypeSummary({ renderOnComplete = true } = {}) {
+    if (!summary) return false;
+    const needsAchievedTypes = !Object.prototype.hasOwnProperty.call(summary, "achieved_type_count");
+    const needsAchievedSeverity = !Object.prototype.hasOwnProperty.call(summary, "achieved_by_severity");
+    const needsVerifiedSeverity = !Object.prototype.hasOwnProperty.call(summary, "verified_by_severity");
+    if (!needsAchievedTypes && !needsAchievedSeverity && !needsVerifiedSeverity) return false;
+    const loadId = ++achievedTypeLoadId;
+    try {
+      const loadState = async (status) => {
+        const query = { page: 1, page_size: 200, status, sort: "legacy", order: "asc" };
+        const first = await api.findings(controller?.signal, query);
+        const items = [...(first.items || [])];
+        for (let page = 2; page <= Number(first.pages || 1); page += 1) {
+          const result = await api.findings(controller?.signal, { ...query, page });
+          items.push(...(result.items || []));
+        }
+        return items;
+      };
+      const [achievedItems, verifiedItems] = await Promise.all([
+        needsAchievedTypes || needsAchievedSeverity ? loadState("archived") : Promise.resolve([]),
+        needsVerifiedSeverity ? loadState("verified") : Promise.resolve([]),
+      ]);
+      if (loadId !== achievedTypeLoadId || !summary) return;
+      const byType = {};
+      const bySeverity = (items) => items.reduce((counts, item) => {
+        const severity = String(item.severity || "unknown").toLowerCase();
+        counts[severity] = (counts[severity] || 0) + 1;
+        return counts;
+      }, {});
+      achievedItems.forEach((item) => {
+        const type = String(item.title || item.id || "Untitled finding").trim();
+        byType[type] = (byType[type] || 0) + 1;
+      });
+      summary = {
+        ...summary,
+        ...(needsAchievedTypes ? { achieved_type_count: Object.keys(byType).length, achieved_by_type: byType } : {}),
+        ...(needsAchievedSeverity ? { achieved_by_severity: bySeverity(achievedItems) } : {}),
+        ...(needsVerifiedSeverity ? { verified_by_severity: bySeverity(verifiedItems) } : {}),
+      };
+      if (renderOnComplete) render();
+      return true;
+    } catch (error) {
+      if (error.name !== "AbortError") console.warn("Unable to calculate achieved finding types", error);
+      return false;
+    }
+  }
+
   async function loadAll(manual = false) {
     controller?.abort();
     controller = new AbortController();
@@ -281,6 +364,10 @@ export function mountFindings({ root, setFreshness, setRefreshHandler, setTopbar
       if (activeTab === "reports" && !reports.length) {
         reports = await api.findingReports(controller.signal).then(v => v.reports || []).catch(() => []);
       }
+      // Older 8888 processes may not yet include state-by-severity in the
+      // summary. Finish the compatible client-side calculation before first
+      // paint so headline counts never momentarily show historical totals.
+      await hydrateAchievedTypeSummary({ renderOnComplete: false });
       render();
     } catch (error) {
       if (error.name !== "AbortError") root.innerHTML = errorState(error);
@@ -293,6 +380,7 @@ export function mountFindings({ root, setFreshness, setRefreshHandler, setTopbar
       selected.clear();
       // Only reload summary + list (not targets/reports) — much cheaper than loadAll()
       [summary] = await Promise.all([api.findingsSummary(), loadList()]);
+      await hydrateAchievedTypeSummary({ renderOnComplete: false });
       render();
       toast(message);
     } catch (error) { toast(error.message, "error"); }
@@ -307,6 +395,7 @@ export function mountFindings({ root, setFreshness, setRefreshHandler, setTopbar
       await api.updateFindingState(recordId, actions);
       // Only reload summary + list (not targets/reports)
       [summary] = await Promise.all([api.findingsSummary(), loadList()]);
+      await hydrateAchievedTypeSummary({ renderOnComplete: false });
       render();
       toast("Finding state updated");
     } catch (error) {
@@ -352,6 +441,69 @@ export function mountFindings({ root, setFreshness, setRefreshHandler, setTopbar
     }));
     drawer.querySelector("[data-copy-prompt]")?.addEventListener("click", async () => {
       try { await copyText(VULN_COPY_PROMPT + markdown); toast("Verification prompt copied"); } catch (error) { toast(error.message, "error"); }
+    });
+    drawer.querySelector("[data-report-generator]")?.addEventListener("click", async (event) => {
+      const confirmed = await confirmAction({
+        title: "Send to Report Generator",
+        message: "Create an English single-finding audit draft in Vulnerability Report Generator? This finding has already been manually verified.",
+        confirmLabel: "Create draft",
+      });
+      if (!confirmed) return;
+      const button = event.currentTarget;
+      button.disabled = true;
+      const label = button.textContent;
+      button.textContent = "Creating draft...";
+      try {
+        const result = await api.sendFindingToReportGenerator(item.record_id);
+        toast(result.status === "already_exported" ? "Report draft already exists" : `Report draft created: audit ${result.audit_id}`);
+        await openFinding(item.record_id);
+        await loadList();
+        render();
+      } catch (error) {
+        toast(error.message, "error");
+        button.disabled = false;
+        button.textContent = label;
+      }
+    });
+    drawer.querySelector("[data-report-generator-sync]")?.addEventListener("click", async (event) => {
+      const confirmed = await confirmAction({
+        title: "Update Report Draft",
+        message: "Replace this PwnDoc draft with the latest reviewed Nscan content? This does not create a second Audit.",
+        confirmLabel: "Update draft",
+      });
+      if (!confirmed) return;
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        const result = await api.syncFindingReportGeneratorDraft(item.record_id);
+        toast(`Report draft updated: audit ${result.audit_id}`);
+        await openFinding(item.record_id);
+        await loadList();
+        render();
+      } catch (error) {
+        toast(error.message, "error");
+        button.disabled = false;
+      }
+    });
+    drawer.querySelector("[data-report-generator-generate]")?.addEventListener("click", async (event) => {
+      const confirmed = await confirmAction({
+        title: "Generate Report Fields",
+        message: "Use PwnDoc's configured AI prompts to regenerate Description, Observation, Remediation, and Vulnerability Impact? Proofs and the reviewed finding metadata stay unchanged.",
+        confirmLabel: "Generate fields",
+      });
+      if (!confirmed) return;
+      const button = event.currentTarget;
+      button.disabled = true;
+      try {
+        const result = await api.generateFindingReportGeneratorFields(item.record_id);
+        toast(`PwnDoc generated ${result.fields?.length || 0} report fields`);
+        await openFinding(item.record_id);
+        await loadList();
+        render();
+      } catch (error) {
+        toast(error.message, "error");
+        button.disabled = false;
+      }
     });
     drawer.querySelectorAll("[data-related-record-id]").forEach(button => button.addEventListener("click", () => openFinding(button.dataset.relatedRecordId)));
   }

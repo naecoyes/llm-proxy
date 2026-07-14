@@ -57,6 +57,38 @@ class OperationalSQLiteTests(unittest.TestCase):
             review = connection.execute("SELECT starred,verified FROM finding_review_state").fetchone()
             self.assertEqual(tuple(review), (1, 0))
 
+        history = self.db.usage_history(days=30)
+        self.assertEqual(history["2026-07-01"]["models"]["model-a"]["tokens"], 30)
+
+    def test_hourly_response_usage_uses_response_ledger(self):
+        self.db.record_llm_event({
+            "type": "response", "timestamp": "2026-07-01T11:15:00", "request_id": "usage-1",
+            "model_name": "model-a", "status": "success",
+            "usage": {"prompt_tokens": 80, "completion_tokens": 20, "total_tokens": 100},
+        })
+
+        hourly = self.db.hourly_response_usage(usage_date="2026-07-01")
+        self.assertEqual(hourly["11"]["model-a"]["requests"], 1)
+        self.assertEqual(hourly["11"]["model-a"]["tokens"], 100)
+
+    def test_full_smart_batch_and_job_snapshots_are_persisted(self):
+        batch = {
+            "batch_id": "smart-batch-db-test", "status": "running", "updated_at": "2026-07-01T10:00:00+00:00",
+            "parallel": 2, "tasks": [{"target": "example.ae", "status": "running", "scan_id": "scan-1"}],
+        }
+        self.db.sync_batch_snapshot(batch, "/tmp/smart-batch-db-test.json")
+        restored = self.db.smart_batch_snapshot("smart-batch-db-test")
+        self.assertEqual(restored["tasks"][0]["scan_id"], "scan-1")
+        self.assertEqual(self.db.smart_batch_snapshots(limit=10)[0]["batch_id"], "smart-batch-db-test")
+
+        job = {
+            "job_id": "dashboard-db-test", "status": "started", "engine": "dual", "phase": "strix",
+            "submitted_at": "2026-07-01T10:00:00+00:00", "children": [{"engine": "strix", "status": "running"}],
+        }
+        self.db.sync_smart_batch_job(job, "/tmp/dashboard-db-test.json")
+        restored_job = self.db.smart_batch_job("dashboard-db-test")
+        self.assertEqual(restored_job["children"][0]["engine"], "strix")
+
     def test_assets_can_filter_zero_findings_for_coverage_rescan(self):
         zero_id = self.db.upsert_asset("zero.example.ae", source_type="test")
         finding_id = self.db.upsert_asset("finding.example.ae", source_type="test")
@@ -73,6 +105,22 @@ class OperationalSQLiteTests(unittest.TestCase):
 
         self.assertEqual(result["total"], 1)
         self.assertEqual(result["items"][0]["target"], "zero.example.ae")
+
+    def test_retest_lookup_is_exact_asset_and_includes_review_state(self):
+        asset_id = self.db.upsert_asset("portal.example.ae", source_type="test")
+        with self.db.transaction() as connection:
+            connection.execute(
+                "INSERT INTO finding_refs(record_id,asset_id,finding_id,title,severity,metadata_json) VALUES(?,?,?,?,?,?)",
+                ("finding-1", asset_id, "V-1", "Existing issue", "HIGH", '{"target":"portal.example.ae"}'),
+            )
+            connection.execute(
+                "INSERT INTO finding_review_state(state_key,verified,archived,updated_at) VALUES(?,?,?,?)",
+                ("portal.example.ae:V-1:Existing issue", 1, 0, "2026-07-01T00:00:00Z"),
+            )
+        baseline = self.db.retest_asset_findings(["https://portal.example.ae/login"])
+        self.assertEqual(baseline["portal.example.ae"]["asset_id"], asset_id)
+        self.assertEqual(baseline["portal.example.ae"]["findings"][0]["record_id"], "finding-1")
+        self.assertEqual(baseline["portal.example.ae"]["findings"][0]["verified"], 1)
 
     def test_finding_catalog_refreshes_asset_counts_authoritatively(self):
         self.db.upsert_asset("clean.example.ae", source_type="test")
