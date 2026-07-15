@@ -8,6 +8,7 @@ argument list. The scanner remains the source of truth for execution and state.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
@@ -36,6 +37,9 @@ try:
     from chelmon_runtime import get_chelmon_runtime_status
 except ModuleNotFoundError:  # package import from the project root
     from .chelmon_runtime import get_chelmon_runtime_status
+
+
+logger = logging.getLogger(__name__)
 
 
 TARGET_RE = re.compile(r"^(?:https?://)?[A-Za-z0-9][A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]{1,252}$")
@@ -80,13 +84,23 @@ def default_paths() -> SmartBatchPaths:
 class SmartBatchJobManager:
     def __init__(self, paths: SmartBatchPaths | None = None) -> None:
         self.paths = paths or default_paths()
+        # Test and one-off managers often use temporary job directories. Their
+        # checkpoints must never leak into the dashboard's production index.
+        self._sync_asset_db = (
+            self.paths.job_dir.resolve(strict=False)
+            == default_paths().job_dir.resolve(strict=False)
+        )
 
-    @staticmethod
-    def _persist_job(job_file: Path, job: dict[str, Any]) -> None:
+    def _persist_job(self, job_file: Path, job: dict[str, Any]) -> None:
         """Persist the job atomically to SQLite and keep a JSON checkpoint."""
         atomic_write_json(job_file, job)
+        if not self._sync_asset_db:
+            return
         try:
-            from asset_database import get_asset_database
+            try:
+                from asset_database import get_asset_database
+            except ModuleNotFoundError:
+                from .asset_database import get_asset_database
 
             get_asset_database().sync_smart_batch_job(job, str(job_file))
         except Exception as exc:  # noqa: BLE001
@@ -155,7 +169,10 @@ class SmartBatchJobManager:
         dry_run = bool(payload.get("dry_run", False))
         if not dry_run:
             try:
-                from asset_database import get_asset_database
+                try:
+                    from asset_database import get_asset_database
+                except ModuleNotFoundError:
+                    from .asset_database import get_asset_database
 
                 get_asset_database().record_scope_decisions(
                     analysis["scope_decisions"],
@@ -307,6 +324,8 @@ class SmartBatchJobManager:
             args.append("--skip-scanned")
         if options["model"]:
             args.extend(["--model", options["model"]])
+        if options.get("vision_assist_model"):
+            args.extend(["--vision-assist-model", options["vision_assist_model"]])
         if options.get("retest_context_dir"):
             args.extend(["--retest-context-dir", str(options["retest_context_dir"])])
         if options["allow_private_targets"]:
@@ -340,7 +359,10 @@ class SmartBatchJobManager:
             "NSCAN_GLOBAL_SCAN_LIMIT": os.environ.get("NSCAN_GLOBAL_SCAN_LIMIT", "2"),
             "NSCAN_BATCH_SUBMITTED_AT": submitted_at,
             "NSCAN_BATCH_JOB_ID": job_id,
+            "NSCAN_WORKFLOW_MODE": str(options.get("workflow_mode") or ""),
         }
+        if options.get("vision_assist_model"):
+            overrides["NSCAN_VISION_ASSIST_MODEL"] = str(options["vision_assist_model"])
         if parent_job_id:
             overrides.update({
                 "NSCAN_PARENT_JOB_ID": parent_job_id,
@@ -428,6 +450,8 @@ class SmartBatchJobManager:
                 f"--property=StandardError=append:{stderr_file}",
                 "--property=Restart=no",
                 "--property=KillMode=mixed",
+                "--property=Slice=nscan-scan.slice",
+                "--property=TimeoutStopSec=30s",
             ]
             for key, value in sorted(overrides.items()):
                 command.append(f"--setenv={key}={value}")
@@ -452,6 +476,13 @@ class SmartBatchJobManager:
         else:
             warning = "systemd-run is unavailable" if mode != "process" else "worker mode forced to process"
 
+        if mode != "process":
+            # A silent process fallback puts the worker back in the
+            # llm-proxy.service cgroup and defeats restart isolation.  Refuse
+            # new work instead; development environments can opt in explicitly
+            # with NSCAN_WORKER_MODE=process.
+            raise RuntimeError(f"independent scan worker unavailable: {warning}")
+
         process = self._start_process(args, stdout_file, stderr_file, env)
         return {
             "worker_mode": "process",
@@ -461,8 +492,18 @@ class SmartBatchJobManager:
             "worker_warning": warning,
         }
 
-    def resume_job(self, job_id: str, source: str = "dashboard") -> dict[str, Any]:
-        """Resume only incomplete dual-engine stages from their checkpoints."""
+    def resume_job(
+        self,
+        job_id: str,
+        source: str = "dashboard",
+        *,
+        restore_terminated: bool = False,
+    ) -> dict[str, Any]:
+        """Resume incomplete dual-engine stages from their checkpoints.
+
+        Terminated jobs stay terminal by default.  An operator must explicitly
+        opt into restoring one through the protected dashboard API.
+        """
         job_file = self.paths.job_dir / f"{safe_job_id(job_id)}.json"
         job = self._read_job_file(job_file)
         if not job:
@@ -472,8 +513,11 @@ class SmartBatchJobManager:
         refreshed = self._refresh_job_state(job)
         if refreshed.get("process_alive"):
             raise ValueError("This dual-engine job already has an active worker")
-        if str(job.get("status") or "") in {"completed", "terminated", "dry_run_completed"}:
+        status = str(job.get("status") or "")
+        if status in {"completed", "dry_run_completed"}:
             raise ValueError(f"Job status {job.get('status')} cannot be resumed")
+        if status == "terminated" and not restore_terminated:
+            raise ValueError("Terminated jobs require an explicit restore request")
 
         children = job.get("children") if isinstance(job.get("children"), list) else []
         incomplete = [child for child in children if str(child.get("status") or "") != "completed"]
@@ -495,6 +539,7 @@ class SmartBatchJobManager:
             "status": "started",
             "phase": "recovering",
             "pid": worker["pid"],
+            "process_alive": True,
             "worker_mode": worker["worker_mode"],
             "worker_unit": worker["worker_unit"],
             "worker_status": worker["worker_status"],
@@ -504,6 +549,12 @@ class SmartBatchJobManager:
             "resume_requested_at": datetime.now(timezone.utc).isoformat(),
             "resume_source": source,
         })
+        if status == "terminated":
+            job.update({
+                "restored_from_terminated": True,
+                "restored_at": datetime.now(timezone.utc).isoformat(),
+                "restored_source": source,
+            })
         self._persist_job(job_file, job)
         return job
 
@@ -583,10 +634,17 @@ class SmartBatchJobManager:
 
         job.update({
             "engine_plan": [dict(item) for item in DUAL_ENGINE_PLAN],
-            "phase": "planned" if dry_run else "strix",
+            "execution_strategy": "per_target_pipeline",
+            "phase": "planned" if dry_run else "target_pipeline",
             "children": children,
             "completed_passes": 0,
-            "total_passes": len(children),
+            "total_passes": int(job.get("target_count") or 0) * len(children),
+            "pipeline": {
+                "strategy": "per_target",
+                "targets_file": str(target_file),
+                "parallel": int(options.get("parallel") or 2),
+                "preflight": "reused" if not options.get("probe_live_before_queue") else "target_file",
+            },
             "command": [],
         })
         if dry_run:
@@ -621,7 +679,10 @@ class SmartBatchJobManager:
     def list_jobs(self, limit: int = 50) -> dict[str, Any]:
         self.paths.job_dir.mkdir(parents=True, exist_ok=True)
         try:
-            from asset_database import get_asset_database
+            try:
+                from asset_database import get_asset_database
+            except ModuleNotFoundError:
+                from .asset_database import get_asset_database
 
             stored = get_asset_database().smart_batch_jobs(limit=limit)
         except Exception as exc:  # noqa: BLE001
@@ -642,7 +703,10 @@ class SmartBatchJobManager:
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         job_file = self.paths.job_dir / f"{safe_job_id(job_id)}.json"
         try:
-            from asset_database import get_asset_database
+            try:
+                from asset_database import get_asset_database
+            except ModuleNotFoundError:
+                from .asset_database import get_asset_database
 
             job = get_asset_database().smart_batch_job(job_id)
         except Exception:  # noqa: BLE001
@@ -814,13 +878,54 @@ class SmartBatchJobManager:
             return None
 
     def _refresh_job_state(self, job: dict[str, Any]) -> dict[str, Any]:
+        job_id = str(job.get("job_id") or "")
+        checkpoint_value = str(job.get("job_file") or "").strip()
+        checkpoint = Path(checkpoint_value) if checkpoint_value else self.paths.job_dir / f"{safe_job_id(job_id)}.json"
+        checkpoint_root = self.paths.job_dir.resolve(strict=False)
+        try:
+            checkpoint_path = checkpoint.resolve(strict=False)
+            checkpoint_path.relative_to(checkpoint_root)
+            checkpoint_in_runtime = True
+        except (OSError, ValueError):
+            checkpoint_path = checkpoint
+            checkpoint_in_runtime = False
+        checkpoint_exists = checkpoint_in_runtime and checkpoint_path.is_file()
+        job["checkpoint_status"] = "available" if checkpoint_exists else (
+            "outside_runtime" if not checkpoint_in_runtime else "missing"
+        )
+        if not checkpoint_exists:
+            # Never trust a recorded PID when its durable checkpoint is gone.
+            # The PID may have been reused by an unrelated process, which used
+            # to make test fixtures appear as live production scans.
+            job["process_alive"] = False
+            job["worker_status"] = "stale/checkpoint-missing"
+            job["worker_warning"] = "Durable job checkpoint is unavailable"
+            if str(job.get("status") or "") in {
+                "started", "running", "recovering", "dry_run_started",
+            }:
+                job["status"] = "stale_record"
+                job["recovery_state"] = "missing_job_checkpoint"
+            if job.get("engine") == "dual":
+                job["completed_passes"] = int(job.get("completed_passes") or 0)
+                job["total_passes"] = int(job.get("total_passes") or len(job.get("children") or []))
+            return job
+
         unit = str(job.get("worker_unit") or "")
         if unit:
             worker = self._systemd_worker_status(unit)
             job["worker_status"] = worker["state"]
             if worker.get("pid"):
                 job["pid"] = worker["pid"]
-            job["process_alive"] = bool(worker["active"])
+            # The API service may run without the user's systemd DBus session.
+            # In that case ``systemctl --user`` reports the worker as inactive
+            # even while the coordinator PID is alive.  The PID is recorded
+            # when the worker is spawned, so prefer it as a safe fallback and
+            # never turn a live dual scan into a phantom interruption.
+            pid_fallback_alive = pid_alive(job.get("pid"))
+            job["process_alive"] = bool(worker["active"]) or pid_fallback_alive
+            if pid_fallback_alive and not worker["active"]:
+                job["worker_status"] = "active/pid-fallback"
+                job["worker_warning"] = "systemd user status unavailable; coordinator PID is alive"
             if job.get("status") in {"started", "running", "dry_run_started"} and not job["process_alive"]:
                 job["status"] = "interrupted"
                 job["recovery_state"] = "worker_exited"
@@ -892,6 +997,12 @@ class SmartBatchJobManager:
             probe_max_proxy_nodes = int(payload.get("probe_max_proxy_nodes") or 3)
         except (TypeError, ValueError):
             probe_max_proxy_nodes = 3
+        source = str(payload.get("source") or "dashboard").strip().lower()
+        probe_requested = bool(payload.get("probe_live_before_queue", True))
+        # Catalog, ingest, and synchronization workflows are bulk sources. They
+        # must prove liveness before consuming a scanner container or LLM slot.
+        # Only an explicit Dashboard submission may opt out for a known target.
+        probe_live_before_queue = probe_requested if source == "dashboard" else True
         return {
             "engine": engine,
             "mode": mode,
@@ -907,14 +1018,21 @@ class SmartBatchJobManager:
             # suppress the Chelmon pass after it records the target.
             "skip_scanned": False if engine == "dual" else bool(payload.get("skip_scanned", False)),
             "model": str(payload.get("model") or "").strip(),
+            "vision_assist_model": str(payload.get("vision_assist_model") or "").strip(),
             "allow_private_targets": bool(payload.get("allow_private_targets", False)),
             "skip_dns_guard": bool(payload.get("skip_dns_guard", True)),
-            "probe_live_before_queue": bool(payload.get("probe_live_before_queue", True)),
+            "probe_live_before_queue": probe_live_before_queue,
+            "probe_live_forced": probe_live_before_queue and not probe_requested,
             "probe_concurrency": max(1, min(probe_concurrency, 200)),
             "probe_proxy_quorum": max(1, min(probe_proxy_quorum, 10)),
             "probe_max_proxy_nodes": max(1, min(probe_max_proxy_nodes, 10)),
-            "probe_keep_inconclusive": bool(payload.get("probe_keep_inconclusive", True)),
-            "source": str(payload.get("source") or "dashboard").strip().lower(),
+            # Dual runs perform two model-heavy passes.  Default to confirmed
+            # liveness only; callers can still explicitly opt into probing
+            # inconclusive targets for a single-engine exploratory run.
+            "probe_keep_inconclusive": bool(
+                payload.get("probe_keep_inconclusive", False if engine == "dual" else True)
+            ),
+            "source": source,
             "platform": normalize_platform(str(payload.get("platform") or "dashboard")),
             "source_ref": str(payload.get("source_ref") or "").strip(),
             "allow_non_uae": bool(payload.get("allow_non_uae", False)),
