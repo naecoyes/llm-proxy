@@ -4,12 +4,25 @@ from types import SimpleNamespace
 
 from server import (
     _prepare_openai_request_body,
+    classify_stream_completion,
     normalize_openai_sse_chunk,
     normalize_openrouter_reasoning_capability,
 )
 
 
 class StreamChunkNormalizationTests(unittest.TestCase):
+    def test_zero_usage_output_remains_partial_and_suspicious(self):
+        status, error = classify_stream_completion(
+            is_success=True,
+            client_cancelled=False,
+            client_closed_after_output=False,
+            server_shutting_down=False,
+            total_tokens=0,
+            stream_error=None,
+        )
+        self.assertEqual("partial", status)
+        self.assertEqual("suspicious_empty_usage", error)
+
     def test_detects_content_without_usage_in_multi_event_chunk(self):
         first = {
             "choices": [

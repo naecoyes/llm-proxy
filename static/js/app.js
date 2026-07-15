@@ -3,12 +3,12 @@ import { closeDrawer, toast } from "./components.js?v=20260623-provider-ui";
 import { Router } from "./router.js";
 import { formatNumber, icon, relativeTime } from "./utils.js";
 import { mountOverview } from "./pages/overview.js?v=20260709-overview-trend-narrow";
-import { mountScans, mountScanHistory } from "./pages/scans.js?v=20260715-live-worker-filter-v1";
+import { mountScans, mountScanHistory } from "./pages/scans.js?v=20260715-resumable-preflight-v1";
 import { mountAssets } from "./pages/assets.js?v=20260701-assets-history";
-import { mountFindings } from "./pages/findings.js?v=20260713-unachieved-counts-v1";
+import { mountFindings } from "./pages/findings.js?v=20260715-export-capability-v1";
 import { mountEgress } from "./pages/egress.js";
 import { mountModels } from "./pages/models.js?v=20260623-provider-ui";
-import { mountActivity } from "./pages/activity.js?v=20260715-pipeline-activity-v1";
+import { mountActivity } from "./pages/activity.js?v=20260715-resumable-preflight-v1";
 import { mountSettings } from "./pages/settings.js";
 
 const routes = {

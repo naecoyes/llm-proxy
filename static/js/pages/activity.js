@@ -1,7 +1,7 @@
 import { api } from "../api.js";
 import { Poller } from "../poller.js";
 import { badge, emptyState, errorState, modelIdentity, openDrawer, skeleton } from "../components.js";
-import { debounce, escapeHtml, formatDate, formatDuration, formatNumber } from "../utils.js";
+import { debounce, escapeHtml, formatDate, formatDuration, formatNumber, relativeTime } from "../utils.js";
 
 const STALE_PENDING_MS = 10 * 60 * 1000;
 const TREND_REFRESH_MS = 60 * 60 * 1000;
@@ -70,11 +70,15 @@ function renderPipelineActivity(payload) {
   if (!jobs.length) return emptyState("No active scan pipelines");
   return `<div class="process-list">${jobs.slice(0, 8).map((job) => {
     const preflight = job.pipeline?.preflight || {};
+    const preflightProgress = job.preflight_progress || job.pipeline?.preflight_progress || preflight.progress || {};
     const inPreflight = String(preflight.status || "").toLowerCase() === "running";
-    const label = inPreflight ? "preflight" : (job.recovery_state || job.status || "running");
+    const percent = Math.max(0, Math.min(100, Number(preflightProgress.progress_percent || 0)));
+    const checked = Number(preflightProgress.checked_targets || 0);
+    const total = Number(preflightProgress.total_targets || job.target_count || 0);
+    const label = inPreflight ? `preflight ${percent.toFixed(1)}%` : (job.recovery_state || job.status || "running");
     const egress = preflight.container_egress;
     const detail = inPreflight
-      ? `${formatNumber(job.target_count || 0)} targets · multi-proxy liveness${egress ? ` · egress ${egress.ok ? "ready" : "failed"}` : ""}`
+      ? `${formatNumber(checked)} / ${formatNumber(total)} checked · ${formatNumber(preflightProgress.alive_targets || 0)} alive · ${formatNumber(preflightProgress.dead_targets || 0)} dead · ${formatNumber(preflightProgress.inconclusive_targets || 0)} inconclusive · ${formatNumber(preflightProgress.blocked_targets || 0)} blocked · ${Number(preflightProgress.rate_per_second || 0).toFixed(1)}/s${egress ? ` · egress ${egress.ok ? "ready" : "failed"}` : ""}${preflightProgress.updated_at ? ` · snapshot ${relativeTime(preflightProgress.updated_at)}` : ""}`
       : `${formatNumber(job.target_count || 0)} targets · worker ${job.worker_status || "active"}`;
     return `<div class="process-row"><div class="process-main"><div class="process-title">${escapeHtml(job.label || job.name || job.job_name || job.job_id || "Scan pipeline")}</div><div class="process-meta">${escapeHtml(job.engine || "strix")} · ${escapeHtml(job.scan_mode || "standard")} · ${escapeHtml(detail)}</div></div>${badge(label)}</div>`;
   }).join("")}</div>`;

@@ -74,6 +74,22 @@
   </dialog>
 
   <div class="toast-region" id="toastRegion" aria-live="assertive"></div>
-  <script type="module" src="/static/js/app.js?v=20260715-pipeline-activity-v1"></script>
+  <script>
+    (() => {
+      if (window.location.protocol === "file:") {
+        const productionUrl = "http://192.168.0.100:8888/";
+        document.getElementById("pageTitle").textContent = "Dashboard data unavailable";
+        document.getElementById("pageSubtitle").textContent = "This local HTML file is not connected to the Nscan API.";
+        document.getElementById("freshnessLabel").textContent = "Local file";
+        document.getElementById("topbarActions").innerHTML = "";
+        document.getElementById("pageContent").innerHTML = `<section class="panel"><div class="panel-body error-state"><div><h2>Open the production dashboard</h2><p>Relative API requests are disabled for file:// pages.</p><p><a class="button" href="${productionUrl}">${productionUrl}</a></p></div></div></section>`;
+        return;
+      }
+      const script = document.createElement("script");
+      script.type = "module";
+      script.src = "/static/js/app.js?v=20260715-resumable-preflight-v1";
+      document.body.appendChild(script);
+    })();
+  </script>
 </body>
 </html>

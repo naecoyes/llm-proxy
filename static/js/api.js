@@ -60,6 +60,7 @@ export const api = {
   resumeSmartBatchJob: (jobId) => request(`/proxy/smart-batch/jobs/${encodeURIComponent(jobId)}/resume`, { method: "POST" }),
   smartBatchWorkers: (signal) => request("/proxy/smart-batch/jobs/runtime-summary", { signal }),
   findingsSummary: (signal) => request("/proxy/vulnerabilities/summary", { signal }),
+  findingExportCapabilities: (signal) => request("/proxy/vulnerabilities/export-capabilities", { signal }),
   findingsHistory: (signal, days = 30, sample = "raw") => request(`/proxy/vulnerabilities/history?${new URLSearchParams({ days, sample })}`, { signal }),
   findingsBootstrap: (signal, params = {}) => request(`/proxy/vulnerabilities/bootstrap?${new URLSearchParams({ page: 1, page_size: 50, status: "needs-review", sort: "legacy", order: "asc", ...params })}`, { signal }),
   findings: (signal, params = {}) => request(`/proxy/vulnerabilities?${new URLSearchParams({ page: 1, page_size: 50, ...params })}`, { signal }),

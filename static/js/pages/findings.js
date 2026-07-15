@@ -249,6 +249,7 @@ export function mountFindings({ root, setFreshness, setRefreshHandler, setTopbar
   let pollTimer = null;
   let fullscreen = localStorage.getItem("nscan-findings-fullscreen") === "true";
   let achievedTypeLoadId = 0;
+  let exportCapabilities = null;
 
   root.innerHTML = skeleton(4);
   function applyFullscreen() {
@@ -259,7 +260,13 @@ export function mountFindings({ root, setFreshness, setRefreshHandler, setTopbar
   }
 
   function renderActions() {
-    setTopbarActions(`<button class="button secondary" id="findingsFullscreen" type="button"><span>${fullscreen ? "Exit full view" : "Full view"}</span></button><a class="button secondary" href="/proxy/vulnerabilities/export?format=pwndoc-docx">Export Word</a><a class="button secondary" href="/proxy/vulnerabilities/export?format=csv">Export CSV</a><button class="button secondary" id="findingsAutoClean" type="button">Auto-clean</button>`);
+    const word = exportCapabilities?.formats?.["pwndoc-docx"];
+    const wordAvailable = word?.available === true;
+    const wordReason = wordAvailable ? "Export a PwnDoc-compatible Word report" : (word?.reason || "Checking Word export availability");
+    const wordAction = wordAvailable
+      ? `<a class="button secondary" href="/proxy/vulnerabilities/export?format=pwndoc-docx" title="${escapeHtml(wordReason)}">Export Word</a>`
+      : `<button class="button secondary" type="button" disabled title="${escapeHtml(wordReason)}">Export Word</button>`;
+    setTopbarActions(`<button class="button secondary" id="findingsFullscreen" type="button"><span>${fullscreen ? "Exit full view" : "Full view"}</span></button>${wordAction}<a class="button secondary" href="/proxy/vulnerabilities/export?format=csv">Export CSV</a><button class="button secondary" id="findingsAutoClean" type="button">Auto-clean</button>`);
     document.getElementById("findingsFullscreen")?.addEventListener("click", () => {
       fullscreen = !fullscreen;
       applyFullscreen();
@@ -345,15 +352,19 @@ export function mountFindings({ root, setFreshness, setRefreshHandler, setTopbar
     try {
       if (manual) await api.refreshFindings();
       // Bootstrap: summary + first-page list in one request (was 4 separate parallel requests)
-      const boot = await api.findingsBootstrap(controller.signal, {
-        page: filters.page,
-        page_size: filters.page_size || 50,
-        q: filters.q || "",
-        severity: filters.severity || "",
-        status: filters.status || "needs-review",
-        sort: filters.sort || "legacy",
-        order: filters.order || "asc",
-      });
+      const [boot, capabilities] = await Promise.all([
+        api.findingsBootstrap(controller.signal, {
+          page: filters.page,
+          page_size: filters.page_size || 50,
+          q: filters.q || "",
+          severity: filters.severity || "",
+          status: filters.status || "needs-review",
+          sort: filters.sort || "legacy",
+          order: filters.order || "asc",
+        }),
+        api.findingExportCapabilities(controller.signal).catch(() => null),
+      ]);
+      exportCapabilities = capabilities || exportCapabilities;
       summary = boot.summary;
       data = boot.records;
       setFreshness(data.generated_at);

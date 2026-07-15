@@ -451,6 +451,35 @@ def normalize_openai_sse_chunk(
     return (normalized.encode() if was_bytes else normalized), diagnostics
 
 
+def classify_stream_completion(
+    *,
+    is_success: bool,
+    client_cancelled: bool,
+    client_closed_after_output: bool,
+    server_shutting_down: bool,
+    total_tokens: int,
+    stream_error: str | None,
+) -> tuple[str, str | None]:
+    """Classify a stream without allowing missing usage to look fully healthy."""
+    zero_usage_partial = is_success and total_tokens == 0
+    if zero_usage_partial:
+        status = "partial"
+    elif client_closed_after_output:
+        status = "success"
+    elif client_cancelled:
+        status = "interrupted" if server_shutting_down else "cancelled"
+    else:
+        status = "success" if is_success else "failed"
+
+    if zero_usage_partial:
+        error = "suspicious_empty_usage"
+    elif is_success:
+        error = None
+    else:
+        error = stream_error or "Empty upstream response"
+    return status, error
+
+
 _DEEPSEEK_REASONING_EFFORTS = {
     "none": "high",
     "minimal": "high",
@@ -2203,21 +2232,13 @@ document.getElementById("f").addEventListener("submit",async e=>{
                             error_msg = stream_error or "Empty upstream response"
                             server.model_manager.handle_error(model_name, RuntimeError(error_msg))
 
-                        zero_usage_partial = is_success and total_tokens == 0
-                        if client_closed_after_output:
-                            status = "success"
-                        elif client_cancelled:
-                            status = (
-                                "interrupted"
-                                if server.is_shutting_down
-                                else "cancelled"
-                            )
-                        elif zero_usage_partial:
-                            status = "partial"
-                        else:
-                            status = "success" if is_success else "failed"
-                        final_error = None if is_success else (
-                            stream_error or "Empty upstream response"
+                        status, final_error = classify_stream_completion(
+                            is_success=is_success,
+                            client_cancelled=client_cancelled,
+                            client_closed_after_output=client_closed_after_output,
+                            server_shutting_down=server.is_shutting_down,
+                            total_tokens=total_tokens,
+                            stream_error=stream_error,
                         )
 
                         # 记录请求完成

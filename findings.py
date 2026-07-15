@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import csv
-import html
 import hashlib
+import html
+import importlib.util
 import io
 import json
 import logging
@@ -1400,6 +1401,20 @@ def create_findings_router(service: FindingsService) -> APIRouter:
             raise HTTPException(status_code=400, detail="format must be json, csv, docx, word, or pwndoc-docx")
         filename, media_type, content = await service.export(format, severity, target)
         return Response(content=content, media_type=media_type, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    @router.get("/proxy/vulnerabilities/export-capabilities")
+    async def export_capabilities():
+        word_available = importlib.util.find_spec("docx") is not None
+        return {
+            "formats": {
+                "json": {"available": True},
+                "csv": {"available": True},
+                "pwndoc-docx": {
+                    "available": word_available,
+                    "reason": "" if word_available else "python-docx is not installed on the dashboard runtime",
+                },
+            }
+        }
 
     @router.get("/proxy/vulnerabilities/targets")
     async def targets():

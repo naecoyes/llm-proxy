@@ -4,14 +4,17 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scanScript.dual_engine_scan import (
+    _pipeline_live_targets,
     child_completed_successfully,
     inherit_parent_preflight,
     prepare_child_resume,
     report_summary,
     retest_classification,
 )
+from scanScript.probe_live_targets import ProbeResult
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -19,6 +22,74 @@ RUNNER = ROOT / "scanScript" / "dual_engine_scan.py"
 
 
 class DualEngineCoordinatorTests(unittest.TestCase):
+    def test_completed_preflight_is_reused_without_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            filtered = state_dir / "_preflight" / "dual.live.txt"
+            filtered.parent.mkdir()
+            filtered.write_text("example.ae\n", encoding="utf-8")
+            targets = root / "targets.txt"
+            targets.write_text("example.ae\n", encoding="utf-8")
+            job_path = root / "job.json"
+            job = {
+                "pipeline": {
+                    "preflight": {
+                        "status": "completed",
+                        "filtered_targets_file": str(filtered),
+                    },
+                    "preflight_progress": {"checked_targets": 1, "total_targets": 1},
+                },
+            }
+
+            with patch("scanScript.probe_live_targets.execute_probe") as execute:
+                selected = _pipeline_live_targets(job_path, job, targets, state_dir)
+
+            self.assertEqual(filtered, selected)
+            execute.assert_not_called()
+            self.assertIn("reused_at", job["pipeline"]["preflight"])
+
+    def test_preflight_progress_and_stable_artifact_paths_are_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            targets = root / "targets.txt"
+            targets.write_text("example.ae\n", encoding="utf-8")
+            job_path = root / "job.json"
+            job = {
+                "job_id": "dual-test",
+                "label": "dual-test",
+                "options": {"probe_live_before_queue": True, "use_socks5": False},
+            }
+
+            def fake_execute(*_args, **kwargs):
+                kwargs["progress_callback"]({
+                    "total_targets": 1,
+                    "checked_targets": 1,
+                    "alive_targets": 1,
+                    "dead_targets": 0,
+                    "inconclusive_targets": 0,
+                    "blocked_targets": 0,
+                    "progress_percent": 100.0,
+                })
+                output = Path(kwargs["output_dir"]) / "source.json"
+                output.write_text("{}", encoding="utf-8")
+                return {
+                    "results": [ProbeResult(host="example.ae", sources=["input"], alive=True, classification="alive")],
+                    "summary": {"alive": 1, "dead": 0, "inconclusive": 0, "blocked": 0},
+                    "paths": {"json": output},
+                }
+
+            with patch("scanScript.probe_live_targets.execute_probe", side_effect=fake_execute):
+                selected = _pipeline_live_targets(job_path, job, targets, state_dir)
+
+            self.assertEqual("example.ae\n", selected.read_text(encoding="utf-8"))
+            self.assertEqual(100.0, job["preflight_progress"]["progress_percent"])
+            self.assertEqual("completed", job["pipeline"]["preflight"]["status"])
+            self.assertTrue(job["preflight_resume_path"].endswith("preflight_results.jsonl"))
+            self.assertTrue(job["preflight_manifest_path"].endswith("preflight_manifest.json"))
     def test_second_stage_reuses_primary_filtered_targets(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -166,10 +166,19 @@ function dualStageTone(status) {
 
 function renderDualRunCard(job) {
   const children = Array.isArray(job.children) ? job.children : [];
+  const preflight = job.pipeline?.preflight || {};
+  const preflightProgress = job.preflight_progress || job.pipeline?.preflight_progress || preflight.progress || {};
+  const preflightStatus = String(preflight.status || "").toLowerCase();
+  const preflightRunning = preflightStatus === "running";
+  const preflightPercent = Math.max(0, Math.min(100, Number(preflightProgress.progress_percent || 0)));
+  const preflightChecked = Number(preflightProgress.checked_targets || 0);
+  const preflightTotal = Number(preflightProgress.total_targets || job.target_count || 0);
   const targetPreview = (job.targets_preview || []).slice(0, 2).map(compactTargetName).join(" · ") || "Target details pending";
   const runningChild = children.find((child) => ["running", "retrying"].includes(String(child.status || "").toLowerCase()));
   const current = runningChild || children.find((child) => !["completed", "success", "completed_with_errors", "failed", "terminated", "timeout"].includes(String(child.status || "").toLowerCase()));
-  const currentLabel = current ? `${current.engine === "strix" ? "Stage 1" : "Stage 2"}: ${current.engine === "strix" ? "Strix redteam" : "Chelmon-Claude default"}` : "Finalizing results";
+  const currentLabel = preflightRunning
+    ? `Preflight ${preflightPercent.toFixed(1)}%`
+    : current ? `${current.engine === "strix" ? "Stage 1" : "Stage 2"}: ${current.engine === "strix" ? "Strix redteam" : "Chelmon-Claude default"}` : "Finalizing results";
   const canTerminate = job.process_alive && !["completed", "completed_with_errors", "terminated", "dry_run_completed"].includes(job.status);
   const canResume = !job.process_alive && ["interrupted", "completed_with_errors"].includes(String(job.status || "").toLowerCase());
   const workerMeta = job.worker_unit
@@ -177,6 +186,7 @@ function renderDualRunCard(job) {
     : job.worker_mode ? ` · worker ${job.worker_mode}` : "";
   return `<article class="dual-run-card">
     <header class="dual-run-header"><div><div class="dual-run-title">${scanEngineBadge("dual")}<strong>${escapeHtml(job.label || job.job_id)}</strong>${badge(job.status || "running", job.process_alive ? "success" : "info")}</div><div class="dual-run-meta">${escapeHtml(job.job_id)} · ${formatNumber(job.target_count || 0)} target${Number(job.target_count || 0) === 1 ? "" : "s"} · ${escapeHtml(targetPreview)} · submitted ${formatDate(job.submitted_at)}${escapeHtml(workerMeta)}</div></div><div class="dual-run-actions">${badge(currentLabel, runningChild ? "success" : "info")}${canResume ? `<button class="button secondary small" type="button" data-dual-job-resume="${escapeHtml(job.job_id)}">Resume incomplete stages</button>` : ""}${canTerminate ? `<button class="button secondary small text-danger" type="button" data-dual-job-terminate="${escapeHtml(job.job_id)}">Terminate dual run</button>` : ""}</div></header>
+    ${preflightRunning || preflightStatus === "completed" ? `<div class="dual-preflight-progress"><div class="dual-preflight-summary"><strong>Preflight</strong><span>${formatNumber(preflightChecked)} / ${formatNumber(preflightTotal)} checked · ${formatNumber(preflightProgress.alive_targets || 0)} alive · ${formatNumber(preflightProgress.dead_targets || 0)} dead · ${formatNumber(preflightProgress.inconclusive_targets || 0)} inconclusive · ${formatNumber(preflightProgress.blocked_targets || 0)} blocked</span>${badge(preflightStatus || "pending", preflightStatus === "completed" ? "success" : "info")}</div>${progress(preflightPercent)}</div>` : ""}
     <div class="dual-stage-flow">${children.map((child, index) => {
       const isCurrent = child === current;
       const stageName = child.engine === "strix" ? "Strix" : "Chelmon-Claude";

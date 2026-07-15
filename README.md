@@ -362,6 +362,26 @@ unit/PID is recorded as `interrupted`; it is never inferred to be complete. `POS
 /proxy/smart-batch/jobs/{job_id}/resume` starts a new worker for only unfinished checkpointed stages. Completed
 stages and their reports remain intact.
 
+Parent preflight is resumable. During DNS/TLS/HTTP probing, each completed target is appended to
+`<job-state-dir>/_preflight/preflight_results.jsonl`; the worker updates `preflight_progress` in the job
+snapshot every two seconds or 25 completed targets. A completed run also writes the stable
+`preflight_manifest.json` and a filtered live-target file. Recovery reads the ledger and probes only unfinished
+targets. If the manifest and filtered file are already complete, the coordinator reuses them without repeating
+network requests.
+
+The Activity page shows preflight counters even when no LLM call exists yet. Scans presents preflight progress,
+effective scan progress, and the Dual engine stage separately. Opening `static/index.html` through `file://` is
+not a supported data source; the page links to the production dashboard instead of issuing silent relative API
+requests.
+
+PwnDoc-compatible Word export requires `python-docx`. The dashboard checks
+`GET /proxy/vulnerabilities/export-capabilities` and disables Word export with a reason when the runtime
+dependency is unavailable. Run the production contract suite with the project Python environment:
+
+```bash
+make test-nscan
+```
+
 Model routing uses a network circuit breaker: transient DNS/TCP/stream errors stay retryable for two events;
 the third opens a jittered cooldown. Quota, authentication, context-length and deterministic request errors
 remain separate classes. `GET /proxy/smart-batch/jobs/runtime-summary` is a lightweight worker-only status API
