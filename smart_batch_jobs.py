@@ -628,15 +628,15 @@ class SmartBatchJobManager:
             logger.warning("Smart Batch jobs SQLite read failed: %s", exc)
             stored = []
         if stored:
-            return {"generated_at": datetime.now(timezone.utc).isoformat(), "jobs": [self._refresh_job_state(job) for job in stored]}
+            jobs = [self._refresh_and_persist(job) for job in stored]
+            return {"generated_at": datetime.now(timezone.utc).isoformat(), "jobs": jobs}
         files = sorted(self.paths.job_dir.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
         jobs = []
         for path in files:
             job = self._read_job_file(path)
             if job:
-                self._persist_job(path, job)
                 if len(jobs) < max(1, min(int(limit or 50), 200)):
-                    jobs.append(self._refresh_job_state(job))
+                    jobs.append(self._refresh_and_persist(job))
         return {"generated_at": datetime.now(timezone.utc).isoformat(), "jobs": jobs}
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
@@ -649,9 +649,15 @@ class SmartBatchJobManager:
             job = None
         if not job:
             job = self._read_job_file(job_file)
-            if job:
-                self._persist_job(job_file, job)
-        return self._refresh_job_state(job) if job else None
+        return self._refresh_and_persist(job) if job else None
+
+    def _refresh_and_persist(self, job: dict[str, Any]) -> dict[str, Any]:
+        """Make reconciliation durable for both SQLite and JSON consumers."""
+        refreshed = self._refresh_job_state(job)
+        job_id = str(refreshed.get("job_id") or "")
+        if job_id:
+            self._persist_job(self.paths.job_dir / f"{safe_job_id(job_id)}.json", refreshed)
+        return refreshed
 
     def job_report(self, job_id: str) -> dict[str, Any]:
         job = self.get_job(job_id)
