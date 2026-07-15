@@ -58,6 +58,28 @@ function renderProcesses(requests) {
   return `<div class="process-list">${processes.slice(0, 12).map((row) => `<button class="process-row" type="button" data-process-scan="${escapeHtml(row.scan_id || "")}"><div class="process-main"><div class="process-title">${escapeHtml(row.scan_target || row.scan_id || row.proxy_slot || row.client_ip || "local")}</div><div class="process-meta">${modelIdentity({ name: row.actual_model || "awaiting model", model: row.actual_model || "", provider: row.provider || row.proxy_slot || "" }, { compact: true, secondary: `${escapeHtml(row.provider || row.proxy_slot || "-")} · PID ${escapeHtml(row.scan_pid || "-")}` })}</div></div>${badge(row.classified_status || "active")}</button>`).join("")}</div>`;
 }
 
+function activePipelineJobs(payload) {
+  const activeStatuses = new Set(["started", "running", "recovering", "network_backoff", "awaiting_model"]);
+  return (payload?.jobs || [])
+    .filter((job) => job.process_alive && activeStatuses.has(String(job.status || "").toLowerCase()))
+    .sort((a, b) => new Date(b.updated_at || 0).getTime() - new Date(a.updated_at || 0).getTime());
+}
+
+function renderPipelineActivity(payload) {
+  const jobs = activePipelineJobs(payload);
+  if (!jobs.length) return emptyState("No active scan pipelines");
+  return `<div class="process-list">${jobs.slice(0, 8).map((job) => {
+    const preflight = job.pipeline?.preflight || {};
+    const inPreflight = String(preflight.status || "").toLowerCase() === "running";
+    const label = inPreflight ? "preflight" : (job.recovery_state || job.status || "running");
+    const egress = preflight.container_egress;
+    const detail = inPreflight
+      ? `${formatNumber(job.target_count || 0)} targets · multi-proxy liveness${egress ? ` · egress ${egress.ok ? "ready" : "failed"}` : ""}`
+      : `${formatNumber(job.target_count || 0)} targets · worker ${job.worker_status || "active"}`;
+    return `<div class="process-row"><div class="process-main"><div class="process-title">${escapeHtml(job.label || job.name || job.job_name || job.job_id || "Scan pipeline")}</div><div class="process-meta">${escapeHtml(job.engine || "strix")} · ${escapeHtml(job.scan_mode || "standard")} · ${escapeHtml(detail)}</div></div>${badge(label)}</div>`;
+  }).join("")}</div>`;
+}
+
 function renderStalePanel(requests) {
   const rows = requests.filter((row) => row.classified_status === "stale_no_response" || row.classified_status === "orphan_request");
   if (!rows.length) return emptyState("No stale or orphan requests");
@@ -137,6 +159,7 @@ export function mountActivity(context) {
   const { root, setFreshness, setRefreshHandler } = context;
   root.innerHTML = skeleton(6);
   let logs = null;
+  let scanJobs = null;
   let trend = null;
   let chart = null;
   let trendLoadedAt = 0;
@@ -165,6 +188,7 @@ export function mountActivity(context) {
     const requests = joinedRequests(logs);
     const renderedRows = renderLogRows(requests, filters, page);
     root.innerHTML = `<div class="page-stack">
+      <section class="panel"><header class="panel-header"><div><h2>Scan pipeline activity</h2><p>Preflight, worker, and scheduling activity before LLM requests begin</p></div></header><div class="panel-body">${renderPipelineActivity(scanJobs)}</div></section>
       <div class="equal-grid activity-summary-grid"><section class="panel"><header class="panel-header"><div><h2>Active LLM calls</h2><p>Only requests currently awaiting a provider response, grouped by scan_id</p></div></header><div class="panel-body">${renderProcesses(requests)}</div></section><section class="panel"><header class="panel-header"><div><h2>Stale / orphan requests</h2><p>Requests with no response after ${Math.round(STALE_PENDING_MS / 60000)} min, or missing scan context</p></div></header><div class="panel-body">${renderStalePanel(requests)}</div></section></div>
       <section class="panel" id="usageTrendPanel"><header class="panel-header"><div><h2>Usage trend</h2><p>Token activity by provider or model · refreshed hourly</p></div><div class="panel-actions compact-controls"><select id="trendGranularity" aria-label="Trend range"><option value="4h" ${trendGranularity === "4h" ? "selected" : ""}>Hourly</option><option value="day" ${trendGranularity === "day" ? "selected" : ""}>30d</option></select><select id="trendGroupBy" aria-label="Trend grouping"><option value="provider" ${trendGroupBy === "provider" ? "selected" : ""}>Provider</option><option value="model" ${trendGroupBy === "model" ? "selected" : ""}>Model</option></select></div></header><div class="panel-body"><div class="chart-wrap">${window.Chart ? '<canvas id="activityTrendChart"></canvas>' : emptyState("Chart library unavailable")}</div></div></section>
       <section class="panel"><header class="panel-header"><div><h2>Request activity</h2><p>Joined request, response, and model-switch records, newest first</p></div><div class="panel-actions"><input id="activitySearch" type="search" placeholder="Request or error" value="${escapeHtml(filters.query)}"><input id="activityScan" type="search" placeholder="scan_id or target" value="${escapeHtml(filters.scan)}"><input id="activityModel" type="search" placeholder="Model or provider" value="${escapeHtml(filters.model)}"><select id="activityStatus"><option value="">All statuses</option>${["pending_active","stale_no_response","orphan_request","success","partial","failed","cancelled","interrupted","error"].map((value) => `<option value="${value}" ${filters.status === value ? "selected" : ""}>${value}</option>`).join("")}</select></div></header><div class="panel-body" id="activityLogTable">${renderedRows.html}</div></section>
@@ -200,11 +224,13 @@ export function mountActivity(context) {
 
   const load = async (signal) => {
     const shouldRefreshTrend = !trend || Date.now() - trendLoadedAt >= TREND_REFRESH_MS;
-    const [nextLogs, nextTrend] = await Promise.all([
+    const [nextLogs, nextTrend, nextScanJobs] = await Promise.all([
       api.logs(signal, { limit: 1000, days: 2, joined: true }),
       shouldRefreshTrend ? api.trend(signal, trendGranularity, "", trendGroupBy) : Promise.resolve(null),
+      api.smartBatchJobs(signal, 20).catch(() => scanJobs),
     ]);
     logs = nextLogs;
+    scanJobs = nextScanJobs;
     if (nextTrend) {
       trend = nextTrend;
       trendLoadedAt = Date.now();
