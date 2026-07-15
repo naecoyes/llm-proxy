@@ -926,14 +926,19 @@ class SmartBatchJobManager:
             if pid_fallback_alive and not worker["active"]:
                 job["worker_status"] = "active/pid-fallback"
                 job["worker_warning"] = "systemd user status unavailable; coordinator PID is alive"
-            if job.get("status") in {"started", "running", "dry_run_started"} and not job["process_alive"]:
+            if job.get("status") in {
+                "started", "running", "recovering", "dry_run_started",
+            } and not job["process_alive"]:
                 job["status"] = "interrupted"
                 job["recovery_state"] = "worker_exited"
         else:
             pid = job.get("pid")
             job["process_alive"] = pid_alive(pid)
-            if job.get("status") in {"started", "dry_run_started"} and not job["process_alive"]:
-                job["status"] = "process_exited"
+            if job.get("status") in {
+                "started", "running", "recovering", "dry_run_started",
+            } and not job["process_alive"]:
+                job["status"] = "interrupted"
+                job["recovery_state"] = "worker_exited"
         if job.get("engine") == "dual":
             job["completed_passes"] = int(job.get("completed_passes") or 0)
             job["total_passes"] = int(job.get("total_passes") or len(job.get("children") or []))

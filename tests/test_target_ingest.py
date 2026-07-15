@@ -145,6 +145,37 @@ class TargetIngestPolicyTests(unittest.TestCase):
             self.assertEqual(resumed["worker_unit"], "nscan-scan-dashboard-resume-test")
             self.assertEqual(resumed["recovery_state"], "resume_requested")
 
+    def test_legacy_running_job_with_dead_pid_is_interrupted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = SmartBatchPaths(
+                project_root=Path(__file__).resolve().parents[2],
+                state_dir=root / "state",
+                target_dir=root / "targets",
+                report_dir=root / "reports",
+                job_dir=root / "jobs",
+            )
+            paths.job_dir.mkdir(parents=True)
+            job_id = "legacy-running-dead-pid"
+            job_file = paths.job_dir / f"{job_id}.json"
+            job = {
+                "job_id": job_id,
+                "engine": "dual",
+                "status": "running",
+                "pid": 424242,
+                "job_file": str(job_file),
+                "children": [],
+            }
+            job_file.write_text(__import__("json").dumps(job), encoding="utf-8")
+            manager = SmartBatchJobManager(paths)
+
+            with patch("smart_batch_jobs.pid_alive", return_value=False):
+                refreshed = manager._refresh_job_state(job)
+
+            self.assertFalse(refreshed["process_alive"])
+            self.assertEqual(refreshed["status"], "interrupted")
+            self.assertEqual(refreshed["recovery_state"], "worker_exited")
+
     def test_scope_gate_only_accepts_high_confidence_official_suffixes(self):
         result = analyze_targets(
             ["example.ae", "portal.gov.ae", "brand.com"],

@@ -193,6 +193,7 @@ function renderActiveScans(current, selectedId, jobs, {
   runtimeDetailsOpen,
 } = {}) {
   const activeDualJobs = (jobs || []).filter((job) => job.engine === "dual"
+    && job.process_alive
     && !["completed", "completed_with_errors", "terminated", "dry_run_completed"].includes(job.status));
   // A dual parent card already represents its Strix and Chelmon child batches.
   // Do not render those children again in the ordinary batch list.
