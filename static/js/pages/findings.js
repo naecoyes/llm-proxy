@@ -155,8 +155,12 @@ function renderToolbar(summary, filters) {
   </div>`;
 }
 
-function renderTable(data, selected) {
+function renderTable(data, selected, filters) {
   if (!data.items?.length) return emptyState("No findings match these filters", "Adjust the filters or refresh the report index.");
+  const sortIndicator = (field) => {
+    if (filters.sort !== field) return "↕";
+    return filters.order === "desc" ? "↓" : "↑";
+  };
   const rows = data.items.map(item => `<tr data-record-id="${item.record_id}" class="finding-row ${item.state?.unread ? "is-unread" : ""}" tabindex="0" role="button" aria-label="Open finding ${escapeHtml(item.title)}">
     <td><input class="finding-select" type="checkbox" value="${item.record_id}" ${selected.has(item.record_id) ? "checked" : ""} aria-label="Select ${escapeHtml(item.title)}"></td>
     <td>${badge(item.severity, severityTone[item.severity])}${item.is_high_value ? `<span class="high-value-mark" title="High value">★</span>` : ""}</td>
@@ -166,7 +170,7 @@ function renderTable(data, selected) {
     <td><div class="finding-state-stack">${stateBadges(item)}${rowActions(item)}</div></td>
   </tr>`).join("");
   return `<div class="bulk-bar" ${selected.size ? "" : "hidden"}><strong>${selected.size} selected</strong><button class="button secondary small" data-bulk-action="read">Mark read</button><button class="button secondary small" data-bulk-action="verify">Verify</button><button class="button secondary small" data-bulk-action="archive">Archive</button></div>
-    <div class="table-scroll"><table class="data-table findings-table"><thead><tr><th><input id="findingsSelectPage" type="checkbox" aria-label="Select this page"></th><th>Severity</th><th>Target</th><th>Finding</th><th>CVSS / Found</th><th>State / Actions</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <div class="table-scroll"><table class="data-table findings-table"><thead><tr><th><input id="findingsSelectPage" type="checkbox" aria-label="Select this page"></th><th>Severity</th><th>Target</th><th>Finding</th><th><div class="finding-sort-head"><button class="table-sort" type="button" data-finding-sort="cvss" aria-label="Sort by CVSS" aria-pressed="${filters.sort === "cvss"}">CVSS ${sortIndicator("cvss")}</button><button class="table-sort" type="button" data-finding-sort="timestamp" aria-label="Sort by found time" aria-pressed="${filters.sort === "timestamp"}">Found ${sortIndicator("timestamp")}</button></div></th><th>State / Actions</th></tr></thead><tbody>${rows}</tbody></table></div>
     <div class="pagination-row"><button class="button secondary small" id="findingsPrevious" ${data.page <= 1 ? "disabled" : ""}>Previous</button><span>Page ${data.page} of ${data.pages} · ${fullNumber(data.total)} findings</span><button class="button secondary small" id="findingsNext" ${data.page >= data.pages ? "disabled" : ""}>Next</button></div>`;
 }
 
@@ -285,7 +289,7 @@ export function mountFindings({ root, setFreshness, setRefreshHandler, setTopbar
     root.innerHTML = `<div class="page-stack findings-page">${renderMetrics(summary)}
       ${summary.index_error ? `<div class="alert warning">Index refresh warning: ${escapeHtml(summary.index_error)}</div>` : ""}
       <div class="view-tabs" role="tablist"><button class="view-tab ${activeTab === "findings" ? "active" : ""}" data-findings-tab="findings">Findings</button><button class="view-tab ${activeTab === "marked" ? "active" : ""}" data-findings-tab="marked">Marked</button><button class="view-tab ${activeTab === "verified" ? "active" : ""}" data-findings-tab="verified">Verified</button><button class="view-tab ${activeTab === "targets" ? "active" : ""}" data-findings-tab="targets">Target Analysis</button><button class="view-tab ${activeTab === "reports" ? "active" : ""}" data-findings-tab="reports">Reports</button></div>
-      <div id="findingsTabContent">${activeTab === "findings" ? panel("Vulnerability findings", "Needs-review findings only; Verified and False positive findings are hidden", `${renderToolbar(summary, filters)}<div id="findingsTableRegion">${renderTable(data, selected)}</div>`, '<a class="button secondary small" href="#scans">Open scans</a>') : activeTab === "marked" ? panel("Marked findings", "Findings saved for focused review", `${renderToolbar(summary, filters)}<div id="findingsTableRegion">${renderTable(data, selected)}</div>`) : activeTab === "verified" ? panel("Verified findings", "Confirmed findings ordered by verification time, newest first", `${renderToolbar(summary, filters)}<div id="findingsTableRegion">${renderTable(data, selected)}</div>`) : activeTab === "targets" ? panel("Target analysis", "Finding counts grouped by target", renderTargets(targets)) : panel("Consolidated reports", "Existing Markdown reports referenced from the legacy report directory", renderReports(reports))}</div>
+      <div id="findingsTabContent">${activeTab === "findings" ? panel("Vulnerability findings", "Needs-review findings only; Verified and False positive findings are hidden", `${renderToolbar(summary, filters)}<div id="findingsTableRegion">${renderTable(data, selected, filters)}</div>`, '<a class="button secondary small" href="#scans">Open scans</a>') : activeTab === "marked" ? panel("Marked findings", "Findings saved for focused review", `${renderToolbar(summary, filters)}<div id="findingsTableRegion">${renderTable(data, selected, filters)}</div>`) : activeTab === "verified" ? panel("Verified findings", "Confirmed findings ordered by verification time, newest first", `${renderToolbar(summary, filters)}<div id="findingsTableRegion">${renderTable(data, selected, filters)}</div>`) : activeTab === "targets" ? panel("Target analysis", "Finding counts grouped by target", renderTargets(targets)) : panel("Consolidated reports", "Existing Markdown reports referenced from the legacy report directory", renderReports(reports))}</div>
     </div>`;
     bindEvents();
   }
@@ -634,6 +638,14 @@ export function mountFindings({ root, setFreshness, setRefreshHandler, setTopbar
       await loadList();
       render();
     });
+    root.querySelectorAll("[data-finding-sort]").forEach(button => button.addEventListener("click", async () => {
+      const sort = button.dataset.findingSort;
+      filters.order = filters.sort === sort && filters.order === "desc" ? "asc" : "desc";
+      filters.sort = sort;
+      filters.page = 1;
+      await loadList();
+      render();
+    }));
     root.querySelectorAll(".finding-row").forEach(row => {
       row.addEventListener("click", event => {
         if (event.target.closest("button, input, select, a")) return;

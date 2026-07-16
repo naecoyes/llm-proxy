@@ -1,11 +1,11 @@
-import { api } from "./api.js?v=20260710-scan-freshness-v1";
+import { api } from "./api.js?v=20260716-vision-contract-v1";
 import { closeDrawer, toast } from "./components.js?v=20260623-provider-ui";
 import { Router } from "./router.js";
 import { formatNumber, icon, relativeTime } from "./utils.js";
 import { mountOverview } from "./pages/overview.js?v=20260709-overview-trend-narrow";
 import { mountScans, mountScanHistory } from "./pages/scans.js?v=20260715-resumable-preflight-v1";
 import { mountAssets } from "./pages/assets.js?v=20260701-assets-history";
-import { mountFindings } from "./pages/findings.js?v=20260715-export-capability-v1";
+import { mountFindings } from "./pages/findings.js?v=20260716-finding-sort-v1";
 import { mountEgress } from "./pages/egress.js";
 import { mountModels } from "./pages/models.js?v=20260623-provider-ui";
 import { mountActivity } from "./pages/activity.js?v=20260716-billing-v1";

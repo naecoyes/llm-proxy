@@ -33,6 +33,7 @@ from model_manager import (
     NoAvailableModelError,
     default_reasoning_api,
     supports_native_reasoning,
+    supports_vision_assist,
 )
 from request_logger import (
     SCAN_CONTEXT_FIELD_HEADERS,
@@ -3099,6 +3100,41 @@ document.getElementById("f").addEventListener("submit",async e=>{
             "mode": mode,
         }
 
+    @app.get("/proxy/vision-assist")
+    async def get_vision_assist():
+        """Return the image-assist role without exposing credentials."""
+        selected = str((server.config.get("vision_assist") or {}).get("model") or "")
+        candidates = server.model_manager.get_vision_assist_candidates()
+        return {
+            "model": selected,
+            "available": any(
+                item["name"] == selected and item["healthy"] for item in candidates
+            ),
+            "candidates": candidates,
+        }
+
+    @app.put("/proxy/vision-assist")
+    async def set_vision_assist(request: Request):
+        """Persist an opt-in global default for image-only assistance."""
+        try:
+            body = await request.json()
+            requested = str(body.get("model") or "").strip()
+            if requested:
+                model = server.model_manager.models.get(requested)
+                if not model:
+                    raise ValueError("Vision assist model was not found")
+                if not model.vision_supported or not model.vision_assist_enabled:
+                    raise ValueError(
+                        "Model must have Vision capability and Vision assist enabled"
+                    )
+            updated = copy.deepcopy(server.config)
+            updated.setdefault("vision_assist", {})["model"] = requested
+            server._save_config(updated, create_backup=True)
+            server._apply_runtime_config(updated)
+            return {"model": requested, "message": "Vision assist default updated"}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/proxy/models/add")
     async def add_model(request: Request):
         """添加新模型"""
@@ -3153,6 +3189,17 @@ document.getElementById("f").addEventListener("submit",async e=>{
                     )
                 ),
                 "reasoning_effort": str(body.get("reasoning_effort") or "high").lower(),
+                "vision_supported": bool(
+                    body.get(
+                        "vision_supported",
+                        supports_vision_assist(
+                            str(body.get("provider") or ""), body.get("model", "")
+                        ),
+                    )
+                ),
+                "vision_assist_enabled": bool(
+                    body.get("vision_assist_enabled", False)
+                ),
             }
 
             limits = server.config.setdefault("usage", {}).setdefault(
@@ -3216,6 +3263,8 @@ document.getElementById("f").addEventListener("submit",async e=>{
                 "reasoning_effort",
                 "reasoning_supported",
                 "reasoning_api",
+                "vision_supported",
+                "vision_assist_enabled",
                 "enabled",
                 "free",
                 "peak_only",
@@ -3335,6 +3384,8 @@ document.getElementById("f").addEventListener("submit",async e=>{
             "reasoning_api": config.reasoning_api,
             "thinking_enabled": config.thinking_enabled,
             "reasoning_effort": config.reasoning_effort,
+            "vision_supported": config.vision_supported,
+            "vision_assist_enabled": config.vision_assist_enabled,
             "reasoning_capability": server.get_openrouter_reasoning_status()
             .get("models", {})
             .get(model_name, {}),

@@ -36,6 +36,8 @@ export const api = {
   summary: (signal, includeTelemetry = true) => request(`/proxy/dashboard/summary?include_telemetry=${includeTelemetry}`, { signal }),
   badges: (signal) => request("/proxy/dashboard/badges", { signal }),
   status: (signal, scanMode = "redteam") => request(`/proxy/status${scanMode ? `?scan_mode=${encodeURIComponent(scanMode)}` : ""}`, { signal }),
+  visionAssist: (signal) => request("/proxy/vision-assist", { signal }),
+  setVisionAssist: (model) => request("/proxy/vision-assist", { method: "PUT", ...jsonBody({ model }) }),
   resources: (signal) => request("/proxy/system/resources", { signal }),
   egressUsage: (signal) => request("/proxy/egress/usage", { signal }),
   batches: (signal, limit = 20, options = {}) => request(`/proxy/smart-batch/status?${new URLSearchParams({

@@ -31,6 +31,13 @@ def supports_native_reasoning(provider: str, model: str) -> bool:
     return normalized_model.removeprefix("openrouter/") == "tencent/hy3:free"
 
 
+def supports_vision_assist(provider: str, model: str) -> bool:
+    """Return known image-input support without guessing for every model."""
+    normalized_provider = str(provider or "").strip().lower()
+    normalized_model = str(model or "").strip().lower().removeprefix("openrouter/")
+    return normalized_provider == "openrouter" and normalized_model == "tencent/hy3:free"
+
+
 def default_reasoning_api(provider: str, model: str, supported: bool) -> str:
     """Select the request contract for a model that has native reasoning."""
     if not supported:
@@ -70,6 +77,8 @@ class ModelConfig:
     reasoning_api: str = "none"
     thinking_enabled: bool = False
     reasoning_effort: str = "high"
+    vision_supported: bool = False
+    vision_assist_enabled: bool = False
 
 
 class NoAvailableModelError(Exception):
@@ -136,6 +145,12 @@ class ModelManager:
                 if configured_support is not None
                 else supports_native_reasoning(provider, model_conf.get("model", ""))
             )
+            configured_vision = model_conf.get("vision_supported")
+            vision_supported = (
+                bool(configured_vision)
+                if configured_vision is not None
+                else supports_vision_assist(provider, model_conf.get("model", ""))
+            )
 
             model = ModelConfig(
                 name=name,
@@ -177,6 +192,10 @@ class ModelManager:
                     )
                 ),
                 reasoning_effort=str(model_conf.get("reasoning_effort") or "high").lower(),
+                vision_supported=vision_supported,
+                vision_assist_enabled=bool(
+                    model_conf.get("vision_assist_enabled", False)
+                ),
             )
 
             self.models[name] = model
@@ -266,6 +285,14 @@ class ModelManager:
                 "health_reason": health_reason,
                 "health_next_probe_at": health_next_probe_at,
             }
+        if model.vision_assist_enabled and not bool(
+            (routing_context or {}).get("vision_assist")
+        ):
+            return {
+                "eligible": False,
+                "reason": "vision_assist_only",
+                "vision_supported": model.vision_supported,
+            }
         if not self.health_checker.is_healthy(model_name):
             circuit_state = health_state.circuit_state if health_state else ""
             return {
@@ -289,16 +316,17 @@ class ModelManager:
                 "health_reason": health_reason,
             }
 
+        is_vision_assist = bool((routing_context or {}).get("vision_assist"))
         scan_mode = str((routing_context or {}).get("scan_mode") or "").lower()
         allowed_modes = [str(mode).lower() for mode in model.allowed_scan_modes]
-        if model.routing_tier == "reserve" and not scan_mode:
+        if model.routing_tier == "reserve" and not scan_mode and not is_vision_assist:
             return {
                 "eligible": False,
                 "reason": "scan_mode_required",
                 "scan_mode": scan_mode,
                 "allowed_scan_modes": allowed_modes,
             }
-        if allowed_modes and scan_mode not in allowed_modes:
+        if allowed_modes and scan_mode not in allowed_modes and not is_vision_assist:
             reason = "scan_mode_not_allowed" if scan_mode else "scan_mode_required"
             return {
                 "eligible": False,
@@ -368,6 +396,54 @@ class ModelManager:
             for name in model_names
             if self.get_model_routing_status(name, routing_context)["eligible"]
         ]
+
+    def get_vision_assist_candidates(self) -> list[dict[str, Any]]:
+        """Return dedicated image assistants available to the dashboard."""
+        candidates: list[dict[str, Any]] = []
+        for name, model in self.models.items():
+            if not model.vision_supported or not model.vision_assist_enabled:
+                continue
+            health = self.health_checker.health_state.get(name)
+            enabled = model.enabled and name not in self.disabled_models
+            healthy = enabled and self.health_checker.is_healthy(name)
+            candidates.append(
+                {
+                    "name": name,
+                    "model": model.model,
+                    "provider": model.provider,
+                    "enabled": enabled,
+                    "healthy": healthy,
+                    "reason": "" if healthy else (health.reason if health else "disabled"),
+                }
+            )
+        return sorted(candidates, key=lambda item: item["name"])
+
+    def select_vision_assist_model(
+        self, requested_model: str
+    ) -> tuple[str, ModelConfig]:
+        """Reserve one configured image assistant without automatic fallback."""
+        with self._select_lock:
+            model = self.models.get(requested_model)
+            if not model:
+                raise NoAvailableModelError(
+                    "Configured vision assist model was not found"
+                )
+            if not model.vision_supported or not model.vision_assist_enabled:
+                raise NoAvailableModelError(
+                    "Configured vision assist model is not enabled"
+                )
+            status = self.get_model_routing_status(
+                requested_model, {"vision_assist": True}
+            )
+            if not status.get("eligible"):
+                raise NoAvailableModelError(
+                    f"Vision assist model unavailable: {status.get('reason', 'unknown')}"
+                )
+            if not self.usage_controller.acquire_model(requested_model):
+                raise NoAvailableModelError(
+                    "Vision assist model concurrency is full"
+                )
+            return requested_model, model
 
     def _get_provider_models(self, provider: str) -> List[str]:
         """获取指定 provider 的所有模型名称"""
@@ -1199,6 +1275,8 @@ class ModelManager:
                 "max_context_tokens": model.max_context_tokens,
                 "reasoning_supported": model.reasoning_supported,
                 "reasoning_api": model.reasoning_api,
+                "vision_supported": model.vision_supported,
+                "vision_assist_enabled": model.vision_assist_enabled,
                 "thinking_enabled": model.thinking_enabled,
                 "reasoning_effort": model.reasoning_effort,
                 "request_overrides": self.config.get("models", {})
