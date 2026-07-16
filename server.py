@@ -2938,7 +2938,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
-    @app.post("/proxy/models/{model_name}/schedule-re-enable")
+    @app.post("/proxy/models/{model_name:path}/schedule-re-enable")
     async def schedule_model_re_enable(model_name: str, request: Request):
         """设置模型定时重新启用
 
@@ -3233,7 +3233,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
-    @app.put("/proxy/models/{model_name}")
+    @app.put("/proxy/models/{model_name:path}")
     async def update_model(model_name: str, request: Request):
         """更新模型配置"""
         if model_name not in server.model_manager.models:
@@ -3309,7 +3309,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
 
-    @app.delete("/proxy/models/{model_name}")
+    @app.delete("/proxy/models/{model_name:path}")
     async def delete_model(model_name: str):
         """删除模型"""
         if model_name not in server.model_manager.models:
@@ -3342,7 +3342,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
         """Refresh OpenRouter reasoning metadata for configured models."""
         return await server.refresh_openrouter_reasoning_capabilities(force=True)
 
-    @app.post("/proxy/models/{model_name}/reset")
+    @app.post("/proxy/models/{model_name:path}/reset")
     async def reset_model(model_name: str):
         """重置模型健康状态"""
         if model_name not in server.model_manager.models:
@@ -3353,7 +3353,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
         server.model_manager.reset_model_health(model_name)
         return {"message": f"Model {model_name} health reset"}
 
-    @app.get("/proxy/models/{model_name}")
+    @app.get("/proxy/models/{model_name:path}")
     async def get_model(model_name: str):
         """获取模型详情"""
         if model_name not in server.model_manager.models:
