@@ -130,27 +130,79 @@ function renderLogRows(requests, filters, page) {
   const pages = Math.max(1, Math.ceil(filtered.length / pageSize));
   const safePage = Math.min(page, pages);
   const rows = filtered.slice((safePage - 1) * pageSize, safePage * pageSize);
-  const table = rows.length ? `<div class="table-scroll"><table class="data-table"><thead><tr><th>Time</th><th>scan_id / target</th><th>Model / provider</th><th>Status</th><th>Duration</th><th>Tokens</th><th>Switches</th><th>Error / fallback</th></tr></thead><tbody>${rows.map((row) => `
+  const scanExecution = (row) => [row.scan_engine, row.scan_mode, row.workflow_mode].filter(Boolean).join(" · ") || "-";
+  const reasoningLabel = (row) => row.reasoning_enabled
+    ? `Thinking ${row.reasoning_effort || "high"}`
+    : "";
+  const inputTokens = (row) => {
+    const usage = row.usage || {};
+    const input = usage.prompt_tokens ?? usage.input_tokens;
+    const cached = usage.cached_input_tokens;
+    if (input == null) return "-";
+    return `${formatNumber(input || 0)}${cached == null ? "" : `<div class="cell-secondary">Cache hit ${formatNumber(cached)}</div>`}`;
+  };
+  const outputTokens = (row) => {
+    const usage = row.usage || {};
+    const output = usage.completion_tokens ?? usage.output_tokens;
+    return output == null ? "-" : formatNumber(output || 0);
+  };
+  const requestCost = (row) => {
+    const usage = row.usage || {};
+    if (usage.estimated_cost_cny != null) {
+      const period = usage.pricing_period === "peak" ? "BJT peak" : "BJT off-peak";
+      return `<div>¥${Number(usage.estimated_cost_cny).toFixed(4)}</div><div class="cell-secondary">${period}</div>`;
+    }
+    if (usage.cost != null) return `$${Number(usage.cost || 0).toFixed(4)}`;
+    return "-";
+  };
+  const fallbackOutcome = (row) => {
+    const switches = row.model_switches || [];
+    const latest = switches[switches.length - 1];
+    if (["success", "partial"].includes(row.status) && latest) {
+      const destination = latest.to_model || row.actual_model || "fallback model";
+      return `${badge("Recovered", "success")}<div class="cell-secondary break-anywhere">via ${escapeHtml(destination)} after ${escapeHtml(latest.reason || "provider retry")}</div>`;
+    }
+    if (row.error) return `<span class="break-anywhere">${escapeHtml(String(row.error).slice(0, 120))}</span>`;
+    if (latest) return `<span class="break-anywhere">${escapeHtml(`Fallback: ${latest.reason || "provider retry"}`.slice(0, 120))}</span>`;
+    return "-";
+  };
+  const table = rows.length ? `<div class="table-scroll"><table class="data-table"><thead><tr><th>Time</th><th>scan_id / target</th><th>Model / provider</th><th>Engine / mode</th><th>Status</th><th>Duration</th><th>Input</th><th>Output</th><th>Total Cost</th><th>Switches</th><th>Outcome / fallback</th></tr></thead><tbody>${rows.map((row) => `
     <tr><td>${formatDate(displayTimestamp(row), { seconds: true })}</td><td><button class="button ghost small" type="button" data-log-scan="${escapeHtml(row.scan_id || "")}">${escapeHtml(row.scan_target || row.scan_id || "-")}</button><div class="cell-secondary mono">${escapeHtml(row.scan_id || row.request_id || "-")}</div></td>
-    <td>${modelIdentity({ name: row.actual_model || "-", model: row.actual_model || "", provider: row.provider || row.proxy_slot || "" }, { compact: true, secondary: escapeHtml(row.provider || row.proxy_slot || "-") })}</td><td>${badge(row.classified_status || row.status || "pending")}</td><td>${row.duration_seconds == null ? "-" : formatDuration(row.duration_seconds)}</td><td>${formatNumber(row.usage?.total_tokens || 0)}</td><td>${row.model_switches?.length || 0}</td><td class="break-anywhere">${escapeHtml((row.error || (row.model_switches?.[0]?.reason) || "-").slice(0, 120))}</td></tr>`).join("")}</tbody></table></div>` : emptyState("No matching requests");
+    <td>${modelIdentity({ name: row.actual_model || "-", model: row.actual_model || "", provider: row.provider || row.proxy_slot || "" }, { compact: true, secondary: escapeHtml([row.provider || row.proxy_slot || "-", reasoningLabel(row)].filter(Boolean).join(" · ")) })}</td><td><span class="cell-secondary">${escapeHtml(scanExecution(row))}</span></td><td>${badge(row.classified_status || row.status || "pending")}</td><td>${row.duration_seconds == null ? "-" : formatDuration(row.duration_seconds)}</td><td>${inputTokens(row)}</td><td>${outputTokens(row)}</td><td>${requestCost(row)}</td><td>${row.model_switches?.length || 0}</td><td>${fallbackOutcome(row)}</td></tr>`).join("")}</tbody></table></div>` : emptyState("No matching requests");
   return { html: `${table}<div class="toolbar" style="justify-content:flex-end;margin-top:12px"><button class="button secondary small" id="prevLogPage" ${safePage <= 1 ? "disabled" : ""}>Previous</button><span class="muted">Page ${safePage} of ${pages} · ${filtered.length} requests</span><button class="button secondary small" id="nextLogPage" ${safePage >= pages ? "disabled" : ""}>Next</button></div>`, pages, safePage };
 }
 
-function drawTrend(trend, existing) {
+function drawTrend(trend, existing, groupBy = "provider") {
   existing?.destroy();
   if (!window.Chart || !trend?.labels?.length) return null;
   const canvas = document.getElementById("activityTrendChart");
   if (!canvas) return null;
   const colors = ["#2563eb", "#067647", "#b54708", "#7f56d9", "#0e7090", "#c11574"];
+  const billing = trend.billing || {};
+  const billingView = groupBy === "billing";
+  const datasets = billingView
+    ? [
+      { label: "Input", data: billing.input_tokens || [], borderColor: "#2563eb", backgroundColor: "transparent", borderWidth: 2, pointRadius: 2, tension: .25, yAxisID: "tokens" },
+      { label: "Output", data: billing.output_tokens || [], borderColor: "#16a34a", backgroundColor: "transparent", borderWidth: 2, pointRadius: 2, tension: .25, yAxisID: "tokens" },
+      { label: "Cache hit", data: billing.cached_input_tokens || [], borderColor: "#8b5cf6", backgroundColor: "rgba(139,92,246,.08)", borderWidth: 2, pointRadius: 2, tension: .25, yAxisID: "tokens", fill: true },
+      { label: "Cost (USD)", data: billing.cost_usd || [], borderColor: "#f79009", backgroundColor: "transparent", borderWidth: 2, borderDash: [4, 3], pointRadius: 2, tension: .25, yAxisID: "costUsd" },
+      { label: "Cost (CNY)", data: billing.cost_cny || [], borderColor: "#f04438", backgroundColor: "transparent", borderWidth: 2, borderDash: [6, 4], pointRadius: 2, tension: .25, yAxisID: "costCny" },
+    ]
+    : (trend.datasets || []).map((dataset, index) => ({ label: dataset.model, data: dataset.tokens, borderColor: colors[index % colors.length], backgroundColor: "transparent", borderWidth: 2, pointRadius: 2, tension: .25 }));
   return new window.Chart(canvas, {
     type: "line",
-    data: { labels: trend.labels, datasets: (trend.datasets || []).map((dataset, index) => ({ label: dataset.model, data: dataset.tokens, borderColor: colors[index % colors.length], backgroundColor: "transparent", borderWidth: 2, pointRadius: 2, tension: .25 })) },
+    data: { labels: trend.labels, datasets },
     options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: "bottom", labels: { boxWidth: 10, usePointStyle: true } }, tooltip: { callbacks: { afterLabel: (context) => {
       const members = context.dataset.models || [];
       if (!members.length || members.length === 1) return "";
       const shown = members.slice(0, 6).join(", ");
       return `Models: ${shown}${members.length > 6 ? ` +${members.length - 6} more` : ""}`;
-    } } } }, scales: { x: { grid: { display: false } }, y: { beginAtZero: true, ticks: { callback: (value) => formatNumber(value, 0) } } } },
+    } } } }, scales: billingView ? {
+      x: { grid: { display: false } },
+      tokens: { position: "left", beginAtZero: true, ticks: { callback: (value) => formatNumber(value, 0) } },
+      costUsd: { position: "right", beginAtZero: true, grid: { drawOnChartArea: false }, ticks: { callback: (value) => `$${Number(value).toFixed(2)}` } },
+      costCny: { position: "right", display: false, beginAtZero: true, grid: { drawOnChartArea: false } },
+    } : { x: { grid: { display: false } }, y: { beginAtZero: true, ticks: { callback: (value) => formatNumber(value, 0) } } } },
   });
 }
 
@@ -169,7 +221,7 @@ export function mountActivity(context) {
   let trendLoadedAt = 0;
   let page = 1;
   let trendGranularity = "4h";
-  let trendGroupBy = "provider";
+  let trendGroupBy = "billing";
   const filters = { query: "", status: "", model: "", scan: "" };
 
   const renderTable = () => {
@@ -194,13 +246,13 @@ export function mountActivity(context) {
     root.innerHTML = `<div class="page-stack">
       <section class="panel"><header class="panel-header"><div><h2>Scan pipeline activity</h2><p>Preflight, worker, and scheduling activity before LLM requests begin</p></div></header><div class="panel-body">${renderPipelineActivity(scanJobs)}</div></section>
       <div class="equal-grid activity-summary-grid"><section class="panel"><header class="panel-header"><div><h2>Active LLM calls</h2><p>Only requests currently awaiting a provider response, grouped by scan_id</p></div></header><div class="panel-body">${renderProcesses(requests)}</div></section><section class="panel"><header class="panel-header"><div><h2>Stale / orphan requests</h2><p>Requests with no response after ${Math.round(STALE_PENDING_MS / 60000)} min, or missing scan context</p></div></header><div class="panel-body">${renderStalePanel(requests)}</div></section></div>
-      <section class="panel" id="usageTrendPanel"><header class="panel-header"><div><h2>Usage trend</h2><p>Token activity by provider or model · refreshed hourly</p></div><div class="panel-actions compact-controls"><select id="trendGranularity" aria-label="Trend range"><option value="4h" ${trendGranularity === "4h" ? "selected" : ""}>Hourly</option><option value="day" ${trendGranularity === "day" ? "selected" : ""}>30d</option></select><select id="trendGroupBy" aria-label="Trend grouping"><option value="provider" ${trendGroupBy === "provider" ? "selected" : ""}>Provider</option><option value="model" ${trendGroupBy === "model" ? "selected" : ""}>Model</option></select></div></header><div class="panel-body"><div class="chart-wrap">${window.Chart ? '<canvas id="activityTrendChart"></canvas>' : emptyState("Chart library unavailable")}</div></div></section>
+      <section class="panel" id="usageTrendPanel"><header class="panel-header"><div><h2>Usage trend</h2><p>${trendGroupBy === "billing" ? "Input, output, cache hit, and request cost · refreshed hourly" : "Token activity by provider or model · refreshed hourly"}</p></div><div class="panel-actions compact-controls"><select id="trendGranularity" aria-label="Trend range"><option value="4h" ${trendGranularity === "4h" ? "selected" : ""}>Hourly</option><option value="day" ${trendGranularity === "day" ? "selected" : ""}>30d</option></select><select id="trendGroupBy" aria-label="Trend grouping"><option value="billing" ${trendGroupBy === "billing" ? "selected" : ""}>Billing</option><option value="provider" ${trendGroupBy === "provider" ? "selected" : ""}>Provider</option><option value="model" ${trendGroupBy === "model" ? "selected" : ""}>Model</option></select></div></header><div class="panel-body"><div class="chart-wrap">${window.Chart ? '<canvas id="activityTrendChart"></canvas>' : emptyState("Chart library unavailable")}</div></div></section>
       <section class="panel"><header class="panel-header"><div><h2>Request activity</h2><p>Joined request, response, and model-switch records, newest first</p></div><div class="panel-actions"><input id="activitySearch" type="search" placeholder="Request or error" value="${escapeHtml(filters.query)}"><input id="activityScan" type="search" placeholder="scan_id or target" value="${escapeHtml(filters.scan)}"><input id="activityModel" type="search" placeholder="Model or provider" value="${escapeHtml(filters.model)}"><select id="activityStatus"><option value="">All statuses</option>${["pending_active","stale_no_response","orphan_request","success","partial","failed","cancelled","interrupted","error"].map((value) => `<option value="${value}" ${filters.status === value ? "selected" : ""}>${value}</option>`).join("")}</select></div></header><div class="panel-body" id="activityLogTable">${renderedRows.html}</div></section>
     </div>`;
     if (preservedTrendPanel) {
       root.querySelector("#usageTrendPanel")?.replaceWith(preservedTrendPanel);
     } else {
-      chart = drawTrend(trend, chart);
+      chart = drawTrend(trend, chart, trendGroupBy);
     }
     bind();
   };

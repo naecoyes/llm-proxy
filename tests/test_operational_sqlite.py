@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from asset_database import AssetDatabase
@@ -70,6 +71,43 @@ class OperationalSQLiteTests(unittest.TestCase):
         hourly = self.db.hourly_response_usage(usage_date="2026-07-01")
         self.assertEqual(hourly["11"]["model-a"]["requests"], 1)
         self.assertEqual(hourly["11"]["model-a"]["tokens"], 100)
+
+    def test_response_billing_trend_preserves_token_split_and_costs(self):
+        hour = datetime.now().astimezone().hour
+        timestamp = datetime.now().astimezone().replace(minute=15, second=0, microsecond=0).isoformat()
+        self.db.record_llm_event({
+            "type": "request", "timestamp": timestamp, "request_id": "billing-1",
+            "actual_model": "model-a", "provider": "provider-a",
+        })
+        self.db.record_llm_event({
+            "type": "response", "timestamp": timestamp, "request_id": "billing-1",
+            "model_name": "model-a", "status": "success",
+            "usage": {
+                "prompt_tokens": 800,
+                "completion_tokens": 200,
+                "cached_input_tokens": 500,
+                "total_tokens": 1000,
+                "cost": 0.1234,
+                "estimated_cost_cny": 0.4567,
+                "pricing_period": "peak",
+            },
+        })
+
+        trend = self.db.response_billing_trend(labels=[str(hour)], granularity="4h")
+        self.assertEqual(trend["input_tokens"], [800])
+        self.assertEqual(trend["output_tokens"], [200])
+        self.assertEqual(trend["cached_input_tokens"], [500])
+        self.assertEqual(trend["cost_usd"], [0.1234])
+        self.assertEqual(trend["cost_cny"], [0.4567])
+
+        events = self.db.read_llm_events(
+            start_date=timestamp[:10], end_date=timestamp[:10], limit=10
+        )
+        usage = next(event["usage"] for event in events if event["type"] == "response")
+        self.assertEqual(usage["prompt_tokens"], 800)
+        self.assertEqual(usage["completion_tokens"], 200)
+        self.assertEqual(usage["cached_input_tokens"], 500)
+        self.assertEqual(usage["estimated_cost_cny"], 0.4567)
 
     def test_full_smart_batch_and_job_snapshots_are_persisted(self):
         batch = {

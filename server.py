@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, List, Optional, Set
+from zoneinfo import ZoneInfo
 
 import httpx
 import yaml
@@ -478,6 +479,68 @@ def classify_stream_completion(
     else:
         error = stream_error or "Empty upstream response"
     return status, error
+
+
+def _cached_input_tokens(usage: dict[str, Any] | None) -> int:
+    """Extract explicit upstream cache-read tokens; never estimate cache usage."""
+    payload = usage or {}
+    details = payload.get("prompt_tokens_details") or payload.get("input_tokens_details") or {}
+    for value in (
+        payload.get("cached_input_tokens"),
+        payload.get("cache_read_input_tokens"),
+        details.get("cached_tokens") if isinstance(details, dict) else None,
+    ):
+        try:
+            if value is not None:
+                return max(0, int(value))
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _deepseek_v4_pro_cost_cny(model_config: Any, usage: dict[str, Any]) -> dict[str, Any]:
+    """Calculate DeepSeek V4 Pro marginal cost using its BJT time bands."""
+    provider = str(getattr(model_config, "provider", "") or "").lower()
+    model = str(getattr(model_config, "model", "") or "").lower()
+    if provider != "deepseek" or "deepseek-v4-pro" not in model:
+        return {}
+    now_bjt = datetime.now(ZoneInfo("Asia/Shanghai"))
+    is_peak = (9 <= now_bjt.hour < 12) or (14 <= now_bjt.hour < 18)
+    cache_hit_rate, cache_miss_rate, output_rate = (
+        (0.05, 6.0, 12.0) if is_peak else (0.025, 3.0, 6.0)
+    )
+    prompt = max(0, int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0))
+    cached = min(prompt, _cached_input_tokens(usage))
+    output = max(0, int(usage.get("completion_tokens") or usage.get("output_tokens") or 0))
+    amount = (
+        (cached * cache_hit_rate)
+        + ((prompt - cached) * cache_miss_rate)
+        + (output * output_rate)
+    ) / 1_000_000
+    return {
+        "estimated_cost_cny": round(amount, 8),
+        "pricing_period": "peak" if is_peak else "off_peak",
+    }
+
+
+def _usage_with_billing(server: Any, model_name: str, model_config: Any, usage: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize provider usage and attach per-request configured pricing."""
+    payload = dict(usage or {})
+    prompt = int(payload.get("prompt_tokens") or payload.get("input_tokens") or 0)
+    completion = int(payload.get("completion_tokens") or payload.get("output_tokens") or 0)
+    payload["prompt_tokens"] = prompt
+    payload["completion_tokens"] = completion
+    payload["total_tokens"] = int(payload.get("total_tokens") or (prompt + completion))
+    payload["cached_input_tokens"] = _cached_input_tokens(payload)
+    if payload.get("cost") is None:
+        payload["cost"] = round(
+            server.model_manager.usage_controller.estimate_cost(
+                model_name, prompt, completion
+            ),
+            8,
+        )
+    payload.update(_deepseek_v4_pro_cost_cny(model_config, payload))
+    return payload
 
 
 _DEEPSEEK_REASONING_EFFORTS = {
@@ -2116,6 +2179,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
                         total_tokens = 0
                         input_tokens = 0
                         output_tokens = 0
+                        cached_input_tokens = 0
                         model_switched = False
                         valid_chunk_count = 0
                         finish_reason_stop = False
@@ -2163,6 +2227,7 @@ document.getElementById("f").addEventListener("submit",async e=>{
                                     total_tokens = usage.get("total_tokens", 0)
                                     input_tokens = usage.get("prompt_tokens", 0)
                                     output_tokens = usage.get("completion_tokens", 0)
+                                    cached_input_tokens = _cached_input_tokens(usage)
                                     final_usage = usage
                                 if stream_diag.get("finish_reason") in ("stop", "length"):
                                     finish_reason_stop = True
@@ -2242,16 +2307,24 @@ document.getElementById("f").addEventListener("submit",async e=>{
                         )
 
                         # 记录请求完成
+                        logged_usage = _usage_with_billing(
+                            server,
+                            model_name,
+                            model_config,
+                            {
+                                **final_usage,
+                                "total_tokens": total_tokens,
+                                "prompt_tokens": input_tokens,
+                                "completion_tokens": output_tokens,
+                                "cached_input_tokens": cached_input_tokens,
+                            },
+                        )
                         request_logger.log_response(
                             request_id=request_id,
                             model_name=model_name,
                             duration=duration,
                             status=status,
-                            usage={
-                                "total_tokens": total_tokens,
-                                "prompt_tokens": input_tokens,
-                                "completion_tokens": output_tokens,
-                            },
+                            usage=logged_usage,
                             error=final_error,
                             scan_context=scan_context,
                         )
@@ -2292,7 +2365,9 @@ document.getElementById("f").addEventListener("submit",async e=>{
                                     msg.pop("reasoning_content", None)
 
                     duration = time.time() - start_time
-                    usage = response_data.get("usage", {})
+                    usage = _usage_with_billing(
+                        server, model_name, model_config, response_data.get("usage", {})
+                    )
                     server.model_manager.record_usage(model_name, usage)
                     server.model_manager.handle_success(model_name)
 
@@ -2413,24 +2488,45 @@ document.getElementById("f").addEventListener("submit",async e=>{
             model: 模型名称，可选
             group_by: "provider" 或 "model"
         """
-        safe_group_by = group_by if group_by in {"provider", "model"} else "provider"
+        safe_group_by = group_by if group_by in {"provider", "model", "billing"} else "provider"
+        trend_group_by = "provider" if safe_group_by == "billing" else safe_group_by
         if granularity == "day":
             # Historical trend is database-first. JSON usage files remain a
             # recovery/export copy, but no longer decide dashboard history.
             history = await asyncio.to_thread(get_asset_database().usage_history, days=30)
             if history:
-                return server.model_manager.usage_controller.daily_trend_from_history(
-                    history, model, safe_group_by,
+                trend = server.model_manager.usage_controller.daily_trend_from_history(
+                    history, model, trend_group_by,
                 )
+                trend["billing"] = await asyncio.to_thread(
+                    get_asset_database().response_billing_trend,
+                    labels=trend.get("labels") or [],
+                    granularity="day",
+                )
+                return trend
         else:
             # The response ledger is durable per request and therefore cannot
             # lose the current hour during a proxy restart.
             hourly = await asyncio.to_thread(get_asset_database().hourly_response_usage)
             if hourly:
-                return server.model_manager.usage_controller.hourly_trend_from_history(
-                    hourly, model, safe_group_by,
+                trend = server.model_manager.usage_controller.hourly_trend_from_history(
+                    hourly, model, trend_group_by,
                 )
-        return server.model_manager.usage_controller.get_trend_data(granularity, model, safe_group_by)
+                trend["billing"] = await asyncio.to_thread(
+                    get_asset_database().response_billing_trend,
+                    labels=trend.get("labels") or [],
+                    granularity="4h",
+                )
+                return trend
+        trend = server.model_manager.usage_controller.get_trend_data(
+            granularity, model, trend_group_by
+        )
+        trend["billing"] = await asyncio.to_thread(
+            get_asset_database().response_billing_trend,
+            labels=trend.get("labels") or [],
+            granularity=granularity,
+        )
+        return trend
 
     @app.get("/proxy/system/resources")
     async def proxy_system_resources():

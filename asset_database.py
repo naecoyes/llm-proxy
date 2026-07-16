@@ -26,11 +26,28 @@ try:
 except ModuleNotFoundError:  # package import from the project root
     from .target_policy import normalize_platform, target_host
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def cached_input_tokens(usage: dict[str, Any] | None) -> int:
+    """Return provider-reported cache-read tokens without estimating hits."""
+    payload = usage or {}
+    details = payload.get("prompt_tokens_details") or payload.get("input_tokens_details") or {}
+    for value in (
+        payload.get("cached_input_tokens"),
+        payload.get("cache_read_input_tokens"),
+        details.get("cached_tokens") if isinstance(details, dict) else None,
+    ):
+        try:
+            if value is not None:
+                return max(0, int(value))
+        except (TypeError, ValueError):
+            continue
+    return 0
 
 
 def default_db_path() -> Path:
@@ -339,6 +356,9 @@ class AssetDatabase:
                     status TEXT NOT NULL DEFAULT '',
                     prompt_tokens INTEGER NOT NULL DEFAULT 0,
                     completion_tokens INTEGER NOT NULL DEFAULT 0,
+                    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    estimated_cost_cny REAL,
+                    pricing_period TEXT NOT NULL DEFAULT '',
                     total_tokens INTEGER NOT NULL DEFAULT 0,
                     cost REAL NOT NULL DEFAULT 0,
                     error TEXT NOT NULL DEFAULT '',
@@ -529,6 +549,16 @@ class AssetDatabase:
                   ON smart_batch_jobs(updated_at DESC, status, engine);
                 """
             )
+            response_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(llm_responses)")
+            }
+            for column, definition in (
+                ("cached_input_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                ("estimated_cost_cny", "REAL"),
+                ("pricing_period", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if column not in response_columns:
+                    connection.execute(f"ALTER TABLE llm_responses ADD COLUMN {column} {definition}")
             connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def _asset_id(
@@ -1272,6 +1302,55 @@ class AssetDatabase:
             }
         return hourly
 
+    def response_billing_trend(
+        self, *, labels: list[str], granularity: str
+    ) -> dict[str, list[float | int]]:
+        """Aggregate immutable request token and billing fields for Activity."""
+        empty = {
+            "input_tokens": [],
+            "output_tokens": [],
+            "cached_input_tokens": [],
+            "cost_usd": [],
+            "cost_cny": [],
+        }
+        if not labels:
+            return empty
+        is_hourly = granularity != "day"
+        first = str(labels[0])[:10]
+        last = str(labels[-1])[:10]
+        if is_hourly:
+            first = last = datetime.now().astimezone().date().isoformat()
+            bucket_expr = "substr(responded_at, 12, 2)"
+        else:
+            bucket_expr = "substr(responded_at, 1, 10)"
+        end = (date.fromisoformat(last) + timedelta(days=1)).isoformat()
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""SELECT {bucket_expr} AS bucket,
+                           COALESCE(SUM(prompt_tokens), 0) AS input_tokens,
+                           COALESCE(SUM(completion_tokens), 0) AS output_tokens,
+                           COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens,
+                           COALESCE(SUM(cost), 0) AS cost_usd,
+                           COALESCE(SUM(estimated_cost_cny), 0) AS cost_cny
+                    FROM llm_responses
+                    WHERE responded_at >= ? AND responded_at < ?
+                    GROUP BY bucket""",
+                (f"{first}T00:00:00", f"{end}T00:00:00"),
+            ).fetchall()
+        values = {str(row["bucket"]): dict(row) for row in rows}
+
+        def lookup(label: str, field: str) -> float:
+            key = str(label).zfill(2) if is_hourly else str(label)
+            return float((values.get(key) or {}).get(field) or 0)
+
+        return {
+            "input_tokens": [int(lookup(label, "input_tokens")) for label in labels],
+            "output_tokens": [int(lookup(label, "output_tokens")) for label in labels],
+            "cached_input_tokens": [int(lookup(label, "cached_input_tokens")) for label in labels],
+            "cost_usd": [lookup(label, "cost_usd") for label in labels],
+            "cost_cny": [lookup(label, "cost_cny") for label in labels],
+        }
+
     def sync_batch_snapshot(self, batch: dict[str, Any], state_path: str = "") -> None:
         batch_id = str(batch.get("batch_id") or "")
         if not batch_id:
@@ -1509,18 +1588,24 @@ class AssetDatabase:
                 connection.execute(
                     """INSERT INTO llm_responses(
                       request_id,responded_at,model_name,duration_seconds,status,prompt_tokens,
-                      completion_tokens,total_tokens,cost,error,scan_id,scan_target)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                      completion_tokens,cached_input_tokens,estimated_cost_cny,pricing_period,
+                      total_tokens,cost,error,scan_id,scan_target)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(request_id) DO UPDATE SET responded_at=excluded.responded_at,
                       model_name=excluded.model_name,duration_seconds=excluded.duration_seconds,
                       status=excluded.status,prompt_tokens=excluded.prompt_tokens,
-                      completion_tokens=excluded.completion_tokens,total_tokens=excluded.total_tokens,
+                      completion_tokens=excluded.completion_tokens,
+                      cached_input_tokens=excluded.cached_input_tokens,
+                      estimated_cost_cny=excluded.estimated_cost_cny,
+                      pricing_period=excluded.pricing_period,total_tokens=excluded.total_tokens,
                       cost=excluded.cost,error=excluded.error,scan_id=excluded.scan_id,
                       scan_target=excluded.scan_target""",
                     (
                         request_id, timestamp, str(entry.get("model_name") or ""),
                         entry.get("duration_seconds"), str(entry.get("status") or ""),
                         int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0),
+                        cached_input_tokens(usage), usage.get("estimated_cost_cny"),
+                        str(usage.get("pricing_period") or ""),
                         int(usage.get("total_tokens") or 0), float(usage.get("cost") or 0),
                         str(entry.get("error") or "")[:4000], str(entry.get("scan_id") or ""),
                         str(entry.get("scan_target") or ""),
@@ -1596,6 +1681,9 @@ class AssetDatabase:
                 item["usage"] = {
                     "prompt_tokens": item.pop("prompt_tokens"),
                     "completion_tokens": item.pop("completion_tokens"),
+                    "cached_input_tokens": item.pop("cached_input_tokens", 0),
+                    "estimated_cost_cny": item.pop("estimated_cost_cny", None),
+                    "pricing_period": item.pop("pricing_period", ""),
                     "total_tokens": item.pop("total_tokens"), "cost": item.pop("cost"),
                 }
                 events.append(item)
