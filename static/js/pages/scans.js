@@ -87,7 +87,7 @@ function batchCounts(batch) {
 function batchLifecycle(batch) {
   if (batch.lifecycle === "finished") return "history";
   if (batch.lifecycle === "active" || batch.status === "running" || batch.has_live_running_tasks) return "current";
-  if (batch.lifecycle === "stale") return "current";
+  if (batch.lifecycle === "stale") return "history";
   if (["initialized", "planning"].includes(batch.status)) return "current";
   return "history";
 }
@@ -579,20 +579,39 @@ export function mountScans(context) {
       return !queueQuery || `${task.target} ${task.status} ${task.llm_model_primary} ${task.last_error}`.toLowerCase().includes(queueQuery);
     }).sort((a, b) => Number(isActiveTask(b)) - Number(isActiveTask(a)));
     const summary = data.summary || {};
-    const rawOverallProgress = summary.display_progress_percent ?? summary.overall_progress_percent ?? 0;
+    const terminalJobStatuses = new Set(["completed", "completed_with_errors", "terminated", "dry_run_completed"]);
+    const activeJobs = (jobs?.jobs || []).filter((job) => job.process_alive && !terminalJobStatuses.has(String(job.status || "").toLowerCase()));
+    const pipelineJobs = activeJobs.filter((job) => job.pipeline?.strategy === "per_target");
+    const pipelineTotals = pipelineJobs.reduce((totals, job) => {
+      const pipeline = job.pipeline || {};
+      totals.total += Number(pipeline.total_targets || 0);
+      totals.completed += Number(pipeline.completed_targets || 0);
+      totals.failed += Number(pipeline.failed_targets || 0);
+      totals.active += Number(pipeline.active_targets || 0);
+      return totals;
+    }, { total: 0, completed: 0, failed: 0, active: 0 });
+    pipelineTotals.queued = Math.max(0, pipelineTotals.total - pipelineTotals.completed - pipelineTotals.failed - pipelineTotals.active);
+    const pipelineProgress = pipelineTotals.total
+      ? ((pipelineTotals.completed + pipelineTotals.failed) / pipelineTotals.total) * 100
+      : 0;
+    const rawOverallProgress = pipelineTotals.total
+      ? pipelineProgress
+      : summary.display_progress_percent ?? summary.overall_progress_percent ?? 0;
     const overallProgress = Math.max(Number(rawOverallProgress) || 0, lastOverallProgress);
     lastOverallProgress = overallProgress;
-    const runningCount = activeTasks.length || summary.running_tasks || 0;
-    const queuedCount = queuedTasks.length + autoRequeueTasks.length || (summary.pending_tasks || 0) + (summary.retry_pending_tasks || 0) + (summary.auto_requeue_pending_tasks || 0);
+    const runningCount = pipelineTotals.total ? pipelineTotals.active : activeTasks.length || summary.running_tasks || 0;
+    const queuedCount = pipelineTotals.total ? pipelineTotals.queued : queuedTasks.length + autoRequeueTasks.length || (summary.pending_tasks || 0) + (summary.retry_pending_tasks || 0) + (summary.auto_requeue_pending_tasks || 0);
     const retryDueCount = dueRetryTasks.length || (summary.retry_due_tasks || 0) + (summary.auto_requeue_due_tasks || 0);
-    const failedCount = failedTasks.length || (summary.failed_tasks || 0) + (summary.timeout_tasks || 0);
-    const preflightBatches = current.filter((batch) => batchPreparationStage(batch));
+    const failedCount = pipelineTotals.total ? pipelineTotals.failed : failedTasks.length || (summary.failed_tasks || 0) + (summary.timeout_tasks || 0);
+    const succeededCount = pipelineTotals.total ? pipelineTotals.completed : summary.successful_tasks || 0;
+    const displayedTotal = pipelineTotals.total || summary.total_tasks || 0;
+    const preflightJobs = activeJobs.filter((job) => String(job.pipeline?.preflight?.status || "").toLowerCase() === "running");
     root.innerHTML = `<div class="page-stack scans-page">
       <div class="metrics-grid single-row scans-key-metrics">
-        <div class="metric-card"><div class="metric-label">Current progress</div><div class="metric-value">${formatNumber(overallProgress, 1)}%</div><div class="metric-detail">${summary.total_tasks || 0} active-window tasks</div></div>
-        <div class="metric-card"><div class="metric-label">Running</div><div class="metric-value">${runningCount}</div><div class="metric-detail">${preflightBatches.length ? `${preflightBatches.length} in target safety preflight` : `${current.length} current batches`}</div></div>
+        <div class="metric-card"><div class="metric-label">Current progress</div><div class="metric-value">${formatNumber(overallProgress, 1)}%</div><div class="metric-detail">${formatNumber(displayedTotal)} target pipelines</div></div>
+        <div class="metric-card"><div class="metric-label">Running</div><div class="metric-value">${runningCount}</div><div class="metric-detail">${preflightJobs.length ? `${preflightJobs.length} jobs in target safety preflight` : `${activeJobs.length || current.length} active batches`}</div></div>
         <div class="metric-card ${retryDueCount ? "warning" : ""}"><div class="metric-label">Queued</div><div class="metric-value">${queuedCount}</div><div class="metric-detail">${retryDueCount} ready to retry</div></div>
-        <div class="metric-card"><div class="metric-label">Succeeded</div><div class="metric-value">${summary.successful_tasks || 0}</div><div class="metric-detail">Current active batches</div></div>
+        <div class="metric-card"><div class="metric-label">Succeeded</div><div class="metric-value">${succeededCount}</div><div class="metric-detail">Completed target pipelines</div></div>
         <div class="metric-card ${failedCount ? "warning" : ""}"><div class="metric-label">Failed</div><div class="metric-value">${failedCount}</div><div class="metric-detail">${summary.timeout_tasks || 0} timed out</div></div>
       </div>
 
