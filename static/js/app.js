@@ -8,7 +8,7 @@ import { mountAssets } from "./pages/assets.js?v=20260701-assets-history";
 import { mountFindings } from "./pages/findings.js?v=20260715-export-capability-v1";
 import { mountEgress } from "./pages/egress.js";
 import { mountModels } from "./pages/models.js?v=20260623-provider-ui";
-import { mountActivity } from "./pages/activity.js?v=20260715-resumable-preflight-v1";
+import { mountActivity } from "./pages/activity.js?v=20260716-billing-v1";
 import { mountSettings } from "./pages/settings.js";
 
 const routes = {
