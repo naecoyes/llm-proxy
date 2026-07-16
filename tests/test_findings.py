@@ -81,6 +81,20 @@ class FindingsServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["achieved_by_type"]["SQL injection"], 1)
         self.assertEqual(summary["achieved_by_type"]["Exposed metadata"], 1)
 
+    async def test_needs_review_count_matches_default_list_filter(self):
+        snapshot = await self.service.refresh()
+        records = {record["id"]: record for record in snapshot.records}
+        state = self.service.load_state()
+        state["stars"][records["vuln-0001"]["state_key"]] = True
+        self.state_file.write_text(json.dumps(state), encoding="utf-8")
+
+        summary = await self.service.summary()
+        listed = await self.service.list_records(1, 50, status="needs-review")
+
+        self.assertEqual(summary["needs_review_total"], 1)
+        self.assertEqual(await self.service.needs_review_count(), 1)
+        self.assertEqual(listed["total"], 1)
+
     async def test_report_and_summary_content_are_read_by_index_id(self):
         snapshot = await self.service.refresh()
         record = next(item for item in snapshot.records if item["id"] == "vuln-0001")

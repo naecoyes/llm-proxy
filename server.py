@@ -3448,7 +3448,10 @@ document.getElementById("f").addEventListener("submit",async e=>{
         except Exception:
             active_scans = 0
         assets_total = int(asset_summary.get("total") or 0)
-        findings_total = int(asset_summary.get("findings") or 0)
+        try:
+            findings_total = await _findings_service.needs_review_count()
+        except Exception:
+            findings_total = 0
         return {
             "active_scans": active_scans,
             "vulnerabilities_total": findings_total,

@@ -472,6 +472,21 @@ class FindingsService:
         }
         return result
 
+    @staticmethod
+    def _is_needs_review(record: dict[str, Any], state: dict[str, Any]) -> bool:
+        key = record["state_key"]
+        return (
+            state["archived"].get(key) is not True
+            and state["stars"].get(key) is not True
+            and state["verified"].get(key) is not False
+            and record.get("review_state") != "pending_evidence_review"
+        )
+
+    async def needs_review_count(self) -> int:
+        """Return the count shown by the default Findings view."""
+        snapshot, state = await self.snapshot(), self.load_state()
+        return sum(1 for record in snapshot.records if self._is_needs_review(record, state))
+
     async def summary(self) -> dict[str, Any]:
         snapshot, state = await self.snapshot(), self.load_state()
         counts = {name.lower(): 0 for name in VALID_SEVERITIES}
@@ -506,10 +521,14 @@ class FindingsService:
             1 for record in active_records
             if state["archived"].get(record["state_key"]) is not True
         )
+        needs_review_total = sum(
+            1 for record in snapshot.records if self._is_needs_review(record, state)
+        )
         result = {
             "total": len(snapshot.records), "critical": counts["critical"], "high": counts["high"],
             "medium": counts["medium"], "low": counts["low"], "info": counts["info"],
             "unachieved_total": active_unachieved,
+            "needs_review_total": needs_review_total,
             "unachieved_by_severity": {
                 severity: counts[severity] - achieved_by_severity[severity]
                 for severity in counts
@@ -693,10 +712,7 @@ class FindingsService:
                     "archived": state["archived"].get(key) is True,
                     "unarchived": state["archived"].get(key) is not True,
                     "needs-review": (
-                        state["archived"].get(key) is not True
-                        and state["stars"].get(key) is not True
-                        and state["verified"].get(key) is not False
-                        and record.get("review_state") != "pending_evidence_review"
+                        self._is_needs_review(record, state)
                     ),
                     "pending-evidence-review": record.get("review_state") == "pending_evidence_review",
                     "starred": state["stars"].get(key) is True,
